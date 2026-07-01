@@ -1,0 +1,165 @@
+#==========================================================================
+#
+#   Copyright NumFOCUS
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#          https://www.apache.org/licenses/LICENSE-2.0.txt
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+#==========================================================================
+
+[build-system]
+requires = ["scikit-build-core"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "itk-impact"
+version = "0.1.0"
+description = "A semantic similarity metric for multimodal image registration using features from pretrained TorchScript models."
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    { name = "Valentin Boussot", email = "boussot.v@gmail.com" },
+]
+keywords = [
+    "itk",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Android",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Programming Language :: C++",
+    "Programming Language :: Python",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Software Development :: Libraries",
+]
+requires-python = ">=3.8"
+# NOTE: this module is developed against ITK 6 (the metric derives from current
+# ImageToImageMetricv4) and links LibTorch. A binary wheel therefore needs an ITK-6
+# Python build (not yet on PyPI) and the matching LibTorch shared libraries reachable
+# at import time (RPATH / LD_LIBRARY_PATH). The pin below is the released ITK series;
+# bump it to 6.x once ITK 6 wheels are published.
+dependencies = [
+    "itk == 5.4.*",
+    # LibTorch is NOT bundled in the wheel: itk-impact links the libtorch that ships inside
+    # the `torch` package, so a single small wheel inherits CPU or CUDA from the installed
+    # torch (the user picks the CUDA build from the PyTorch index for GPU). The C++ ABI is
+    # version-coupled, so this MUST match the torch the wheel was built against — keep it in
+    # lock-step with [tool.cibuildwheel].before-build below.
+    "torch == 2.12.*",
+]
+
+[project.urls]
+Download = "https://github.com/InsightSoftwareConsortium/ITKIMPACT"
+Homepage = "https://github.com/InsightSoftwareConsortium/ITKIMPACT"
+
+[tool.scikit-build]
+# The versions of CMake to allow. If CMake is not present on the system or does
+# not pass this specifier, it will be downloaded via PyPI if possible. An empty
+# string will disable this check.
+cmake.version = ">=3.16.3"
+
+# A list of args to pass to CMake when configuring the project. Setting this in
+# config or envvar will override toml. See also ``cmake.define``.
+cmake.args = []
+
+# A table of defines to pass to CMake when configuring the project. Additive.
+cmake.define = {}
+
+# Verbose printout when building.
+cmake.verbose = true
+
+# The build type to use when building the project. Valid options are: "Debug",
+# "Release", "RelWithDebInfo", "MinSizeRel", "", etc.
+cmake.build-type = "Release"
+
+# The source directory to use when building the project. Currently only affects
+# the native builder (not the setuptools plugin).
+cmake.source-dir = "."
+
+# The versions of Ninja to allow. If Ninja is not present on the system or does
+# not pass this specifier, it will be downloaded via PyPI if possible. An empty
+# string will disable this check.
+ninja.version = ">=1.11"
+
+# The logging level to display, "DEBUG", "INFO", "WARNING", and "ERROR" are
+# possible options.
+logging.level = "INFO"
+
+# Files to include in the SDist even if they are skipped by default. Supports
+# gitignore syntax.
+sdist.include = []
+
+# Files to exclude from the SDist even if they are included by default. Supports
+# gitignore syntax.
+sdist.exclude = []
+
+# A list of license files to include in the wheel. Supports glob patterns.
+wheel.license-files = ["LICEN[CS]E*",]
+
+# Target the platlib or the purelib. If not set, the default is to target the
+# platlib if wheel.cmake is true, and the purelib otherwise.
+wheel.platlib = "false"
+
+# If CMake is less than this value, backport a copy of FindPython. Set to 0
+# disable this, or the empty string.
+backport.find-python = "3.26.1"
+
+# Select the editable mode to use. Can be "redirect" (default) or "inplace".
+editable.mode = "redirect"
+
+# Rebuild the project when the package is imported. The build-directory must be
+# set.
+editable.rebuild = false
+
+# If set, this will provide a method for scikit-build-core backward compatibility.
+minimum-version = "0.8.2"
+
+# The build directory. Defaults to a temporary directory, but can be set.
+build-dir = "build/{wheel_tag}"
+
+# ---------------------------------------------------------------------------
+# Reuse the LibTorch shipped in the `torch` wheel instead of bundling a second
+# multi-GB copy. `before-build` installs the ABI-matching torch so
+# find_package(Torch) (auto-located in itk-module-init.cmake) links against it;
+# the per-platform repair steps then EXCLUDE the torch/c10 shared libs from the
+# wheel, so they resolve at runtime from the installed torch — which is what
+# decides CPU vs CUDA. Keep the version in lock-step with [project].dependencies.
+# NOTE: the standard ITKRemoteModuleBuildTestPackageAction may override these via
+# CIBW_* env; if a test build still vendors libtorch, mirror before-build /
+# repair-wheel-command as CIBW_BEFORE_BUILD / CIBW_REPAIR_WHEEL_COMMAND_* in the
+# workflow (env wins over pyproject).
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+before-build = "pip install torch==2.12.1"
+
+[tool.cibuildwheel.linux]
+# Build against the CPU torch (its libtorch/libtorch_cpu/libc10 are also present in the CUDA
+# torch), so the single excluded-libs wheel runs on both — GPU kicks in whenever the installed
+# torch is a CUDA build. Avoids pulling the huge default CUDA torch into the build container.
+before-build = "pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu"
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_cuda.so --exclude libtorch_global_deps.so --exclude libtorch_python.so --exclude libc10.so --exclude libc10_cuda.so --exclude libgomp.so.1"
+
+[tool.cibuildwheel.macos]
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} --exclude libtorch --exclude libtorch_cpu --exclude libtorch_python --exclude libc10"
+
+[tool.cibuildwheel.windows]
+repair-wheel-command = "delvewheel repair -w {dest_dir} {wheel} --exclude torch.dll --exclude torch_cpu.dll --exclude torch_cuda.dll --exclude torch_python.dll --exclude c10.dll --exclude c10_cuda.dll"

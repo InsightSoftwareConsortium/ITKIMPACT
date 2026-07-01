@@ -1,0 +1,181 @@
+# Build torch-aware itk-impact wheels and publish to (Test)PyPI.
+#
+# itk-impact links LibTorch, which must NOT be bundled in the wheel: it is resolved at run time
+# from the user's installed `torch` package (so one small wheel inherits CPU or CUDA from that
+# torch). The stock ITK reusable python workflow cannot exclude libtorch, so this custom
+# workflow drives the ITKPythonPackage build scripts directly and passes the exclusion flag
+# (Linux: -x / auditwheel; Windows: --exclude-libs / delvewheel). macOS is not covered yet
+# (the ITKPythonPackage macpython script has no exclusion hook).
+#
+# Publishing uses PyPI Trusted Publishers (OIDC) -- no stored token:
+#   * workflow_dispatch  -> TestPyPI  (test.pypi.org)
+#   * push tag v*        -> PyPI      (pypi.org)
+# Configure a Trusted Publisher on each side for repo InsightSoftwareConsortium/ITKIMPACT,
+# workflow "build-wheels.yml", environment "testpypi" / "pypi".
+
+name: Wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  # LibTorch shared libs excluded from the wheel (resolved at runtime from the `torch` package).
+  EXCLUDE_LINUX: "libtorch.so;libtorch_cpu.so;libtorch_cuda.so;libtorch_global_deps.so;libtorch_python.so;libc10.so;libc10_cuda.so;libgomp.so.1"
+  EXCLUDE_WINDOWS: "torch.dll;torch_cpu.dll;torch_cuda.dll;torch_python.dll;c10.dll;c10_cuda.dll"
+  # ITKPythonBuilds release (prebuilt wrapping-enabled ITK) and ITKPythonPackage build scripts.
+  ITK_PACKAGE_VERSION: "v5.4.6"
+  ITKPYTHONPACKAGE_TAG: "v5.4.6"
+  ITKPYTHONPACKAGE_ORG: "InsightSoftwareConsortium"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        python3-minor-version: ["10", "11"]  # cp versions shipped in ITKPythonBuilds v5.4.6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: BRAINSia/free-disk-space@v2
+        with:
+          removalmode: "rmz"
+          tool-cache: "true"
+          swap-storage: "true"
+          haskell: "true"
+          dotnet: "true"
+          docker-images: "false"
+          android: "false"
+          large-packages: "false"
+
+      - name: Fetch ITKPythonPackage build script
+        run: |
+          curl --retry 3 --retry-delay 30 --retry-all-errors -L \
+            https://raw.githubusercontent.com/${ITKPYTHONPACKAGE_ORG}/ITKPythonPackage/${ITKPYTHONPACKAGE_TAG}/scripts/dockcross-manylinux-download-cache-and-build-module-wheels.sh -O
+          chmod u+x dockcross-manylinux-download-cache-and-build-module-wheels.sh
+
+      - name: Build wheel (libtorch excluded)
+        shell: bash
+        run: |
+          rm -rf dist ITKPythonPackage
+          export MANYLINUX_VERSION=_2_28
+          export TARGET_ARCH=x64
+          # -x excludes libtorch from the auditwheel repair; find_package(Torch) still links it
+          # (itk-module-init.cmake pip-installs the CPU torch into the build container).
+          ./dockcross-manylinux-download-cache-and-build-module-wheels.sh \
+            -x "${EXCLUDE_LINUX}" cp3${{ matrix.python3-minor-version }}
+
+      - name: Check wheels
+        run: |
+          python -m pip install twine
+          ls -al dist/*.whl
+          python -m twine check dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-cp3${{ matrix.python3-minor-version }}
+          path: dist/*.whl
+
+  build-windows:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        python3-minor-version: ["10", "11"]  # cp versions shipped in ITKPythonBuilds v5.4.6
+    steps:
+      - uses: lukka/get-cmake@v4.2.3
+
+      - uses: actions/checkout@v4
+        with:
+          path: "im"
+
+      - name: Reduce source path length
+        shell: bash
+        run: mv im ../../
+
+      - name: Fetch ITKPythonPackage build script
+        shell: pwsh
+        run: |
+          cd ../../im
+          $url = "https://raw.githubusercontent.com/$env:ITKPYTHONPACKAGE_ORG/ITKPythonPackage/$env:ITKPYTHONPACKAGE_TAG/scripts/windows-download-cache-and-build-module-wheels.ps1"
+          (new-object net.webclient).DownloadString($url) > windows-download-cache-and-build-module-wheels.ps1
+
+      - name: Build wheel (libtorch excluded)
+        shell: pwsh
+        run: |
+          if (Test-Path dist) { rm dist -r -fo }
+          cd ../../im
+          & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -SkipAutomaticLocation
+          $env:CC = "cl.exe"
+          $env:CXX = "cl.exe"
+          # --exclude-libs drops the torch DLLs from the delvewheel repair. The value is a
+          # semicolon-delimited list (windows_build_module_wheels.py joins it straight into
+          # delvewheel's --no-dll). The build .ps1 appends -setup_options to a command string
+          # that it later runs with iex, and iex treats a bare ";" as a statement separator --
+          # which previously split the list so only the first DLL was excluded. Wrap the list in
+          # embedded quotes (`") so the whole semicolon list survives iex as a single argument.
+          ./windows-download-cache-and-build-module-wheels.ps1 "${{ matrix.python3-minor-version }}" -setup_options "--exclude-libs `"$env:EXCLUDE_WINDOWS`""
+          mkdir -p '${{ github.workspace }}\dist'
+          cp 'dist\*.whl' '${{ github.workspace }}\dist'
+
+      - name: Check wheels
+        shell: pwsh
+        run: |
+          ls dist/
+          python -m pip install twine
+          python -m twine check dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-cp3${{ matrix.python3-minor-version }}
+          path: dist/*.whl
+
+  publish-testpypi:
+    # Manual runs go to TestPyPI so the recipe can be validated without touching PyPI.
+    # Coupled: publishes only when every build (Linux and Windows) succeeded.
+    if: github.event_name == 'workflow_dispatch'
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect wheels
+        run: |
+          mkdir -p dist
+          find artifacts -name '*.whl' -exec mv {} dist/ \;
+          ls -al dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  publish-pypi:
+    # A pushed v* tag releases to the real PyPI.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect wheels
+        run: |
+          mkdir -p dist
+          find artifacts -name '*.whl' -exec mv {} dist/ \;
+          ls -al dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

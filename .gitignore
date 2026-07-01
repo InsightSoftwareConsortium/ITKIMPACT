@@ -1,0 +1,21 @@
+# Local ExternalData test inputs are kept out of git (heavy binaries). The portable
+# GoogleTest suite uses synthetic images generated in code plus the committed tiny toy
+# models, so these real images/models are only needed for the optional ExternalData
+# tests and live in an ExternalData object store (referenced by committed .sha512 links),
+# not in the repository.
+/test/Data/*.mha
+/test/Data/*.mhd
+/test/Data/*.raw
+/test/Data/Tensor.pt
+/test/Data/M258_2_Layers.pt
+/test/Data/Test.py
+
+# Local planning / audit notes, not part of the module.
+/docs/
+
+# Common build / editor artifacts.
+/build*/
+*~
+.DS_Store
+__pycache__/
+*.pyc

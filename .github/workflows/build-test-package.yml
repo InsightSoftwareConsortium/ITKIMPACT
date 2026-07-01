@@ -1,0 +1,32 @@
+name: Build, test, package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  cxx-build-workflow:
+    # Local copy of ITKRemoteModuleBuildTestPackageAction's build-test-cxx.yml (v5.4.6) with the
+    # macos-15-intel matrix entry removed. torch ships no x86-macOS wheel past 2.2, so this
+    # torch-linking module cannot be built on Intel macs; the upstream reusable workflow
+    # force-includes macos-15-intel via `matrix.include` (a new combination that os-list cannot
+    # remove), so we vendor the workflow and drop that entry. See build-test-cxx.yml.
+    uses: ./.github/workflows/build-test-cxx.yml
+    with:
+      os-list: '["ubuntu-22.04", "windows-2022", "macos-15"]'
+
+  # NOTE: the Python wheel job is intentionally disabled for now.
+  # itk-impact links LibTorch, which the stock ITK wheel build (dockcross manylinux, no
+  # Torch/CUDA in the container) does not provision, and the reusable workflow cannot exclude
+  # libtorch from the wheel. Wheels are built out-of-band until this is wired up properly.
+  # To re-enable once ready:
+  #   python-build-workflow:
+  #     uses: InsightSoftwareConsortium/ITKRemoteModuleBuildTestPackageAction/.github/workflows/build-test-package-python.yml@v5.4.6
+  #     secrets:
+  #       pypi_password: ${{ secrets.pypi_password }}
