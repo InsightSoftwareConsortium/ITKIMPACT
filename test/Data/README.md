@@ -16,14 +16,11 @@ a real lung-CT pair. Those inputs are large, so they are **not** committed:
 - `3DCT_lung_baseline.mha`, `3DCT_lung_followup.mha` — inhale/exhale lung CT pair
 - `M258_2_Layers.pt` — a real IMPACT feature extractor
 
-They are kept out of git (see `../../.gitignore`) and the test **skips** when they are absent
-(e.g. on CI). To run it locally, drop the three files in this directory.
+They are kept out of git (see `../../.gitignore`); the blobs are hosted on
+https://data.kitware.com and fetched on demand via ITK ExternalData, driven by the committed
+`*.sha512` content links next to this file. `test/CMakeLists.txt` expands them with `DATA{...}`
+and an `ExternalData_add_target`, so the gtest runs in CI; if the download is unavailable the
+test **skips** rather than fails. A local copy dropped in this directory is used as-is.
 
-To make it run in CI, host the blobs via ITK ExternalData:
-
-1. `cmake -DExternalData_LINK_CONTENT=SHA512 ...` to turn the local files into committed
-   `*.sha512` content links (or create them by hand: `sha512sum <file>` into `<file>.sha512`).
-2. Upload the blobs to a store reachable by ITK's default `ExternalData_URL_TEMPLATES`
-   (e.g. https://data.kitware.com, addressed by SHA512).
-3. Reference them with `DATA{...}` from an `itk_add_test` driver so ExternalData fetches them
-   before the test runs.
+To refresh a file: replace it, regenerate its link (`sha512sum <file> | awk '{print $1}' >
+<file>.sha512`), and upload the new blob to data.kitware.com (addressed by SHA512).

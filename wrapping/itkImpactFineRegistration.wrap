@@ -1,0 +1,29 @@
+#==========================================================================
+#
+#   Copyright NumFOCUS
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#          https://www.apache.org/licenses/LICENSE-2.0.txt
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+#==========================================================================
+
+# Fast Torch-backed Adam dense-registration refinement filter. It derives from
+# itk::ImageSource<itk::Image<itk::Vector<double, dim>, dim>> (the displacement field),
+# wrapped via ITKDisplacementField. The wrapped header is torch-free (all LibTorch lives
+# in the .hxx, skipped under ITK_MANUAL_INSTANTIATION). The moving-image template
+# parameter defaults to the fixed one; instantiated for scalar float images in 2D/3D.
+# From Python, configure IMPACT models with AddModelConfiguration() (the
+# std::vector<ModelConfiguration> setters need stdvector wrapping -- a follow-up).
+itk_wrap_class("itk::ImpactFineRegistration" POINTER)
+  itk_wrap_template("IF2IF2" "itk::Image<float, 2>, itk::Image<float, 2>")
+  itk_wrap_template("IF3IF3" "itk::Image<float, 3>, itk::Image<float, 3>")
+itk_end_wrap_class()

@@ -1,0 +1,27 @@
+#==========================================================================
+#
+#   Copyright NumFOCUS
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#          https://www.apache.org/licenses/LICENSE-2.0.txt
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+#==========================================================================
+
+# ConvexAdam-style coarse displacement-field initializer (stage 1), feeding the
+# ImpactFineRegistration refinement via SetInitialDisplacementField. Same output type
+# (itk::Image<itk::Vector<double, dim>, dim>) and torch-free public header as the Adam
+# filter. The moving-image template parameter defaults to the fixed one; instantiated for
+# scalar float images in 2D/3D (the C++ implementation currently supports 3D at run time).
+itk_wrap_class("itk::ImpactCoarseRegistration" POINTER)
+  itk_wrap_template("IF2IF2" "itk::Image<float, 2>, itk::Image<float, 2>")
+  itk_wrap_template("IF3IF3" "itk::Image<float, 3>, itk::Image<float, 3>")
+itk_end_wrap_class()
