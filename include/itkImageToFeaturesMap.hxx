@@ -162,7 +162,7 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
   std::vector<int64_t> channelRepeat(m_ModelConfiguration.GetDimension() + 1, 1);
   channelRepeat[0] = m_ModelConfiguration.GetNumberOfChannels();
   
-  for (int sliceIndex = 0; sliceIndex < patch.size(); ++sliceIndex)
+  for (unsigned int sliceIndex = 0; sliceIndex < patch.size(); ++sliceIndex)
   {
     torch::Tensor inputPatch = patch.GetData(inputTensor, sliceIndex)
                                   .repeat({ torch::IntArrayRef(channelRepeat) })

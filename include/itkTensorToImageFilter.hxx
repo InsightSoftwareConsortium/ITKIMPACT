@@ -76,9 +76,7 @@ TensorToImageFilter<VImageDimension>::GenerateOutputInformation()
 
   OutputImagePointer outputPtr = this->GetOutput();
 
-  OriginType origin;
   SpacingType spacing;
-  DirectionType direction;
   RegionType region;
   SizeType size;
   
