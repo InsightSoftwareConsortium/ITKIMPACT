@@ -80,6 +80,19 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::VerifyPreconditions() const
   Superclass::VerifyPreconditions();
 }
 
+template <typename TInputImage, typename TInterpolator>
+void
+ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateOutputInformation()
+{
+  // Intentionally empty: do NOT chain to Superclass (ProcessObject), whose default
+  // copies the primary input's geometry -- including its LargestPossibleRegion -- onto
+  // the outputs. The feature-map geometry is data-dependent and is set in GenerateData()
+  // via graft; letting the default run (e.g. on a downstream UpdateOutputInformation
+  // re-propagation) would reset LargestPossibleRegion to the input image size while the
+  // buffer holds the smaller feature map, making a consumer iterate out of bounds. See
+  // the declaration in itkImageToFeaturesMap.h for the full rationale.
+}
+
 /**
  * ******************* pca_fit ***********************
  */

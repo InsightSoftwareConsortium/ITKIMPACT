@@ -167,6 +167,23 @@ protected:
   void
   VerifyPreconditions() const override;
 
+  /** Deliberately suppress the default output-information generation.
+   *
+   * ProcessObject::GenerateOutputInformation() copies the primary input's geometry
+   * (origin/spacing/direction AND LargestPossibleRegion) onto every output. That is
+   * wrong for this filter: the outputs are feature maps whose size and spacing are
+   * data-dependent (decided by the model) and are set authoritatively in
+   * GenerateData() by grafting the TensorToImageFilter result. Worse, when a
+   * downstream filter re-propagates UpdateOutputInformation() up this filter (e.g. the
+   * per-channel VectorIndexSelectionCast in InterpolateVectorImageFunction::SetInputImage),
+   * the default would reset each output's LargestPossibleRegion back to the (larger)
+   * input image size while the buffer still holds the smaller feature map -- the
+   * consumer then iterates an input-sized region over the smaller buffer and throws
+   * "Region ... is outside of buffered region". Overriding with an empty body keeps the
+   * grafted regions intact. */
+  void
+  GenerateOutputInformation() override;
+
   void
   GenerateData() override;
 
