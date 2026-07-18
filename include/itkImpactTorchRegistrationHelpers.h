@@ -41,7 +41,16 @@
 
 #include <vector>
 
-#if !defined(_MSC_VER)
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <tlhelp32.h> // enumerate loaded modules to find the Python C-API GIL primitives
+#else
 #  include <dlfcn.h> // runtime lookup of the optional Python C-API GIL primitives
 #endif
 
@@ -61,18 +70,45 @@ namespace Impact
  * so we drop it around our self-contained C++/torch work (which never calls back into Python)
  * and restore it on scope exit.
  *
- * The Python C-API GIL primitives are resolved at run time via dlsym, so the module keeps NO
- * build- or link-time dependency on Python (and produces no undefined symbols on any linker).
- * In a pure C++ process (GTest, elastix, any non-Python consumer) libpython is not loaded, the
- * lookups return null, and the guard is a no-op; under a Python interpreter they resolve
- * globally. PyThreadState* is ABI-compatible with void* (a pointer), so no Python.h is needed.
- * On MSVC the guard is unconditionally a no-op. */
+ * The Python C-API GIL primitives are resolved at run time, so the module keeps NO build- or
+ * link-time dependency on Python (and produces no undefined symbols on any linker). On POSIX
+ * they are looked up in the process-global symbol table via dlsym; on Windows, where symbols
+ * live per-module, the loaded modules are enumerated and the primitives are taken from whichever
+ * one exports the CPython C-API (the hosting interpreter's pythonXY.dll). In a pure C++ process
+ * (GTest, elastix, any non-Python consumer) libpython is not loaded, the lookups fail, and the
+ * guard is a no-op; under a Python interpreter they resolve. PyThreadState* is ABI-compatible
+ * with void* (a pointer), so no Python.h is needed. */
 class PythonGilReleaseGuard
 {
 public:
   PythonGilReleaseGuard()
   {
-#if !defined(_MSC_VER)
+#if defined(_WIN32)
+    // Windows has no process-global symbol table to search, so walk the loaded modules and take
+    // the GIL primitives from whichever one exports the CPython C-API (the interpreter's pythonXY.dll).
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snapshot != INVALID_HANDLE_VALUE)
+    {
+      MODULEENTRY32W entry;
+      entry.dwSize = sizeof(entry);
+      for (BOOL more = Module32FirstW(snapshot, &entry); more; more = Module32NextW(snapshot, &entry))
+      {
+        auto isInitialized = reinterpret_cast<int (*)()>(GetProcAddress(entry.hModule, "Py_IsInitialized"));
+        auto saveThread = reinterpret_cast<void * (*)()>(GetProcAddress(entry.hModule, "PyEval_SaveThread"));
+        auto restoreThread = reinterpret_cast<void (*)(void *)>(GetProcAddress(entry.hModule, "PyEval_RestoreThread"));
+        if (isInitialized != nullptr && saveThread != nullptr && restoreThread != nullptr)
+        {
+          m_RestoreThread = restoreThread;
+          if (isInitialized() != 0)
+          {
+            m_State = saveThread();
+          }
+          break;
+        }
+      }
+      CloseHandle(snapshot);
+    }
+#else
     if (void * program = dlopen(nullptr, RTLD_LAZY))
     {
       auto isInitialized = reinterpret_cast<int (*)()>(dlsym(program, "Py_IsInitialized"));
@@ -88,21 +124,17 @@ public:
   }
   ~PythonGilReleaseGuard()
   {
-#if !defined(_MSC_VER)
     if (m_State != nullptr && m_RestoreThread != nullptr)
     {
       m_RestoreThread(m_State);
     }
-#endif
   }
   PythonGilReleaseGuard(const PythonGilReleaseGuard &) = delete;
   PythonGilReleaseGuard & operator=(const PythonGilReleaseGuard &) = delete;
 
 private:
   void * m_State{ nullptr };
-#if !defined(_MSC_VER)
   void (*m_RestoreThread)(void *){ nullptr };
-#endif
 };
 
 /** Copy an itk image into a contiguous float CPU tensor of shape {spatial...} with the ITK
