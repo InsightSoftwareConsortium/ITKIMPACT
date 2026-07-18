@@ -216,6 +216,21 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
       torch::Tensor layer = outputs[i].toTensor().to(torch::kFloat32);
       if (subsetIndex.defined())
       {
+        // SubsetFeatures is an explicit list of channel INDICES (0-based). A raw index_select with an
+        // out-of-range index triggers an asynchronous, context-poisoning CUDA device-side assert
+        // ("srcIndex < srcSelectDimSize") that is impossible to attribute. Validate against this layer's
+        // channel count first and fail with an actionable message instead.
+        const int64_t channels = layer.size(1);
+        for (const unsigned int index : subset)
+        {
+          if (static_cast<int64_t>(index) >= channels)
+          {
+            itkGenericExceptionMacro("ImpactRegistration: SubsetFeatures index "
+                                     << index << " is out of range for a feature layer with " << channels
+                                     << " channel(s). SubsetFeatures lists 0-based channel indices; leave it "
+                                        "empty to keep all channels.");
+          }
+        }
         layer = layer.index_select(1, subsetIndex);
       }
       // Keep the layer at its NATIVE resolution (see the function doc); the consumer resamples it.
