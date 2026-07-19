@@ -22,7 +22,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "itk-impact"
-version = "0.1.0"
+version = "0.1.1"
 description = "A semantic similarity metric for multimodal image registration using features from pretrained TorchScript models."
 readme = "README.md"
 license = {file = "LICENSE"}
