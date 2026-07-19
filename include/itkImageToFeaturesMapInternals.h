@@ -26,6 +26,9 @@
 
 #include "itkImageToTensorFilter.h"
 #include "itkTensorToImageFilter.h"
+#include <itkImage.h>
+#include <itkVectorImage.h>
+#include <itkBSplineInterpolateImageFunction.h>
 #include <itkDanielssonDistanceMapImageFilter.h>
 #include <itkVectorIndexSelectionCastImageFilter.h>
 
