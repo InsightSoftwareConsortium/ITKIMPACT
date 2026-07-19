@@ -24,7 +24,6 @@
 // public header torch-free and castxml/Python wrappable. Include ONLY from translation units
 // that already depend on torch (itkImageToFeaturesMap.hxx, the metric .hxx, the C++ tests).
 
-#include "itkImageToFeaturesMap.h"
 #include "itkImageToTensorFilter.h"
 #include "itkTensorToImageFilter.h"
 #include <itkDanielssonDistanceMapImageFilter.h>
@@ -467,6 +466,16 @@ struct ImageToFeaturesMapInternals
   std::vector<torch::Tensor> principalComponents;
 };
 } // namespace detail
+
+} // namespace itk
+
+// itkImageToFeaturesMap.h pulls its .hxx, which needs the patch machinery and the complete
+// Internals struct defined above -- include it only after those exist, so this header stays
+// self-contained when it is included before itkImageToFeaturesMap.h.
+#include "itkImageToFeaturesMap.h"
+
+namespace itk
+{
 
 /** The interpolated input tensors (one per AddInput call). */
 template <typename TInputImage, typename TInterpolator>
