@@ -94,8 +94,14 @@ Forward(const ModelConfiguration & configuration, torch::Tensor inputPatch)
   }
   if (impl->nArgs >= 4)
   {
-    args.emplace_back(impl->imageStatsTensor);
-    args.emplace_back(impl->imageDirectionTensor);
+    // These are filled by SetupImageMetadata. A stage that runs a metadata-aware model (nArgs>=4)
+    // without having called it leaves them default-constructed (undefined). Passing an *undefined*
+    // tensor into a model that actually reads it -- e.g. SAM's input normalisation does aten::size on
+    // `stats` -- aborts LibTorch's alias analysis ("no op for aten::size"). Fall back to the schema's
+    // empty-tensor default so the model takes its no-metadata path instead of crashing.
+    const torch::Tensor empty = torch::empty({ 0 }, inputPatch.options().dtype(torch::kFloat32));
+    args.emplace_back(impl->imageStatsTensor.defined() ? impl->imageStatsTensor : empty);
+    args.emplace_back(impl->imageDirectionTensor.defined() ? impl->imageDirectionTensor : empty);
   }
   return impl->model->forward(std::move(args)).toList().vec();
 }

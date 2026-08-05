@@ -138,7 +138,8 @@ public:
   itkGetConstMacro(DisplacementHalfWidth, unsigned int);
   /** Also solve the backward (moving->fixed) coarse problem and symmetrize the two fields
    * toward mutual inverses (ConvexAdam-style), for a more diffeomorphic coarse initialization.
-   * Default off. */
+   * Default on, matching the original ConvexAdam (convex_adam_pt ic=True): with it off the coarse
+   * field is under-regularised and folds. */
   itkSetMacro(InverseConsistency, bool);
   itkGetConstMacro(InverseConsistency, bool);
   itkBooleanMacro(InverseConsistency);
@@ -176,7 +177,7 @@ private:
   unsigned int m_Seed{ 0 };
   unsigned int m_GridSpacing{ 4 };
   unsigned int m_DisplacementHalfWidth{ 3 };
-  bool         m_InverseConsistency{ false };
+  bool         m_InverseConsistency{ true };
 
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };
 };

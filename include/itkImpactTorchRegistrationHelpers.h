@@ -179,9 +179,13 @@ std::vector<torch::Tensor>
 ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
                      const torch::Tensor &                   imageTensor, // {1,1,spatial...} on device
                      const torch::Device &                   device,
-                     const std::vector<unsigned int> &       subset)
+                     const std::vector<unsigned int> &       subset,
+                     bool                                    withGrad = false)
 {
-  torch::NoGradGuard         noGrad;
+  // withGrad=false (default): inference, features are constants (coarse stage, frozen-feature fine).
+  // withGrad=true: keep the autograd graph so a caller can backpropagate a loss THROUGH the network to
+  // the warped input (differentiable-feature fine mode), i.e. minimise F(warp(I)) not warp(F(I)).
+  torch::AutoGradMode        gradMode(withGrad);
   std::vector<torch::Tensor> layers;
 
   torch::Tensor subsetIndex;
@@ -205,7 +209,39 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
       input = input.repeat(repeats);
     }
 
-    std::vector<torch::jit::IValue> outputs = Forward(config, input);
+    // A model of lower dimension than the image (a 2D backbone like SAM on a 3D volume) cannot take the
+    // whole {1,C,z,y,x} tensor -- it expects {N,C,H,W}. Run it slice-by-slice over the leading spatial
+    // axes it does not cover and stack the per-slice feature layers back, mirroring the Patch-based
+    // slicing ImageToFeaturesMap does. A native-dimension model keeps the single whole-volume forward.
+    const unsigned int              modelDim = config.GetDimension();
+    std::vector<torch::jit::IValue> outputs;
+    if (modelDim < Dim)
+    {
+      const int64_t                           sliceAxis = 2; // first spatial axis in {1,C,z,y,x}
+      const int64_t                           nSlices = input.size(sliceAxis);
+      std::vector<std::vector<torch::Tensor>> perLayer; // [layer][slice], native model resolution
+      for (int64_t s = 0; s < nSlices; ++s)
+      {
+        std::vector<torch::jit::IValue> sliceOut = Forward(config, input.select(sliceAxis, s));
+        if (perLayer.empty())
+        {
+          perLayer.resize(sliceOut.size());
+        }
+        for (size_t i = 0; i < sliceOut.size(); ++i)
+        {
+          perLayer[i].push_back(sliceOut[i].toTensor().to(torch::kFloat32));
+        }
+      }
+      // Restack each layer's slices along the sliced axis: {1,Cf,y',x'} * z -> {1,Cf,z,y',x'}.
+      for (auto & slices : perLayer)
+      {
+        outputs.emplace_back(torch::stack(slices, sliceAxis));
+      }
+    }
+    else
+    {
+      outputs = Forward(config, input);
+    }
     const std::vector<bool> &       mask = config.GetLayersMask();
     for (size_t i = 0; i < outputs.size(); ++i)
     {
@@ -234,7 +270,8 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
         layer = layer.index_select(1, subsetIndex);
       }
       // Keep the layer at its NATIVE resolution (see the function doc); the consumer resamples it.
-      layers.push_back(layer.detach().contiguous());
+      // Detach only in the no-grad path -- withGrad must preserve the graph back to `imageTensor`.
+      layers.push_back(withGrad ? layer.contiguous() : layer.detach().contiguous());
     }
   }
   return layers;

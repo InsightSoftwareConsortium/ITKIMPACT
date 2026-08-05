@@ -176,6 +176,24 @@ public:
    * map diverges from the features of the warped image. <= 0 extracts once (disabled). Default -1. */
   itkSetMacro(FeatureMapUpdateInterval, int);
   itkGetConstMacro(FeatureMapUpdateInterval, int);
+
+  /** Feature-mode strategy, mirroring itk::ImpactImageToImageMetricv4's "Static"/"Jacobian" modes:
+   * - "Static" (default): the moving features are extracted once and WARPED each iteration
+   *   (grid_sample of a frozen feature map). Fast, and exact for a LOCAL descriptor (MIND) where
+   *   F(warp(I)) == warp(F(I)).
+   * - "Jacobian": every iteration warps the moving IMAGE by the field and RE-EXTRACTS the features
+   *   through the network with autograd, so the loss is the true F(warp(I)) and its gradient carries
+   *   the network term d(feature)/d(displacement) -- needed for a non-local backbone (SAM), whose
+   *   warped feature map is not the feature of the warped image.
+   * (The metric's "Jacobian" samples per-point patches; here, on the dense field, it re-extracts the
+   * whole warped image -- same principle, differentiating the similarity through the model.) */
+  itkSetMacro(Mode, std::string);
+  itkGetConstReferenceMacro(Mode, std::string);
+  /** "Jacobian" mode only: number of z-slices (leading spatial axis) extracted per autograd chunk, to
+   * bound peak memory -- the per-voxel feature loss decomposes over z, so chunk gradients accumulate
+   * into the field. 0 = whole volume in one graph. Default 32. */
+  itkSetMacro(FeatureChunkSize, unsigned int);
+  itkGetConstMacro(FeatureChunkSize, unsigned int);
   /** @} */
 
   /** \name Outputs. */
@@ -239,6 +257,8 @@ private:
   unsigned int m_GridShrinkFactor{ 1 };
   unsigned int m_ControlGridSmoothingIterations{ 0 };
   int          m_FeatureMapUpdateInterval{ -1 };
+  std::string  m_Mode{ "Static" };
+  unsigned int m_FeatureChunkSize{ 32 };
 
   // Auxiliary outputs (the primary displacement field is the ImageSource output 0).
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };

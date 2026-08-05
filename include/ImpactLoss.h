@@ -116,6 +116,17 @@ public:
     throw std::runtime_error("forwardValue() is not implemented for this loss");
   }
 
+  /** True if forwardValue() is a MEAN of independent per-point (per-row) terms -- i.e. the point
+   * axis (dim 0) is reduced only by the final mean(). Such a loss can be evaluated on disjoint
+   * subsets of points and recombined by their point-count weights (used by ImpactFineRegistration's
+   * chunked Jacobian mode). Override to false for a GLOBAL statistic that reduces over the point axis
+   * internally (e.g. NCC's per-channel correlation), which does not decompose over point subsets. */
+  virtual bool
+  IsPerPointMean() const
+  {
+    return true;
+  }
+
   void
   updateDerivativeInJacobianMode(torch::Tensor & jacobian, torch::Tensor & nonZeroJacobianIndices)
   {
@@ -523,10 +534,42 @@ private:
   torch::Tensor m_sff, m_smm, m_sfm, m_sf, m_sm;
   torch::Tensor m_sfdm, m_smdm, m_sdm;
 
+  /** Smallest denominator kept in the correlation quotients below. */
+  static constexpr double s_epsilon = 1e-8;
+
+  /** Per-channel variance from the accumulated sums, clamped to be non-negative: the
+   * cancellation in sum(x*x) - sum(x)^2/N can land slightly below zero in floating point,
+   * and sqrt() of that is NaN. */
+  static torch::Tensor
+  Variance(const torch::Tensor & sxx, const torch::Tensor & sx, double N)
+  {
+    return (sxx - sx * sx / N).clamp_min(0.0);
+  }
+
+  /** Correlation denominator, floored away from zero. A feature channel that is constant
+   * over the sampled points has zero variance, making the correlation 0/0. Since
+   * |covariance| <= sqrt(varFixed * varMoving) (Cauchy-Schwarz), flooring the denominator
+   * makes such a channel contribute a correlation of 0 -- the neutral value -- instead of a
+   * NaN which, through the mean over channels, would turn the whole metric value and its
+   * derivative into NaN and silently stall the registration. */
+  static torch::Tensor
+  Denominator(const torch::Tensor & varFixed, const torch::Tensor & varMoving)
+  {
+    return (torch::sqrt(varFixed) * torch::sqrt(varMoving)).clamp_min(s_epsilon);
+  }
+
 public:
   NCC()
     : Loss(false)
   {}
+
+  /** NCC is a GLOBAL statistic: forwardValue() reduces over the point axis (per-channel sums over all
+   * points) before combining, so it does NOT decompose over point subsets. Blocks chunked evaluation. */
+  bool
+  IsPerPointMean() const override
+  {
+    return false;
+  }
 
   void
   initialize(torch::Tensor & output) override
@@ -598,10 +641,11 @@ public:
     this->m_sm += sm;
 
     torch::Tensor u = sfm - (sf * sm / N);
-    torch::Tensor v = torch::sqrt(sff - sf * sf / N) * torch::sqrt(smm - sm * sm / N);
+    torch::Tensor varM = Variance(smm, sm, N);
+    torch::Tensor v = Denominator(Variance(sff, sf, N), varM);
 
     torch::Tensor u_p = fixedOutput - sf.unsqueeze(0) / N;
-    return -((u_p - u.unsqueeze(0) * (movingOutput - sm.unsqueeze(0) / N) / (smm - sm * sm / N).unsqueeze(0)) /
+    return -((u_p - u.unsqueeze(0) * (movingOutput - sm.unsqueeze(0) / N) / varM.clamp_min(s_epsilon).unsqueeze(0)) /
              v.unsqueeze(0)) /
            fixedOutput.size(1);
   }
@@ -618,7 +662,7 @@ public:
     torch::Tensor sf = fixedOutput.sum(0);
     torch::Tensor sm = movingOutput.sum(0);
     torch::Tensor u = sfm - sf * sm / N;
-    torch::Tensor v = torch::sqrt(sff - sf * sf / N) * torch::sqrt(smm - sm * sm / N);
+    torch::Tensor v = Denominator(Variance(sff, sf, N), Variance(smm, sm, N));
     return -(u / v).mean();
   }
 
@@ -630,7 +674,7 @@ public:
       return 0.0;
     torch::Tensor u = this->m_sfm - (this->m_sf * this->m_sm / N);
     torch::Tensor v =
-      torch::sqrt(this->m_sff - this->m_sf * this->m_sf / N) * torch::sqrt(this->m_smm - this->m_sm * this->m_sm / N);
+      Denominator(Variance(this->m_sff, this->m_sf, N), Variance(this->m_smm, this->m_sm, N));
     return -(u / v).mean().item<double>();
   }
 
@@ -643,11 +687,11 @@ public:
     }
 
     torch::Tensor u = this->m_sfm - (this->m_sf * this->m_sm / N);
-    torch::Tensor v =
-      torch::sqrt(this->m_sff - this->m_sf * this->m_sf / N) * torch::sqrt(this->m_smm - this->m_sm * this->m_sm / N);
+    torch::Tensor varM = Variance(this->m_smm, this->m_sm, N);
+    torch::Tensor v = Denominator(Variance(this->m_sff, this->m_sf, N), varM);
     torch::Tensor u_p = this->m_sfdm - this->m_sf.unsqueeze(-1) * this->m_sdm / N;
     return -((u_p - u.unsqueeze(-1) * (this->m_smdm - this->m_sm.unsqueeze(-1) * this->m_sdm / N) /
-                      (this->m_smm - this->m_sm * this->m_sm / N).unsqueeze(-1)) /
+                      varM.clamp_min(s_epsilon).unsqueeze(-1)) /
              v.unsqueeze(-1))
               .mean(0)
               .to(torch::kCPU);

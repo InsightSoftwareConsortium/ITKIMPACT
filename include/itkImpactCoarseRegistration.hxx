@@ -153,8 +153,17 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       const std::vector<ModelConfiguration> & movingConfigs =
         m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
+      // Give metadata-aware models (nArgs>=4, e.g. SAM) each image's OWN normalisation stats
+      // (min/max/mean/sigma + direction), not the undefined default. Fixed and moving configs added via
+      // AddModelConfiguration share one impl, so set each image's stats immediately BEFORE extracting
+      // that image: the extraction reads them there (serialized on the stream), and reassigning the
+      // member for the next image does not touch the tensor the completed forward already captured.
+      for (const auto & cfg : m_FixedModelsConfiguration)
+        SetupImageMetadata<FixedImageType>(cfg, m_FixedImage);
       fixedLayers =
         Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, m_SubsetFeatures);
+      for (const auto & cfg : movingConfigs)
+        SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
       movingLayers =
         Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, m_SubsetFeatures);
       if (fixedLayers.empty() || fixedLayers.size() != movingLayers.size())

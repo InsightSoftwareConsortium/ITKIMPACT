@@ -327,11 +327,45 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       return F::adaptive_avg_pool2d(layer, F::AdaptiveAvgPool2dFuncOptions({ target[0], target[1] }));
   };
 
+  // "Jacobian" (online) mode: pool ONLY the trailing spatial axes to the loss resolution and keep the
+  // leading axis (z, the chunked axis) native, so a per-z-chunk of re-extracted moving features lines
+  // up with the same slice range of the fixed features.
+  auto poolInPlane = [&](const torch::Tensor & layer) -> torch::Tensor {
+    std::vector<int64_t> target(ImageDimension);
+    target[0] = layer.size(2); // leading axis kept native
+    bool needs = false;
+    for (unsigned int d = 1; d < ImageDimension; ++d)
+    {
+      const int64_t nat = layer.size(2 + static_cast<int64_t>(d));
+      target[d] = std::min(nat, coarseSpatial[d]);
+      if (target[d] != nat)
+      {
+        needs = true;
+      }
+    }
+    if (!needs)
+    {
+      return layer;
+    }
+    if constexpr (ImageDimension == 3)
+      return F::adaptive_avg_pool3d(layer, F::AdaptiveAvgPool3dFuncOptions({ target[0], target[1], target[2] }));
+    else
+      return F::adaptive_avg_pool2d(layer, F::AdaptiveAvgPool2dFuncOptions({ target[0], target[1] }));
+  };
+  const bool jacobianMode = featureMode && (m_Mode == "Jacobian");
+  // A "sliced" model has lower dimension than the image (a 2D backbone run slice-by-slice over z):
+  // its feature map preserves the leading (z) axis 1:1 with the image, so the online loss can be taken
+  // in z-chunks that line up by index (memory-bounded). A full-dimension model may downsample every
+  // axis, so its features are compared whole and aligned by resampling, like the itkv4 metric.
+  const bool jacSliced = jacobianMode && !m_FixedModelsConfiguration.empty() &&
+                         m_FixedModelsConfiguration[0].GetDimension() < ImageDimension;
+
   // Feature-mode setup: extract the fixed/moving feature layers (constants, not differentiated
   // through), optionally PCA-reduce them (fit on fixed), and build one loss per kept layer.
   // Intensity mode skips this and compares raw voxels.
   std::vector<torch::Tensor>                 fixedLayers;
   std::vector<torch::Tensor>                 movingLayers;
+  std::vector<torch::Tensor>                 fixedLayersOnline; // "Jacobian" mode: fixed features, in-plane pooled
   std::vector<torch::Tensor>                 pcaBasis; // per kept layer; undefined entry = no PCA
   std::vector<std::unique_ptr<Impact::Loss>> losses;
   std::vector<float>                         layerWeights;
@@ -352,7 +386,16 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   };
   if (featureMode)
   {
+    // Give metadata-aware models (nArgs>=4, e.g. SAM) each image's OWN normalisation stats
+    // (min/max/mean/sigma), not the undefined default. Fixed and moving configs added via
+    // AddModelConfiguration share one impl, so set each image's stats immediately BEFORE extracting
+    // that image: the extraction reads the stats there (serialized on the stream), and reassigning the
+    // member for the next image does not touch the tensor the completed forward already captured.
+    for (const auto & cfg : m_FixedModelsConfiguration)
+      SetupImageMetadata<FixedImageType>(cfg, m_FixedImage);
     fixedLayers = Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, m_SubsetFeatures);
+    for (const auto & cfg : movingConfigs)
+      SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
     movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, m_SubsetFeatures);
     if (fixedLayers.size() != movingLayers.size() || fixedLayers.empty())
     {
@@ -381,29 +424,64 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       losses.push_back(Impact::LossFactory::Instance().Create(name));
       layerWeights.push_back(l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0f);
     }
-    // Downsample the fixed/moving feature layers to the Adam similarity resolution (never upsampling),
-    // then precompute the identity base grid at each layer's resulting resolution so the loss grid is
-    // built directly there (reuses grid0 for full-resolution layers).
-    layerBaseGrid.resize(movingLayers.size());
-    layerSpatials.resize(movingLayers.size());
-    for (size_t l = 0; l < movingLayers.size(); ++l)
+    if (jacobianMode)
     {
-      fixedLayers[l] = poolLayerToLoss(fixedLayers[l]).contiguous();
-      movingLayers[l] = poolLayerToLoss(movingLayers[l]).contiguous();
-      std::vector<int64_t> ls(movingLayers[l].sizes().begin() + 2, movingLayers[l].sizes().end());
-      layerSpatials[l] = ls;
-      if (ls == spatial)
+      // Chunked z-evaluation (a sliced model split to bound memory) recombines per-chunk means by their
+      // point-count weights, which equals the whole-volume loss ONLY for a per-point-mean distance.
+      // Reject a global distance (e.g. NCC) when chunking is actually active, rather than silently
+      // returning a wrong value/gradient; FeatureChunkSize=0 (whole volume) lifts the restriction.
+      if (jacSliced && m_FeatureChunkSize != 0 && static_cast<int64_t>(m_FeatureChunkSize) < spatial[0])
       {
-        layerBaseGrid[l] = grid0;
-      }
-      else
-      {
-        std::vector<int64_t> gs{ 1, 1 };
-        for (auto s : ls)
+        for (size_t l = 0; l < losses.size(); ++l)
         {
-          gs.push_back(s);
+          if (!losses[l]->IsPerPointMean())
+          {
+            itkExceptionMacro("ImpactFineRegistration Jacobian mode: distance '"
+                              << (l < m_Distance.size() ? m_Distance[l] : std::string("L2"))
+                              << "' is a global statistic that does not decompose over the z-chunks used "
+                                 "to bound memory. Set FeatureChunkSize=0 (whole volume) to use it.");
+          }
         }
-        layerBaseGrid[l] = torch::affine_grid_generator(idAffine, gs, /*align_corners=*/true);
+      }
+      // Online mode: precompute the fixed features on the comparison grid. The moving features are
+      // re-extracted from the warped image every iteration in the Adam loop and brought to this same
+      // grid, so movingLayers / layerBaseGrid (the frozen-warp machinery) are unused here. A sliced
+      // model keeps the leading axis native (in-plane pooled) for 1:1 z-chunking; a full-dimension
+      // model is pooled to the whole loss grid and matched by resampling.
+      fixedLayersOnline.resize(fixedLayers.size());
+      for (size_t l = 0; l < fixedLayers.size(); ++l)
+      {
+        fixedLayersOnline[l] =
+          (jacSliced ? poolInPlane(fixedLayers[l]) : poolLayerToLoss(fixedLayers[l])).contiguous();
+      }
+      movingLayers.clear();
+    }
+    else
+    {
+      // Static mode: downsample the fixed/moving feature layers to the Adam similarity resolution
+      // (never upsampling), then precompute the identity base grid at each layer's resulting
+      // resolution so the loss grid is built directly there (reuses grid0 for full-resolution layers).
+      layerBaseGrid.resize(movingLayers.size());
+      layerSpatials.resize(movingLayers.size());
+      for (size_t l = 0; l < movingLayers.size(); ++l)
+      {
+        fixedLayers[l] = poolLayerToLoss(fixedLayers[l]).contiguous();
+        movingLayers[l] = poolLayerToLoss(movingLayers[l]).contiguous();
+        std::vector<int64_t> ls(movingLayers[l].sizes().begin() + 2, movingLayers[l].sizes().end());
+        layerSpatials[l] = ls;
+        if (ls == spatial)
+        {
+          layerBaseGrid[l] = grid0;
+        }
+        else
+        {
+          std::vector<int64_t> gs{ 1, 1 };
+          for (auto s : ls)
+          {
+            gs.push_back(s);
+          }
+          layerBaseGrid[l] = torch::affine_grid_generator(idAffine, gs, /*align_corners=*/true);
+        }
       }
     }
   }
@@ -480,44 +558,132 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     }
     reg = reg * m_RegularizationWeight;
 
-    // Warp by the residual control field (theta - thetaRef): the moving features were extracted
-    // at thetaRef, so this is identity right after a refresh (and == theta when disabled).
-    torch::Tensor similarity;
-    if (featureMode)
+    double lossValue;
+    if (jacobianMode)
     {
-      // Build each layer's sampling grid directly at its resolution from the smoothed residual
-      // (no full-res detour); smoothing is shared across layers.
-      const torch::Tensor smoothedResidual = smoothControl(theta - thetaRef);
-      similarity = torch::zeros({}, theta.options());
-      for (size_t l = 0; l < movingLayers.size(); ++l)
+      // "Jacobian" (online) mode: warp the moving IMAGE by the current field and RE-EXTRACT features
+      // through the network with autograd, descending on the true loss F(warp(I)) whose gradient carries
+      // the network term d(feature)/d(displacement). Moving and fixed features are matched on a common
+      // grid by RESAMPLING (never index alignment), so any feature resolution is handled -- like the
+      // itkv4 metric. A model whose features downsample every axis (full-dimension) is compared whole;
+      // a sliced model (features preserve z) is taken in z-chunks to bound peak memory.
+      if (jacSliced)
       {
-        torch::Tensor warpedLayer =
-          F::grid_sample(movingLayers[l], gridForLayerControl(smoothedResidual, l), sampleOpts);
-        const int64_t channels = movingLayers[l].size(1);
-        torch::Tensor fixedFlat = fixedLayers[l].permute(toChannelLast).reshape({ -1, channels });
-        torch::Tensor warpedFlat = warpedLayer.permute(toChannelLast).reshape({ -1, channels });
-        similarity = similarity + layerWeights[l] * losses[l]->forwardValue(fixedFlat, warpedFlat);
+        // Peak memory is bounded by taking the field's leading (z) axis in chunks: each chunk backprops
+        // into a detached grid leaf -- its network subgraph is then freed -- and the shared field->grid
+        // graph is traversed once at the end. The per-point feature distance decomposes over voxels, so
+        // weighting a chunk by its voxel fraction makes the accumulated gradient equal the whole mean's.
+        reg.backward();
+        const torch::Tensor fullGrid = gridFromControl(theta); // {1, spatial..., Dim}, graph to theta
+        torch::Tensor       gridLeaf = fullGrid.detach().clone();
+        gridLeaf.set_requires_grad(true);
+        const int64_t nLead = gridLeaf.size(1);
+        const int64_t chunk = (m_FeatureChunkSize == 0) ? nLead : std::min<int64_t>(m_FeatureChunkSize, nLead);
+        double simValue = 0.0;
+        for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
+        {
+          const int64_t di = std::min(chunk, nLead - i0);
+          torch::Tensor gz = gridLeaf.narrow(1, i0, di);
+          torch::Tensor movingChunk = F::grid_sample(movingT, gz, sampleOpts); // {1,1,di,...}, grad -> gridLeaf
+          std::vector<torch::Tensor> ml =
+            Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingChunk, device, m_SubsetFeatures, true);
+          torch::Tensor simChunk = torch::zeros({}, theta.options());
+          for (size_t l = 0; l < ml.size(); ++l)
+          {
+            torch::Tensor mll = ml[l];
+            if (l < pcaBasis.size() && pcaBasis[l].defined())
+            {
+              mll = Impact::PcaTransform(mll.squeeze(0), pcaBasis[l]).unsqueeze(0);
+            }
+            mll = poolInPlane(mll); // features preserve z here, so only the trailing axes are resampled
+            const int64_t channels = mll.size(1);
+            torch::Tensor fixedChunk = fixedLayersOnline[l].narrow(2, i0, di);
+            torch::Tensor fFlat = fixedChunk.permute(toChannelLast).reshape({ -1, channels });
+            torch::Tensor mFlat = mll.permute(toChannelLast).reshape({ -1, channels });
+            simChunk = simChunk + layerWeights[l] * losses[l]->forwardValue(fFlat, mFlat);
+          }
+          torch::Tensor weighted = simChunk * (static_cast<double>(di) / static_cast<double>(nLead));
+          weighted.backward(); // accumulates into gridLeaf.grad; this chunk's network graph is freed
+          simValue += weighted.template item<double>();
+        }
+        fullGrid.backward(gridLeaf.grad()); // shared field->grid graph, once: gridLeaf.grad -> theta.grad
+        lossValue = simValue + reg.template item<double>();
+      }
+      else
+      {
+        // Full-dimension model: warp the whole moving image, re-extract its features, and resample each
+        // layer to the fixed layer's loss-grid resolution before comparing (a single backward pass).
+        torch::Tensor              movingWarped = F::grid_sample(movingT, gridFromControl(theta), sampleOpts);
+        std::vector<torch::Tensor> ml =
+          Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingWarped, device, m_SubsetFeatures, true);
+        torch::Tensor sim = torch::zeros({}, theta.options());
+        for (size_t l = 0; l < ml.size(); ++l)
+        {
+          torch::Tensor mll = ml[l];
+          if (l < pcaBasis.size() && pcaBasis[l].defined())
+          {
+            mll = Impact::PcaTransform(mll.squeeze(0), pcaBasis[l]).unsqueeze(0);
+          }
+          const std::vector<int64_t> tgt(fixedLayersOnline[l].sizes().begin() + 2, fixedLayersOnline[l].sizes().end());
+          const std::vector<int64_t> cur(mll.sizes().begin() + 2, mll.sizes().end());
+          if (cur != tgt)
+          {
+            if constexpr (ImageDimension == 3)
+              mll = F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kTrilinear).align_corners(true));
+            else
+              mll = F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kBilinear).align_corners(true));
+          }
+          const int64_t channels = mll.size(1);
+          torch::Tensor fFlat = fixedLayersOnline[l].permute(toChannelLast).reshape({ -1, channels });
+          torch::Tensor mFlat = mll.permute(toChannelLast).reshape({ -1, channels });
+          sim = sim + layerWeights[l] * losses[l]->forwardValue(fFlat, mFlat);
+        }
+        torch::Tensor loss = sim + reg;
+        loss.backward();
+        lossValue = loss.template item<double>();
       }
     }
     else
     {
-      // Build the grid directly at the control-grid resolution and warp the pooled moving image.
-      torch::Tensor dd = smoothControl(theta - thetaRef).permute(toChannelLast);
-      torch::Tensor grid = gridBaseCoarse + (dd / scale).flip(-1);
-      torch::Tensor warpedImage = F::grid_sample(movingCoarse, grid, sampleOpts);
-      similarity = (warpedImage - fixedCoarse).pow(2).mean();
+      // Warp by the residual control field (theta - thetaRef): the moving features were extracted
+      // at thetaRef, so this is identity right after a refresh (and == theta when disabled).
+      torch::Tensor similarity;
+      if (featureMode)
+      {
+        // Build each layer's sampling grid directly at its resolution from the smoothed residual
+        // (no full-res detour); smoothing is shared across layers.
+        const torch::Tensor smoothedResidual = smoothControl(theta - thetaRef);
+        similarity = torch::zeros({}, theta.options());
+        for (size_t l = 0; l < movingLayers.size(); ++l)
+        {
+          torch::Tensor warpedLayer =
+            F::grid_sample(movingLayers[l], gridForLayerControl(smoothedResidual, l), sampleOpts);
+          const int64_t channels = movingLayers[l].size(1);
+          torch::Tensor fixedFlat = fixedLayers[l].permute(toChannelLast).reshape({ -1, channels });
+          torch::Tensor warpedFlat = warpedLayer.permute(toChannelLast).reshape({ -1, channels });
+          similarity = similarity + layerWeights[l] * losses[l]->forwardValue(fixedFlat, warpedFlat);
+        }
+      }
+      else
+      {
+        // Build the grid directly at the control-grid resolution and warp the pooled moving image.
+        torch::Tensor dd = smoothControl(theta - thetaRef).permute(toChannelLast);
+        torch::Tensor grid = gridBaseCoarse + (dd / scale).flip(-1);
+        torch::Tensor warpedImage = F::grid_sample(movingCoarse, grid, sampleOpts);
+        similarity = (warpedImage - fixedCoarse).pow(2).mean();
+      }
+      torch::Tensor loss = similarity + reg;
+      loss.backward();
+      lossValue = loss.template item<double>();
     }
-    torch::Tensor loss = similarity + reg;
-
-    loss.backward();
     optimizer.step();
 
-    m_MetricValuesPerIteration.push_back(loss.template item<double>());
+    m_MetricValuesPerIteration.push_back(lossValue);
 
     // FeatureMapUpdateInterval: periodically re-extract the moving feature maps from the moving
     // image warped by the current total field, and reset the residual baseline. theta (and its
     // Adam moments) is untouched; only the reference frame of the moving features changes.
-    if (featureMode && m_FeatureMapUpdateInterval > 0 &&
+    if (featureMode && !jacobianMode && m_FeatureMapUpdateInterval > 0 &&
         (iteration + 1) % static_cast<unsigned int>(m_FeatureMapUpdateInterval) == 0 &&
         iteration + 1 < m_NumberOfIterations)
     {
