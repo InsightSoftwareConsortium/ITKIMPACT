@@ -39,6 +39,7 @@
 #  include "ImpactExport.h"
 #endif
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <sstream>
@@ -147,6 +148,62 @@ public:
   {
     return m_overlap;
   }
+
+  /** The patch overlap per axis, in voxels of the model's own grid and in the same axis order
+   * as GetPatchSize() -- the shape the model was exported for, so the tensor's order, which is
+   * the reverse of ITK's. The reassembly only ever needs the two to agree with each other.
+   *
+   * Always Dimension entries long: the constructor broadcasts its scalar `overlap` across the
+   * axes, so this is the one the reassembly reads and the scalar above stays what it always
+   * was. A per-axis overlap is what an anisotropic patch needs -- a [96, 128, 160] network
+   * asked for the same voxel overlap on all three axes blends its short axis over a much larger
+   * fraction of the patch than its long one. */
+  const std::vector<unsigned int> &
+  GetOverlaps() const
+  {
+    return m_overlaps;
+  }
+
+  /** Override the per-axis overlap. Same axis order as GetPatchSize(), i.e. the model's, which
+   * is the reverse of the order GetVoxelSize() is read in. Fewer entries than Dimension repeat
+   * the last one, so a single value still means "the same on every axis". Ignored by a
+   * configuration that has no model, whose dimension is zero. */
+  void
+  SetOverlaps(const std::vector<unsigned int> & overlaps)
+  {
+    if (overlaps.empty() || m_dimension == 0)
+    {
+      return;
+    }
+    m_overlaps.assign(m_dimension, overlaps.back());
+    for (unsigned int d = 0; d < m_dimension && d < overlaps.size(); ++d)
+    {
+      m_overlaps[d] = overlaps[d];
+    }
+    m_overlap = *std::max_element(m_overlaps.begin(), m_overlaps.end());
+  }
+
+  /** The window overlapping patches are blended with, by name: one of
+   *
+   *  - `mean`     -- plain average of the patches covering a voxel;
+   *  - `cosinus`  -- raised-cosine taper, an exact partition of unity over the overlap;
+   *  - `gaussian` -- nnU-Net's importance weighting, so what TotalSegmentator and
+   *                  MRSegmentator reassemble with (use it to reproduce their output);
+   *  - `trim`     -- keep each patch's central band instead of averaging, which is what
+   *                  carries a discrete output (a label map, an arg-max) through reassembly.
+   *
+   * Defaults to `cosinus`. */
+  const std::string &
+  GetPatchCombine() const
+  {
+    return m_patchCombine;
+  }
+  void
+  SetPatchCombine(const std::string & patchCombine)
+  {
+    m_patchCombine = patchCombine;
+  }
+
   const std::vector<bool> &
   GetLayersMask() const
   {
@@ -180,6 +237,11 @@ private:
   std::vector<int64_t> m_patchSize;
   std::vector<float>   m_voxelSize;
   unsigned int         m_overlap{ 0 };
+  // Per-axis overlap, and the window the overlapping patches are blended with. Both are
+  // filled by the constructor from the scalar overlap, so a caller that knows nothing about
+  // them (Elastix, which passes 0 and never blends) is unaffected.
+  std::vector<unsigned int> m_overlaps;
+  std::string               m_patchCombine{ "cosinus" };
   std::vector<bool>    m_layersMask;
   // Precomputed physical patch offsets (torch-free); see GetPatchIndex().
   std::vector<std::vector<float>> m_patchIndex;

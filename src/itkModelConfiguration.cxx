@@ -42,6 +42,11 @@ ModelConfiguration::ModelConfiguration(std::string               modelPath,
   , m_layersMask(layersMask)
   , m_impl(std::make_shared<detail::ModelConfigurationImpl>())
 {
+  // Broadcast the scalar overlap across the axes. The reassembly reads the per-axis vector
+  // only, so this is the single place the two representations meet; SetOverlaps() overrides it
+  // for a model whose patch is anisotropic.
+  m_overlaps.assign(m_dimension, overlap);
+
   m_impl->dtype = useMixedPrecision ? torch::kFloat16 : torch::kFloat32;
   // The model runs with the default JIT graph-executor optimization (fusion) enabled.
   // Export models WITHOUT data-dependent control flow (e.g. a shape test feeding a

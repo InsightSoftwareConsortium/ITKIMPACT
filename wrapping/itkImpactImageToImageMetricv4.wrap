@@ -24,3 +24,20 @@ itk_wrap_class("itk::ImpactImageToImageMetricv4" POINTER)
   itk_wrap_template("IF2IF2" "itk::Image<float, 2>, itk::Image<float, 2>")
   itk_wrap_template("IF3IF3" "itk::Image<float, 3>, itk::Image<float, 3>")
 itk_end_wrap_class()
+
+# The scales estimator every ITKv4 optimizer wants, instantiated on this metric. ITK wraps it
+# only for its own metrics, so without this a Python caller has to hand-set the optimizer
+# scales -- and a wrong guess sends a rigid transform off the image instead of onto the
+# anatomy, because the scale has to be guessed against the metric's own gradient magnitude.
+# C++ callers instantiate the template themselves and never hit this.
+#
+# POINTER_WITH_2_SUPERCLASSES, as ITK wraps it for its own metrics: SWIG needs
+# RegistrationParameterScalesFromShiftBase and RegistrationParameterScalesEstimator above it,
+# or it refuses the derived class with "nothing known about base class".
+itk_wrap_class("itk::RegistrationParameterScalesFromPhysicalShift" POINTER_WITH_2_SUPERCLASSES)
+  itk_wrap_include("itkImpactImageToImageMetricv4.h")
+  itk_wrap_template("ImpactIF2IF2"
+    "itk::ImpactImageToImageMetricv4<itk::Image<float, 2>, itk::Image<float, 2>>")
+  itk_wrap_template("ImpactIF3IF3"
+    "itk::ImpactImageToImageMetricv4<itk::Image<float, 3>, itk::Image<float, 3>>")
+itk_end_wrap_class()

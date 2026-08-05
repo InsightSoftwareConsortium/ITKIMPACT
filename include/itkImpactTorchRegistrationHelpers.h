@@ -29,6 +29,7 @@
 //   - whole-volume IMPACT feature extraction reusing itk::Forward.
 // Pulls in LibTorch; included only from .hxx files, never part of the castxml surface.
 
+#include "itkImpactPatchTiling.h"
 #include "itkModelConfigurationDetail.h"
 
 #include <itkImage.h>
@@ -196,9 +197,55 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
       torch::from_blob(idx.data(), { static_cast<int64_t>(idx.size()) }, torch::kLong).clone().to(device);
   }
 
+  // Keep only the requested channels of a layer, validating the indices first.
+  auto keepSubset = [&](torch::Tensor layer) {
+    if (!subsetIndex.defined())
+    {
+      return layer;
+    }
+    // SubsetFeatures is an explicit list of channel INDICES (0-based). A raw index_select with an
+    // out-of-range index triggers an asynchronous, context-poisoning CUDA device-side assert
+    // ("srcIndex < srcSelectDimSize") that is impossible to attribute. Validate against this layer's
+    // channel count first and fail with an actionable message instead.
+    const int64_t channels = layer.size(1);
+    for (const unsigned int index : subset)
+    {
+      if (static_cast<int64_t>(index) >= channels)
+      {
+        itkGenericExceptionMacro("ImpactRegistration: SubsetFeatures index "
+                                 << index << " is out of range for a feature layer with " << channels
+                                 << " channel(s). SubsetFeatures lists 0-based channel indices; leave it "
+                                    "empty to keep all channels.");
+      }
+    }
+    return layer.index_select(1, subsetIndex);
+  };
+
   for (const auto & config : configs)
   {
     ModelTo(config, device);
+
+    // A declared patch size means the model is meant to see the volume in pieces -- its trained
+    // field of view, and bounded memory on a volume that does not fit whole. The tiling and its
+    // blend are shared with itk::ImageToFeaturesMap (itkImpactPatchTiling.h) rather than written
+    // twice. Not available with a live autograd graph: a tiled pass would hold every patch's
+    // graph until the blend, so the differentiable-feature mode keeps the whole-volume forward.
+    const std::vector<int64_t> & declaredPatch = config.GetPatchSize();
+    const bool                   tiled =
+      !withGrad && std::any_of(declaredPatch.begin(), declaredPatch.end(), [](int64_t p) { return p > 0; });
+    if (tiled)
+    {
+      for (torch::Tensor & map : RunTiledModel(config,
+                                               imageTensor.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
+                                               device,
+                                               device, // stays on the device; no host round-trip
+                                               PathCombineModeFromString(config.GetPatchCombine())))
+      {
+        layers.push_back(keepSubset(map.unsqueeze(0)).contiguous());
+      }
+      continue;
+    }
+
     const int64_t numberOfChannels = static_cast<int64_t>(config.GetNumberOfChannels());
 
     torch::Tensor input = imageTensor.to(GetModelDtype(config));
@@ -249,26 +296,7 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
       {
         continue;
       }
-      torch::Tensor layer = outputs[i].toTensor().to(torch::kFloat32);
-      if (subsetIndex.defined())
-      {
-        // SubsetFeatures is an explicit list of channel INDICES (0-based). A raw index_select with an
-        // out-of-range index triggers an asynchronous, context-poisoning CUDA device-side assert
-        // ("srcIndex < srcSelectDimSize") that is impossible to attribute. Validate against this layer's
-        // channel count first and fail with an actionable message instead.
-        const int64_t channels = layer.size(1);
-        for (const unsigned int index : subset)
-        {
-          if (static_cast<int64_t>(index) >= channels)
-          {
-            itkGenericExceptionMacro("ImpactRegistration: SubsetFeatures index "
-                                     << index << " is out of range for a feature layer with " << channels
-                                     << " channel(s). SubsetFeatures lists 0-based channel indices; leave it "
-                                        "empty to keep all channels.");
-          }
-        }
-        layer = layer.index_select(1, subsetIndex);
-      }
+      torch::Tensor layer = keepSubset(outputs[i].toTensor().to(torch::kFloat32));
       // Keep the layer at its NATIVE resolution (see the function doc); the consumer resamples it.
       // Detach only in the no-grad path -- withGrad must preserve the graph back to `imageTensor`.
       layers.push_back(withGrad ? layer.contiguous() : layer.detach().contiguous());

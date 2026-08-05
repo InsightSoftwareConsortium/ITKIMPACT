@@ -19,6 +19,9 @@
 #ifndef itkImageToTensorFilter_hxx
 #define itkImageToTensorFilter_hxx
 
+#include <itkContinuousIndex.h>
+#include <itkMultiThreaderBase.h>
+
 #include <vector>
 
 namespace itk
@@ -103,49 +106,68 @@ ImageToTensorFilter<TInputImage, TInterpolator>::GenerateData()
 
   const typename InputImageType::SizeType    oldSize = inputImage->GetLargestPossibleRegion().GetSize();
   const typename InputImageType::SpacingType oldSpacing = inputImage->GetSpacing();
-  const typename InputImageType::PointType   origin = inputImage->GetOrigin();
 
-  // Resampled grid size from the target voxel spacing.
-  typename InputImageType::SizeType newSize;
-  SizeValueType                     numberOfVoxels = 1;
+  // Resampled grid size from the target voxel spacing, and the spacing that grid actually
+  // has. The two differ: newSize is rounded, so an integer number of samples cannot span the
+  // input's extent at exactly m_OutputSpacing. Sample the grid newSize describes -- step
+  // oldSize*oldSpacing/newSize -- rather than m_OutputSpacing, so that the grid is consistent
+  // with its own size. TensorToImageFilter must derive the feature map's spacing as
+  // extent/size (that is how a model's stride is recovered: a /2 encoder halves the size and
+  // the spacing correctly doubles), so a sampler that steps by m_OutputSpacing instead makes
+  // it declare a spacing the samples were never taken at: the error is zero at the origin and
+  // grows linearly, up to half a feature voxel at the far edge, sliding the features off the
+  // anatomy they were computed from. The price is that m_OutputSpacing is honoured only to
+  // within that same rounding (relative error <= 1/(2*newSize)), and exactly when it divides
+  // the extent -- notably whenever it equals the input spacing.
+  typename InputImageType::SizeType    newSize;
+  typename InputImageType::SpacingType newSpacing;
+  SizeValueType                        numberOfVoxels = 1;
   for (unsigned int d = 0; d < ImageDimension; ++d)
   {
     newSize[d] = static_cast<SizeValueType>(oldSize[d] * oldSpacing[d] / m_OutputSpacing[d] + 0.5);
     numberOfVoxels *= newSize[d];
+    newSpacing[d] = newSize[d] > 0 ? oldSize[d] * oldSpacing[d] / newSize[d] : m_OutputSpacing[d];
   }
 
   // Interpolated intensities, filled with the first image axis varying fastest.
   std::vector<float> buffer(static_cast<size_t>(numberOfVoxels), 0.0f);
 
-  // Physical points are formed axis-aligned (origin + index * spacing), matching the Elastix
-  // ImpactTensorUtils::ImageToTensor reference. Direction cosines are intentionally not applied,
-  // to preserve numerical parity with that reference feature extraction.
-  typename InputImageType::IndexType index;
-  index.Fill(0);
-  typename InputImageType::PointType point;
-  for (SizeValueType linearIndex = 0; linearIndex < numberOfVoxels; ++linearIndex)
-  {
-    for (unsigned int d = 0; d < ImageDimension; ++d)
-    {
-      point[d] = origin[d] + index[d] * m_OutputSpacing[d];
-    }
-
-    const auto sampledPoint = m_Transform ? m_Transform(point) : point;
-    if (m_Interpolator->IsInsideBuffer(sampledPoint))
-    {
-      buffer[linearIndex] = static_cast<float>(m_Interpolator->Evaluate(sampledPoint));
-    }
-
-    // Increment the multi-index with the first axis varying fastest.
-    for (unsigned int d = 0; d < ImageDimension; ++d)
-    {
-      if (++index[d] < static_cast<IndexValueType>(newSize[d]))
+  // Sampling points go through the image's own index-to-physical map, so the direction cosines
+  // are applied. The resampled grid shares the input's origin and orientation and differs only
+  // in spacing, which is what scaling the continuous index by newSpacing/oldSpacing expresses.
+  // Forming the points axis-aligned instead (origin + index * spacing) is correct only for an
+  // identity direction, and fails silently otherwise: the points walk off along the wrong
+  // physical axis, IsInsideBuffer() rejects them, and the model is handed an empty volume.
+  //
+  // The coordinate type comes from the image's own PointType, so the continuous index and the
+  // point handed to TransformContinuousIndexToPhysicalPoint agree on it.
+  //
+  // Threaded over the samples -- the dominant cost of feeding a model a resampled volume. Each
+  // sample derives its own index from the flat sample number instead of carrying one, so they
+  // are independent; Evaluate() is called concurrently on one shared interpolator, which is the
+  // contract every ITK InterpolateImageFunction meets (ResampleImageFilter does the same).
+  using ContinuousIndexType = ContinuousIndex<typename InputImageType::PointType::ValueType, ImageDimension>;
+  MultiThreaderBase::New()->ParallelizeArray(
+    0,
+    numberOfVoxels,
+    [&](SizeValueType linearIndex) {
+      ContinuousIndexType continuousIndex;
+      SizeValueType       remainder = linearIndex;
+      for (unsigned int d = 0; d < ImageDimension; ++d) // first axis varying fastest
       {
-        break;
+        continuousIndex[d] = (remainder % newSize[d]) * newSpacing[d] / oldSpacing[d];
+        remainder /= newSize[d];
       }
-      index[d] = 0;
-    }
-  }
+      typename InputImageType::PointType point;
+      inputImage->TransformContinuousIndexToPhysicalPoint(continuousIndex, point);
+
+      const auto sampledPoint = m_Transform ? m_Transform(point) : point;
+      if (m_Interpolator->IsInsideBuffer(sampledPoint))
+      {
+        buffer[linearIndex] = static_cast<float>(m_Interpolator->Evaluate(sampledPoint));
+      }
+    },
+    nullptr);
 
   // Tensor shape reverses the ITK index order (e.g. {z, y, x}) so the first image axis (x)
   // is the contiguous/fastest tensor dimension, consistent with the buffer fill order.

@@ -212,8 +212,9 @@ similarity instead of features. See [`examples/`](examples/) for the runnable sc
 
 ## Examples
 
-Three self-contained scripts in [`examples/`](examples/), each shown below on clinical data
-(a thoraco-abdominal CT, and a CT–MR pair). Everything runs from Python — no `import torch`.
+Runnable scripts in [`examples/`](examples/), each shown below on clinical data (an abdominal
+CT, and a CT–MR pair). Everything runs from Python — no `import torch`. The
+[examples README](examples/README.md) walks through each one with the code.
 
 ### 1. Inference engine — [`ImpactInferenceExample.py`](examples/ImpactInferenceExample.py)
 
@@ -224,22 +225,31 @@ the `layersMask`. Patch tiling with blended overlap keeps memory bounded on full
 
 ![Inference: CT, feature map (PCA-RGB), segmentation](examples/images/example-inference.png)
 
+The last layer is a stack of class logits, so an arg-max over the channel axis is the label map.
+Reassembly follows nnU-Net's, so the result matches what TotalSegmentator produces itself
+(macro Dice 0.889 against the official tool on this case).
+
+![Segmentation: axial, coronal and sagittal views of 20 organs](examples/images/example-segmentation.png)
+
 ### 2. Similarity metric — [`ImpactMetricExample.py`](examples/ImpactMetricExample.py)
 
 `itk.ImpactImageToImageMetricv4` compares images through features rather than intensities, and
 plugs straight into `itk.ImageRegistrationMethodv4`. Driven by the modality-invariant MIND
-descriptor with an NCC distance, it recovers a rigid **CT↔MR** misalignment to ~0.7 mm.
-Overlaying the MR's edges on the CT makes the alignment easy to check.
+descriptor with an NCC distance, it takes back a known 12 mm / 4° **CT↔MR** misalignment on an
+abdominal pair — organ Dice 0.225 → 0.355, of the 0.422 the pair reaches perfectly aligned.
+Overlaying the CT's edges on the MR makes the alignment easy to check.
 
-![Metric v4: CT, MR, before, after](examples/images/example-metricv4.png)
+![Metric v4: MR, CT, before, after](examples/images/example-metricv4.png)
 
 ### 3. ConvexAdam deformable — [`ImpactConvexAdamExample.py`](examples/ImpactConvexAdamExample.py)
 
 `itk.ImpactCoarseRegistration` builds a coarse displacement field from a cost volume, then
 `itk.ImpactFineRegistration` refines it with Adam on the same features — a dense, multi-modal
-deformable registration entirely on the GPU.
+deformable registration entirely on the GPU. On the same pair it reaches Dice 0.465 in 3 s,
+past what a rigid transform can do, because the field also takes up the deformation between
+the two acquisitions.
 
-![ConvexAdam: CT, MR, before, after](examples/images/example-convexadam.png)
+![ConvexAdam: MR, before, after, displacement](examples/images/example-convexadam.png)
 
 ## Quick start (C++)
 

@@ -41,6 +41,8 @@ parser.add_argument("models", nargs="+", help="TorchScript feature model(s), e.g
 parser.add_argument("--out", default="moved.mha")
 parser.add_argument("--iterations", type=int, default=60)
 parser.add_argument("--voxel", type=float, default=2.0)
+parser.add_argument("--mask", default=None,
+                    help="body mask on the fixed image; strongly recommended (see below)")
 parser.add_argument("--device", default="cuda", help='"cpu", "cuda", "cuda:0", ...')
 args = parser.parse_args()
 
@@ -64,6 +66,14 @@ metric.SetSubsetFeatures([12] * len(args.models))  # channels compared per model
 metric.SetPCA([0] * len(args.models))
 metric.SetMode("Static")
 metric.SetDevice(args.device)
+if args.mask:
+    # Air agrees between modalities everywhere, so a whole-image domain measures mostly
+    # background: on an abdominal MR-CT pair the similarity varies by 1e-4 over a 2 cm offset,
+    # which no optimizer can follow, against 5e-2 for the same offset inside the body.
+    mask = itk.ImageMaskSpatialObject[Dimension].New()
+    mask.SetImage(itk.imread(args.mask, itk.UC))
+    mask.Update()
+    metric.SetFixedImageMask(mask)
 
 # Rigid transform, centred on the moving image.
 center = [
@@ -75,15 +85,16 @@ transform.SetIdentity()
 transform.SetCenter(center)
 
 optimizer = itk.RegularStepGradientDescentOptimizerv4[itk.D].New()
-optimizer.SetLearningRate(1.5)
-optimizer.SetMinimumStepLength(1e-3)
+optimizer.SetLearningRate(2.0)
+optimizer.SetMinimumStepLength(1e-4)
 optimizer.SetNumberOfIterations(args.iterations)
-optimizer.SetRelaxationFactor(0.7)
-scales = itk.OptimizerParameters[itk.D](transform.GetNumberOfParameters())
-scales.Fill(1.0)
-for i in range(3):
-    scales[i] = 1000.0                              # rotation (radians) vs translation (mm)
-optimizer.SetScales(scales)
+optimizer.SetRelaxationFactor(0.8)
+# Let ITK derive the parameter scales from the physical shift each parameter causes, rather
+# than guessing a rotation-versus-translation ratio by hand: the right ratio depends on the
+# metric's own gradient magnitude, and a wrong guess walks the transform off the image.
+estimator = itk.RegistrationParameterScalesFromPhysicalShift[type(metric)].New()
+estimator.SetMetric(metric)
+optimizer.SetScalesEstimator(estimator)
 
 registration = itk.ImageRegistrationMethodv4[ImageType, ImageType].New()
 registration.SetFixedImage(fixed)

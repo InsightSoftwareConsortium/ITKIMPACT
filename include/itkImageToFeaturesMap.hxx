@@ -22,6 +22,9 @@
 #include "itkModelConfigurationDetail.h"
 #include "itkImageToFeaturesMapInternals.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace itk
 {
 
@@ -74,6 +77,16 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::AddInput(const TInputImage * inp
     converter->SetTransform(m_Transform);
   }
 
+  // The resampling grid is the image's, so the voxel size is needed on every image axis -- one
+  // entry per image dimension, not per model dimension. A model swept over a volume (a 2D model
+  // run slice by slice) still needs the swept axis's spacing to place its slices.
+  if (m_ModelConfiguration.GetVoxelSize().size() < TInputImage::ImageDimension)
+  {
+    itkExceptionMacro("ImageToFeaturesMap: the voxel size has "
+                      << m_ModelConfiguration.GetVoxelSize().size() << " entries but the input image has "
+                      << TInputImage::ImageDimension
+                      << " dimension(s); give one voxel size per image axis, whatever the model's dimension.");
+  }
   InputImageSpacingType outputSpacing;
   for (unsigned int i = 0; i < TInputImage::ImageDimension; ++i) {
       outputSpacing[i] = m_ModelConfiguration.GetVoxelSize()[i];
@@ -153,131 +166,76 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
   using TensorToImageFilterType = itk::TensorToImageFilter<ImageDimension>;
   const torch::Device device(m_Device);
 
-  // Static feature extraction is pure inference: no gradient ever flows back through the
-  // model here (the metric/registration derivatives go through the feature-map
-  // interpolator, and the online mode has its own autograd path). Without this guard each
-  // patch's forward builds an autograd graph that the kept layer tensors keep alive --
-  // moving them to the CPU does not release it, since they still carry a grad_fn -- so the
-  // device activations of *every* patch stay resident and memory grows with the number of
-  // patches, exhausting the GPU on realistic volumes.
+  // Pure inference: no gradient flows back through the model here. Without the guard every
+  // patch's forward builds an autograd graph that the layer tensors keep alive -- .to(kCPU)
+  // does not release it -- so device activations accumulate over the patches.
   torch::NoGradGuard noGrad;
 
+
+  // The input's intensity statistics and direction matrix, for models whose forward takes
+  // them: TotalSegmentator's exports reorient the patch from the direction and normalise from
+  // the statistics. Without this they take their no-metadata path and their lateralised classes
+  // come out mirrored on any image whose direction is not the identity.
+  SetupImageMetadata<TInputImage>(m_ModelConfiguration, this->GetInput(0));
 
   // Run the model on the configured device; input patches are moved to it and
   // outputs are pulled back to the CPU below.
   ModelTo(m_ModelConfiguration, device);
 
-  torch::Tensor tensorTmp;
-  std::vector<int64_t> padding;
-  for (int it = m_ModelConfiguration.GetDimension()*2 - 1; it >= 0; it--) padding.push_back(m_ModelConfiguration.GetOverlap());
-  torch::Tensor inputTensor = torch::constant_pad_nd(m_Internals->inputsTensor[0], padding, 0);
-  std::vector<int64_t> patchSize = m_ModelConfiguration.GetPatchSize();
-  std::vector<int64_t> inputShape;
-  for (unsigned int dim = 0; dim < m_ModelConfiguration.GetDimension(); ++dim){
-    if (m_ModelConfiguration.GetPatchSize()[dim] <= 0) 
-      patchSize[dim] = inputTensor.size(inputTensor.dim() - m_ModelConfiguration.GetDimension() + dim);
-    inputShape.push_back(inputTensor.size(dim+1));
-  }
-      
-  Patch patch = Patch(inputShape, patchSize, m_ModelConfiguration.GetOverlap());
-  
-  std::vector<Accumulator> accumulators;
+  // Everything below is the tiling, which itkImpactPatchTiling.h owns and the registration
+  // filters share. This filter only decides where the map lands: with PCA it has to exist as a
+  // tensor to be projected, so the accumulator allocates; without it, the map is blended straight
+  // into the output image's pixels and never exists twice.
+  const bool blendInPlace = (m_PCA == 0);
 
-  std::vector<int64_t> channelRepeat(m_ModelConfiguration.GetDimension() + 1, 1);
-  channelRepeat[0] = m_ModelConfiguration.GetNumberOfChannels();
-  
-  for (unsigned int sliceIndex = 0; sliceIndex < patch.size(); ++sliceIndex)
+  std::vector<typename OutputImageType::Pointer> images;
+  auto makeDestination = [&](std::size_t layerIndex, const std::vector<int64_t> & shape) -> torch::Tensor {
+    if (!blendInPlace)
+    {
+      return {};
+    }
+    auto * output = static_cast<OutputImageType *>(this->ProcessObject::GetOutput(layerIndex));
+    return AllocateFeatureImage<ImageDimension>(this->GetInput(0), shape, output);
+  };
+
+  const std::vector<torch::Tensor> maps =
+    RunTiledModel(m_ModelConfiguration,
+                  m_Internals->inputsTensor[0],
+                  device,
+                  torch::Device(torch::kCPU), // the map ends up in an ITK buffer, which is on the host
+                  PathCombineModeFromString(m_ModelConfiguration.GetPatchCombine()),
+                  makeDestination);
+
+  if (blendInPlace)
   {
-    torch::Tensor inputPatch = patch.GetData(inputTensor, sliceIndex)
-                                  .repeat({ torch::IntArrayRef(channelRepeat) })
-                                  .unsqueeze(0)
-                                  .to(device)
-                                  .to(GetModelDtype(m_ModelConfiguration));
-    std::vector<torch::jit::IValue> outputsList;
-    if (accumulators.empty()){
-      try
-      {
-        outputsList = Forward(m_ModelConfiguration, inputPatch);
-      }
-      catch (const std::exception & e)
-      {
-        itkGenericExceptionMacro(
-          "ERROR: The model " << m_ModelConfiguration.GetModelPath()
-                        << " configuration is invalid. The dimensions, number of channels, or patch size may "
-                            "not meet the requirements of the model.\n"
-                            "Details:\n"
-                            " - Number of channels: "
-                        << m_ModelConfiguration.GetNumberOfChannels()
-                        << "\n"
-                            " - Patch size: "
-                        << m_ModelConfiguration.GetPatchSize()
-                        << "\n"
-                            " - Dimension: "
-                        << m_ModelConfiguration.GetDimension()
-                        << "\n"
-                            "Please verify the configuration to ensure compatibility with the model. \n Exception : "
-                        << e.what());
-      }
-      if (m_ModelConfiguration.GetLayersMask().size() != outputsList.size())
-      {
-        itkGenericExceptionMacro("Error: The number of " << m_ModelConfiguration.GetModelPath() << " masks (" << m_ModelConfiguration.GetLayersMask().size()
-                                                          << ") does not match the number of layers ("
-                                                          << outputsList.size()
-                                                          << "). Please ensure that the configuration is consistent.");
-      }
-      for (int index=0, it = 0; it < outputsList.size(); ++it)
-      {
-        if (m_ModelConfiguration.GetLayersMask()[it])
-        {
-          torch::Tensor layerPatch = outputsList[it].toTensor().squeeze(0).to(torch::kCPU).to(torch::kFloat32);
-          float ratio = static_cast<float>(layerPatch.size(1))/static_cast<float>(patchSize[0]);
-          std::vector<int64_t> outputShape;
-          std::vector<int64_t> outputPatchSize;
-          for(int d = 0; d < patchSize.size(); d++){
-            outputShape.push_back(inputTensor.size(d+1)*ratio);
-            outputPatchSize.push_back(layerPatch.size(d+1));
-          }
-          accumulators.push_back(Accumulator(outputShape, outputPatchSize, m_ModelConfiguration.GetOverlap()*ratio, true));
-          accumulators[index].addLayer(sliceIndex, layerPatch);
-          index++;
-        }
-      }
-    } else {
-      outputsList = Forward(m_ModelConfiguration, inputPatch);
-      for (int i = 0, index=0, it = 0; it < outputsList.size(); ++it)
-      {
-        if (m_ModelConfiguration.GetLayersMask()[it])
-        {
-          torch::Tensor layerPatch = outputsList[it].toTensor().squeeze(0).to(torch::kCPU).to(torch::kFloat32);
-          accumulators[index++].addLayer(sliceIndex, layerPatch);
-        }
-      }
-    }
+    // The output images already hold the maps -- `maps` are views of their pixels.
+    return;
+  }
 
-      
-    for(int i = 0; i < accumulators.size(); ++i){
-      if(accumulators[i].isFull()){
-        // A fresh converter per layer: the output is grafted into GetOutput(i), so a
-        // shared instance would let a later layer's Update() overwrite the buffer
-        // already grafted for an earlier layer, corrupting multi-layer feature maps.
-        auto tensorToImageFilter = TensorToImageFilterType::New();
-        tensorToImageFilter->SetReferenceImage(this->GetInput(0));
-        torch::Tensor result = accumulators[i].assemble().contiguous();
-        if (m_PCA > 0){
-          if (m_Internals->principalComponents.size() < accumulators.size())
-            m_Internals->principalComponents.resize(accumulators.size());
-          // Fit the PCA basis once (e.g. on the fixed image); reuse it when one was
-          // injected (e.g. on the moving image) so both share the same basis.
-          if (!m_Internals->principalComponents[i].defined())
-            m_Internals->principalComponents[i] = pca_fit(result, m_PCA);
-          tensorToImageFilter->SetTensor(pca_transform(result, m_Internals->principalComponents[i]));
-        } else {
-          tensorToImageFilter->SetTensor(result);
-        }
-        tensorToImageFilter->Update();
-        this->ProcessObject::GetOutput(i)->Graft(tensorToImageFilter->GetOutput());
-      }
+  if (m_ModelConfiguration.GetDimension() != ImageDimension)
+  {
+    itkGenericExceptionMacro("ImageToFeaturesMap: PCA needs the whole map as one tensor, which a model of lower "
+                             "dimension than the image never forms -- it is run slice by slice.");
+  }
+  if (m_Internals->principalComponents.size() < maps.size())
+  {
+    m_Internals->principalComponents.resize(maps.size());
+  }
+  for (std::size_t i = 0; i < maps.size(); ++i)
+  {
+    // A fresh converter per layer: a shared one would let a later layer's Update() overwrite the
+    // buffer already grafted for an earlier layer.
+    auto tensorToImageFilter = TensorToImageFilterType::New();
+    tensorToImageFilter->SetReferenceImage(this->GetInput(0));
+    // Fit the PCA basis once (e.g. on the fixed image); reuse it when one was injected (e.g. on
+    // the moving image) so both share the same basis.
+    if (!m_Internals->principalComponents[i].defined())
+    {
+      m_Internals->principalComponents[i] = pca_fit(maps[i], m_PCA);
     }
+    tensorToImageFilter->SetTensor(pca_transform(maps[i], m_Internals->principalComponents[i]));
+    tensorToImageFilter->Update();
+    this->ProcessObject::GetOutput(i)->Graft(tensorToImageFilter->GetOutput());
   }
 }
 

@@ -56,11 +56,30 @@ class ImpactToyModelDown(torch.nn.Module):
         return [self.pool(x), self.conv(x)]  # layer 0: 1 channel (clean), layer 1: 3 channels
 
 
+class ImpactToyModel2D(torch.nn.Module):
+    """The 2D counterpart, for the case of a model of lower dimension than the image: it is
+    swept over the volume, one slice at a time."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(1, 4, kernel_size=3, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        features = self.conv(x)              # [B, 4, H, W]
+        passthrough = torch.cat([x, x], 1)   # [B, 2, H, W]
+        return [features, passthrough]
+
+
 def main() -> None:
     torch.manual_seed(20240601)
     model = ImpactToyModel().eval()
     torch.jit.script(model).save("ImpactToyModel.pt")
     print("wrote ImpactToyModel.pt")
+
+    torch.manual_seed(20240601)
+    model2d = ImpactToyModel2D().eval()
+    torch.jit.script(model2d).save("ImpactToyModel2D.pt")
+    print("wrote ImpactToyModel2D.pt")
 
     torch.manual_seed(20240601)
     down = ImpactToyModelDown().eval()

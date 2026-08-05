@@ -207,6 +207,15 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
     // analytic derivative consistent with finite differences of the value.
     constexpr double kGradientStep = 1e-3;
 
+    // A patch step of one voxel along image axis d is the d-th column of the image's
+    // direction matrix, scaled by the requested voxel size -- not world axis d. This is the
+    // same index-to-physical map the Static path applies (via
+    // TransformContinuousIndexToPhysicalPoint in ImageToTensorFilter), so both modes hand the
+    // model the same neighborhood; adding the offsets component-wise in world coordinates is
+    // correct only for an identity direction and silently rotates the patch otherwise.
+    const auto & fixedDirection = this->m_ImpactAssociate->GetFixedImage()->GetDirection();
+    const auto & movingDirection = this->m_ImpactAssociate->GetMovingImage()->GetDirection();
+
     auto firstKeptLayer =
       [](std::vector<torch::jit::IValue> & outputs, const ModelConfiguration & cfg) -> torch::Tensor {
       const auto & mask = cfg.GetLayersMask();
@@ -244,17 +253,20 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
 
       for (int64_t flat = 0; flat < nVox; ++flat)
       {
-        // Decode the row-major multi-index and build the physical offset along each axis.
+        // Decode the multi-index with image axis 0 varying FASTEST, so that reshaping the flat
+        // buffer to the reversed extents below reproduces the Static path's tensor layout.
         int64_t             rem = flat;
         FixedImagePointType  fixedPt = mappedFixedPoint;
         MovingImagePointType movingPt = mappedMovingPoint;
-        for (int d = static_cast<int>(dim) - 1; d >= 0; --d)
+        for (unsigned int d = 0; d < dim; ++d)
         {
           const int64_t idx = rem % patchSize[d];
           rem /= patchSize[d];
           const double off = (static_cast<double>(idx) - (patchSize[d] - 1) / 2.0) * voxelSize[d];
-          fixedPt[d] += off;
-          movingPt[d] += off;
+          for (unsigned int r = 0; r < ImageToImageMetricv4Type::FixedImageDimension; ++r)
+            fixedPt[r] += fixedDirection[r][d] * off;
+          for (unsigned int r = 0; r < movingDimension; ++r)
+            movingPt[r] += movingDirection[r][d] * off;
         }
 
         if (this->m_ImpactAssociate->m_FixedInterpolator->IsInsideBuffer(fixedPt))
@@ -286,9 +298,13 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
       }
 
       // Patch spatial shape and the per-channel repeat the model expects: [1, C, s...].
+      // The extents are reversed (image axis 0 innermost) because the buffer above is filled
+      // with image axis 0 varying fastest -- the same layout ImageToTensorFilter produces, and
+      // the one the TorchScript models are trained on. Reversing the extents rather than
+      // transposing the values keeps anisotropic patch sizes exact instead of scrambling them.
       std::vector<int64_t> spatial;
       for (unsigned int d = 0; d < dim; ++d)
-        spatial.push_back(patchSize[d]);
+        spatial.push_back(patchSize[dim - 1 - d]);
       std::vector<int64_t> channelRepeat(dim + 1, 1);
       channelRepeat[0] = fixedConfig.GetNumberOfChannels();
 

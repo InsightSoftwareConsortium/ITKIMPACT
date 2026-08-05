@@ -739,6 +739,257 @@ TEST(ImpactBackend, MultiLayerFeatureMapsAreIndependent)
   EXPECT_LT(maxDiff, 1e-5) << "layer-0 feature map must not depend on whether layer 1 is also extracted";
 }
 
+// --- Tiling: a blended map must reconstruct the input, whatever the overlap -------
+// The toy model's layer 1 is a passthrough, so with a voxel size equal to the input's the
+// assembled map is the input itself -- exactly, for every window, because each one is
+// normalised into a partition of unity over the patches covering a voxel. Anything that shifts
+// the tiling (a padding collar, a mis-cropped border, a stride that does not match the patch
+// count) breaks the identity, and so does dropping the direction cosines: the sampler then
+// walks off the volume and returns zeros.
+//
+// The image deliberately has a non-identity direction and a size that is not a multiple of the
+// patch on any axis; on an axis-aligned volume of a multiple size, both defects are invisible.
+TEST(ImpactBackend, TiledFeatureMapReconstructsInputForEveryWindow)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  const ImageType::SizeType size = { { 20, 17, 13 } }; // no axis is a multiple of the patch
+  auto                      img = MakeRampImage(size);
+  ImageType::DirectionType  direction;
+  const double              angle = 30.0 * itk::Math::pi / 180.0;
+  direction.SetIdentity();
+  direction[0][0] = std::cos(angle);
+  direction[0][1] = -std::sin(angle);
+  direction[1][0] = std::sin(angle);
+  direction[1][1] = std::cos(angle);
+  img->SetDirection(direction);
+  ImageType::PointType origin;
+  origin[0] = -3.5;
+  origin[1] = 7.25;
+  origin[2] = 1.0;
+  img->SetOrigin(origin);
+
+  for (const std::string window : { "mean", "cosinus", "gaussian", "trim" })
+  {
+    for (const unsigned int overlap : { 0u, 3u, 5u })
+    {
+      itk::ModelConfiguration cfg(
+        ToyModelPath(), 3, 1, { 8, 8, 8 }, { 1.f, 1.f, 1.f }, overlap, { true, true }, false);
+      cfg.SetPatchCombine(window);
+      auto interp = InterpolatorType::New();
+      interp->SetSplineOrder(3);
+      auto f = FeatMapType::New();
+      f->SetModelConfiguration(cfg);
+      f->SetInterpolator(interp);
+      f->AddInput(img);
+      f->SetPCA(0);
+      f->SetDevice("cpu");
+      ASSERT_NO_THROW(f->Update()) << window << " / overlap " << overlap;
+
+      auto map = f->GetOutput(1); // passthrough
+      const std::string where = window + " / overlap " + std::to_string(overlap);
+      ASSERT_EQ(map->GetLargestPossibleRegion().GetSize(), size) << where << ": map must lie on the input grid";
+      for (unsigned int d = 0; d < 3; ++d)
+      {
+        EXPECT_NEAR(map->GetSpacing()[d], 1.0, 1e-6) << where;
+        EXPECT_NEAR(map->GetOrigin()[d], origin[d], 1e-6) << where;
+      }
+      EXPECT_EQ(map->GetDirection(), direction) << where;
+
+      itk::ImageRegionConstIteratorWithIndex<ImageType> it(img, img->GetLargestPossibleRegion());
+      double                                            maxDiff = 0.0;
+      for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+      {
+        maxDiff = std::max(maxDiff, std::abs(static_cast<double>(map->GetPixel(it.GetIndex())[0]) - it.Get()));
+      }
+      EXPECT_LT(maxDiff, 1e-3) << where << ": the blend must reconstruct the input exactly";
+    }
+  }
+}
+
+// The overlap is settable per axis; an anisotropic one must reconstruct just as exactly, and
+// a value at least as large as the patch is a configuration error rather than a silent stall.
+TEST(ImpactBackend, PerAxisOverlapBlendsAndRejectsAnOverlapAsLargeAsThePatch)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  const ImageType::SizeType size = { { 20, 17, 13 } };
+  auto                      img = MakeRampImage(size);
+
+  auto run = [&](const std::vector<unsigned int> & overlaps) {
+    itk::ModelConfiguration cfg(ToyModelPath(), 3, 1, { 8, 8, 8 }, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+    cfg.SetOverlaps(overlaps);
+    EXPECT_EQ(cfg.GetOverlaps().size(), 3u);
+    auto interp = InterpolatorType::New();
+    interp->SetSplineOrder(3);
+    auto f = FeatMapType::New();
+    f->SetModelConfiguration(cfg);
+    f->SetInterpolator(interp);
+    f->AddInput(img);
+    f->SetPCA(0);
+    f->SetDevice("cpu");
+    f->Update();
+    return f;
+  };
+
+  auto              f = run({ 6, 0, 3 });
+  auto              map = f->GetOutput(1);
+  itk::ImageRegionConstIteratorWithIndex<ImageType> it(img, img->GetLargestPossibleRegion());
+  double            maxDiff = 0.0;
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    maxDiff = std::max(maxDiff, std::abs(static_cast<double>(map->GetPixel(it.GetIndex())[0]) - it.Get()));
+  }
+  EXPECT_LT(maxDiff, 1e-3) << "an anisotropic overlap must blend as exactly as a uniform one";
+
+  // An overlap of a whole patch would leave the stride at zero, so the patches never advance.
+  EXPECT_THROW(run({ 8, 8, 8 }), itk::ExceptionObject);
+}
+
+// An anisotropic patch is the shape the model was exported for, so it is consumed in the
+// tensor's axis order -- the reverse of ITK's. GetPatchSize()[0] therefore tiles the LAST ITK
+// axis. The reconstruction test above cannot see this (every window reconstructs a passthrough
+// whatever the layout), so it is pinned here on the convolution layer, where the patch seams
+// are visible. Note that GetVoxelSize() is read in ITK order instead; the two are declared in
+// opposite orders, which only matters for an anisotropic configuration.
+TEST(ImpactBackend, AnisotropicPatchIsTiledInTensorAxisOrder)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  const ImageType::SizeType size = { { 20, 17, 13 } };
+  auto                      img = MakeRampImage(size);
+
+  auto run = [&](const std::vector<unsigned int> & patch) {
+    itk::ModelConfiguration cfg(ToyModelPath(), 3, 1, patch, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+    auto                    interp = InterpolatorType::New();
+    interp->SetSplineOrder(3);
+    auto f = FeatMapType::New();
+    f->SetModelConfiguration(cfg);
+    f->SetInterpolator(interp);
+    f->AddInput(img);
+    f->SetPCA(0);
+    f->SetDevice("cpu");
+    f->Update();
+    return f;
+  };
+
+  // The 8 is patch entry 0, so it lands on the last ITK axis: z (extent 13) is tiled into two
+  // patches, at 0 and 8. Entry 2 (13) lands on x (extent 20), tiled at 0 and 13. The
+  // whole-image run is the seam-free reference.
+  auto tiled = run({ 8, 17, 13 });
+  auto whole = run({ 0, 0, 0 });
+  auto tiledMap = tiled->GetOutput(0);
+  auto wholeMap = whole->GetOutput(0);
+  ASSERT_EQ(tiledMap->GetLargestPossibleRegion().GetSize(), size);
+
+  // Single voxels, not planes: every x-plane crosses the z seam, so only a voxel interior to
+  // its patch on every axis isolates the axis under test.
+  auto diffAt = [&](itk::IndexValueType x, itk::IndexValueType y, itk::IndexValueType z) {
+    const ImageType::IndexType index = { { x, y, z } };
+    const auto                 a = tiledMap->GetPixel(index);
+    const auto                 b = wholeMap->GetPixel(index);
+    double                     worst = 0.0;
+    for (unsigned int c = 0; c < a.GetSize(); ++c)
+    {
+      worst = std::max(worst, std::abs(static_cast<double>(a[c]) - static_cast<double>(b[c])));
+    }
+    return worst;
+  };
+
+  // z's second patch starts at 8, so the convolution on that plane sees its zero padding.
+  EXPECT_GT(diffAt(8, 8, 8), 1.0) << "patch entry 0 tiles z: a seam is expected at z = 8";
+  // The same column at z = 4 lies inside every patch that covers it. Were the patch consumed in
+  // ITK order the 8 would tile x instead, and x = 8 would be the seam.
+  EXPECT_LT(diffAt(8, 8, 4), 1e-3) << "z = 4 is interior to its patch: no seam may appear";
+}
+
+// A model of lower dimension than the image is swept over the axes it does not span: a 2D model
+// on a volume is run slice by slice, along the last ITK axis. The passthrough layer must
+// therefore reconstruct the volume exactly -- every slice is blended into a partition of unity
+// of its own -- and the swept axis must keep its extent and its spacing.
+TEST(ImpactBackend, TwoDimensionalModelIsSweptOverAVolume)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  const std::string model2d = std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt";
+  const ImageType::SizeType size = { { 20, 17, 6 } }; // x, y tiled; z swept
+  auto                      img = MakeRampImage(size);
+  ImageType::SpacingType    spacing;
+  spacing[0] = 1.0;
+  spacing[1] = 1.0;
+  spacing[2] = 2.5; // the swept axis is anisotropic, and must stay so
+  img->SetSpacing(spacing);
+
+  // The patch is 2D but the voxel size covers every image axis: the resampling grid is the
+  // image's, and the swept axis needs a spacing to place its slices.
+  itk::ModelConfiguration cfg(
+    model2d, 2, 1, { 8, 8 }, { 1.f, 1.f, 2.5f }, 3, { true, true }, /*mixedPrecision*/ false);
+  auto interp = InterpolatorType::New();
+  interp->SetSplineOrder(3);
+  auto f = FeatMapType::New();
+  f->SetModelConfiguration(cfg);
+  f->SetInterpolator(interp);
+  f->AddInput(img);
+  f->SetPCA(0);
+  f->SetDevice("cpu");
+  ASSERT_NO_THROW(f->Update());
+
+  auto map = f->GetOutput(1); // passthrough
+  EXPECT_EQ(map->GetLargestPossibleRegion().GetSize(), size) << "the swept axis must keep its extent";
+  EXPECT_EQ(map->GetNumberOfComponentsPerPixel(), 2u);
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    EXPECT_NEAR(map->GetSpacing()[d], spacing[d], 1e-6) << "axis " << d;
+  }
+
+  itk::ImageRegionConstIteratorWithIndex<ImageType> it(img, img->GetLargestPossibleRegion());
+  double                                            maxDiff = 0.0;
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    maxDiff = std::max(maxDiff, std::abs(static_cast<double>(map->GetPixel(it.GetIndex())[0]) - it.Get()));
+  }
+  EXPECT_LT(maxDiff, 1e-3) << "each swept slice must be blended into a partition of unity";
+
+  // The 4-channel convolution layer keeps the same grid.
+  EXPECT_EQ(f->GetOutput(0)->GetLargestPossibleRegion().GetSize(), size);
+  EXPECT_EQ(f->GetOutput(0)->GetNumberOfComponentsPerPixel(), 4u);
+}
+
+// The in-place blend gives the output image its geometry directly; it must agree with what
+// TensorToImageFilter would have produced from the same tensor, since the PCA path still
+// goes through that filter.
+TEST(ImpactBackend, InPlaceFeatureImageGeometryMatchesTensorToImageFilter)
+{
+  const ImageType::SizeType size = { { 20, 17, 13 } };
+  auto                      reference = MakeRampImage(size);
+  ImageType::SpacingType    spacing;
+  spacing[0] = 0.8;
+  spacing[1] = 1.25;
+  spacing[2] = 3.0;
+  reference->SetSpacing(spacing);
+  ImageType::DirectionType direction;
+  direction.SetIdentity();
+  direction[1][1] = -1.0;
+  reference->SetDirection(direction);
+
+  // A map at half the input resolution on one axis, so the derived spacing is exercised.
+  const std::vector<int64_t> shape = { 5, 7, 17, 10 }; // [channels, z, y, x]
+
+  auto inPlace = itk::VectorImage<float, 3>::New();
+  itk::AllocateFeatureImage<3>(reference.GetPointer(), shape, inPlace.GetPointer());
+
+  auto converter = itk::TensorToImageFilter<3>::New();
+  converter->SetReferenceImage(reference.GetPointer());
+  converter->SetTensor(torch::zeros({ shape[0], shape[1], shape[2], shape[3] }));
+  converter->Update();
+  auto viaFilter = converter->GetOutput();
+
+  EXPECT_EQ(inPlace->GetLargestPossibleRegion().GetSize(), viaFilter->GetLargestPossibleRegion().GetSize());
+  EXPECT_EQ(inPlace->GetNumberOfComponentsPerPixel(), viaFilter->GetNumberOfComponentsPerPixel());
+  EXPECT_EQ(inPlace->GetDirection(), viaFilter->GetDirection());
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    EXPECT_NEAR(inPlace->GetSpacing()[d], viaFilter->GetSpacing()[d], 1e-9);
+    EXPECT_NEAR(inPlace->GetOrigin()[d], viaFilter->GetOrigin()[d], 1e-9);
+  }
+}
+
 // --- A downsampling encoder yields a feature map that still overlays the input ----
 // The feature-map spacing/size are derived from the input/output tensor size ratio
 // (TensorToImageFilter: spacing = refExtent/outputSize). A /2 encoder must therefore

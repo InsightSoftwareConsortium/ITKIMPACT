@@ -46,7 +46,10 @@ parser.add_argument("--voxel", type=float, default=1.5, help="model voxel size i
 parser.add_argument("--patch", type=int, default=0,
                     help="patch size in voxels; 0 (default) runs the whole image in one pass")
 parser.add_argument("--overlap", type=int, default=32,
-                    help="patch overlap in voxels, blended on assembly; keep it generous (see below)")
+                    help="patch overlap in voxels, blended on assembly")
+parser.add_argument("--combine", default="cosinus",
+                    help="blend window: mean, cosinus, gaussian (nnU-Net's, as TotalSegmentator "
+                         "uses) or trim (select instead of average, for a label map)")
 parser.add_argument("--feature-out", default="features.mha")
 parser.add_argument("--seg-out", default="segmentation.mha")
 parser.add_argument("--device", default="cuda", help='"cpu", "cuda", "cuda:0", ...')
@@ -61,14 +64,17 @@ image = itk.imread(args.image, itk.F)
 mask = [False] * args.num_layers
 mask[args.feature_layer] = True
 mask[args.seg_layer] = True
-# A patch size of 0 runs the whole image through the model in one pass, which is exact and
-# usually what you want. Patch tiling bounds memory on volumes that do not fit on the device;
-# the patches are then blended over their overlap margins, so give the overlap enough room --
-# with a margin of only a few voxels the blended logits are visibly attenuated near the patch
-# borders, which for a segmentation head is enough to flip the arg-max and speckle the labels.
+# A patch size of 0 runs the whole image through the model in one pass. Patch tiling bounds
+# memory on volumes that do not fit on the device, and gives the model the field of view it was
+# trained on; overlapping patches are blended into a partition of unity, so the assembled map
+# lies on the resampled grid whatever the overlap. A larger overlap costs patches and buys
+# accuracy near the patch borders, where the model has least context.
 voxel = [args.voxel] * Dimension
 patch = [args.patch] * Dimension
 config = itk.ModelConfiguration(args.model, Dimension, 1, patch, voxel, args.overlap, mask, False)
+config.SetPatchCombine(args.combine)
+# The overlap can also be set per axis, which is what an anisotropic patch needs:
+#   config.SetOverlaps([16, 16, 8])
 
 InterpolatorType = itk.BSplineInterpolateImageFunction[ImageType, itk.D, itk.F]
 
