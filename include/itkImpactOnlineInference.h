@@ -47,7 +47,24 @@ namespace itk
 namespace Impact
 {
 
-/** Callback evaluating a patch of image intensities around a point (value-only path). */
+/** The shape a sampled patch must be given as a tensor.
+ *
+ * The host framework fills a flat buffer in GetPatchIndex() order, which runs ITK axis 0
+ * fastest. A row-major tensor over that buffer therefore has ITK x as its LAST, fastest axis:
+ * the shape is the configured patch size reversed, the same convention ImageToTensorFilter and
+ * the metric threader build their tensors with. Passing the un-reversed patch size is correct
+ * only when its first and last entries happen to be equal -- an isotropic patch -- and
+ * silently re-partitions the buffer otherwise. Callbacks are handed this, never the raw patch
+ * size, so the convention lives in one place. */
+inline std::vector<int64_t>
+PatchTensorShape(const ModelConfiguration & configuration)
+{
+  const std::vector<int64_t> & patchSize = configuration.GetPatchSize();
+  return std::vector<int64_t>(patchSize.rbegin(), patchSize.rend());
+}
+
+/** Callback evaluating a patch of image intensities around a point (value-only path). Its third
+ * argument is the tensor shape the returned patch must have: see PatchTensorShape(). */
 template <typename ImagePointType>
 using ImagesPatchValuesEvaluator = std::function<
   torch::Tensor(const ImagePointType &, const std::vector<std::vector<float>> &, const std::vector<int64_t> &)>;
@@ -77,7 +94,8 @@ GetModelOutputsExample(std::vector<itk::ModelConfiguration> & modelsConfig,
       std::vector<int64_t> resizeVector(config.GetPatchSize().size() + 1, 1);
       resizeVector[0] = config.GetNumberOfChannels();
       std::vector<torch::jit::IValue> outputsList;
-      auto modelInput = torch::zeros({ torch::IntArrayRef(config.GetPatchSize()) }, itk::GetModelDtype(config))
+      const std::vector<int64_t>      tensorShape = PatchTensorShape(config);
+      auto modelInput = torch::zeros({ torch::IntArrayRef(tensorShape) }, itk::GetModelDtype(config))
                           .unsqueeze(0)
                           .repeat({ torch::IntArrayRef(resizeVector) })
                           .unsqueeze(0)
@@ -229,7 +247,8 @@ GenerateOutputs(const std::vector<itk::ModelConfiguration> &                    
       std::vector<int64_t> sizes(config.GetPatchSize().size() + 1, -1);
       sizes[0] = nbSample;
 
-      torch::Tensor patchValueTensor = torch::zeros({ torch::IntArrayRef(config.GetPatchSize()) }, itk::GetModelDtype(config))
+      const std::vector<int64_t> tensorShape = PatchTensorShape(config);
+      torch::Tensor patchValueTensor = torch::zeros({ torch::IntArrayRef(tensorShape) }, itk::GetModelDtype(config))
                                          .unsqueeze(0)
                                          .expand(sizes)
                                          .unsqueeze(1)
@@ -238,7 +257,7 @@ GenerateOutputs(const std::vector<itk::ModelConfiguration> &                    
       for (unsigned int s = 0; s < nbSample; ++s)
       {
         patchValueTensor[s] =
-          imagesPatchValuesEvaluator(fixedPoints[s], patchIndex[i][s], config.GetPatchSize()).to(itk::GetModelDtype(config));
+          imagesPatchValuesEvaluator(fixedPoints[s], patchIndex[i][s], tensorShape).to(itk::GetModelDtype(config));
       }
 
       std::vector<int64_t> resizeVector(patchValueTensor.dim(), 1);
@@ -288,7 +307,8 @@ GenerateOutputsAndJacobian(const std::vector<itk::ModelConfiguration> &         
     std::vector<int64_t> sizes(config.GetPatchSize().size() + 1, -1);
     sizes[0] = nbSample;
 
-    torch::Tensor patchValueTensor = torch::zeros({ torch::IntArrayRef(config.GetPatchSize()) }, itk::GetModelDtype(config))
+    const std::vector<int64_t> tensorShape = PatchTensorShape(config);
+    torch::Tensor patchValueTensor = torch::zeros({ torch::IntArrayRef(tensorShape) }, itk::GetModelDtype(config))
                                        .unsqueeze(0)
                                        .expand(sizes)
                                        .unsqueeze(1)
@@ -299,7 +319,7 @@ GenerateOutputsAndJacobian(const std::vector<itk::ModelConfiguration> &         
     for (unsigned int s = 0; s < nbSample; ++s)
     {
       patchValueTensor[s] = imagesPatchValuesAndJacobiansEvaluator(
-                              fixedPoints[s], imagesPatchesJacobians, patchIndex[i][s], config.GetPatchSize(), s)
+                              fixedPoints[s], imagesPatchesJacobians, patchIndex[i][s], tensorShape, s)
                               .to(itk::GetModelDtype(config));
     }
 

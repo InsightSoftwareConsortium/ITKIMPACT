@@ -26,6 +26,7 @@
 #include "itkModelConfiguration.h"
 #include "itkImageToFeaturesMap.h"
 #include "itkImageToFeaturesMapInternals.h"
+#include "itkImpactOnlineInference.h"
 #include "ImpactLoss.h"
 #include "itkImpactImageToImageMetricv4.h"
 #include "itkImpactFineRegistration.h"
@@ -621,9 +622,131 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
   checkLoss("NCC");        // cross-point statistics path
 }
 
-// --- End-to-end: a real ITK optimizer reduces the metric and recovers a shift -
-TEST(ImpactMetric, TranslationRegistrationConverges)
+// A 2D model on a volume samples a plane through each point, and that plane is drawn at random so
+// the metric integrates over orientations instead of always showing the network the same one.
+// Random, but a function of where the point is -- so the value is reproducible, which is what
+// makes the analytic derivative comparable to a finite difference of it at all.
+TEST(ImpactMetric, TwoDimensionalModelJacobianDerivativeMatchesFiniteDifferences)
 {
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  // Blobs rather than ramps: a rotated patch reaches diagonally, so its corners can leave the
+  // buffer, where a sample is clamped to zero. A ramp is at its largest exactly at the border, so
+  // the clamp is a large jump; a blob has decayed to nothing by then and the jump with it.
+  auto fixed = MakeBlobImage(12, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(12, 1.0, -0.7, 0.6, 2.0);
+
+  auto identityFixed = itk::IdentityTransform<double, 3>::New();
+  auto transform = TransformType::New();
+  transform->SetIdentity();
+
+  auto makeMetric = [&](unsigned int workUnits, unsigned int seed) {
+    auto                                 metric = MetricType::New();
+    std::vector<itk::ModelConfiguration> configs;
+    // A 2D patch on a 3D image. The voxel size carries an entry per image axis because
+    // ModelConfiguration pairs the two when it precomputes its patch offsets; Jacobian mode
+    // reads only the two in-plane steps.
+    configs.emplace_back(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt",
+                         2,
+                         1,
+                         std::vector<unsigned int>{ 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         0,
+                         std::vector<bool>{ true, true },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ "DotProduct" });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 4 }); // all 4 conv channels => no random subset on top
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(seed);
+    metric->SetDevice("cpu");
+
+    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+    movingInterp->SetSplineOrder(3);
+    metric->SetMovingInterpolator(movingInterp);
+
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(identityFixed);
+    metric->SetMovingTransform(transform);
+    metric->SetUseFixedImageGradientFilter(false);
+    metric->SetUseMovingImageGradientFilter(false);
+    metric->SetMaximumNumberOfWorkUnits(workUnits);
+
+    // Sample the interior only. A rotated 3x3 patch reaches sqrt(2) voxels diagonally, so
+    // sampling up to the border would put some of its corners outside the moving buffer, where a
+    // sample is clamped to zero. Which corners are out then changes with the transform, making
+    // the metric genuinely discontinuous there -- real, but not what this test is measuring.
+    MetricType::VirtualRegionType virtualRegion;
+    virtualRegion.SetSize({ { 8, 8, 8 } });
+    MetricType::VirtualPointType virtualOrigin;
+    virtualOrigin.Fill(2.0);
+    metric->SetVirtualDomain(fixed->GetSpacing(), virtualOrigin, fixed->GetDirection(), virtualRegion);
+    metric->Initialize();
+    return metric;
+  };
+
+  auto                       metric = makeMetric(1, 1);
+  MetricType::MeasureType    value;
+  MetricType::DerivativeType analyticDerivative;
+  metric->GetValueAndDerivative(value, analyticDerivative);
+  ASSERT_EQ(analyticDerivative.GetSize(), transform->GetNumberOfParameters());
+  EXPECT_TRUE(std::isfinite(static_cast<double>(value)));
+  EXPECT_EQ(metric->GetNumberOfValidPoints(), 8u * 8u * 8u);
+
+  const double                     h = 1e-3;
+  const MetricType::ParametersType params0 = transform->GetParameters();
+  for (unsigned int j = 0; j < transform->GetNumberOfParameters(); ++j)
+  {
+    MetricType::ParametersType pPlus = params0;
+    pPlus[j] += h;
+    transform->SetParameters(pPlus);
+    const double vPlus = static_cast<double>(metric->GetValue());
+
+    MetricType::ParametersType pMinus = params0;
+    pMinus[j] -= h;
+    transform->SetParameters(pMinus);
+    const double vMinus = static_cast<double>(metric->GetValue());
+
+    transform->SetParameters(params0);
+
+    const double fd = (vPlus - vMinus) / (2.0 * h);
+    // Purely relative: an absolute floor would make the comparison vacuous here, where the
+    // derivative of a blob pair is three orders of magnitude smaller than the ramp's.
+    EXPECT_GT(std::abs(fd), 1e-5) << "parameter " << j << ": nothing to compare against";
+    EXPECT_NEAR(static_cast<double>(analyticDerivative[j]), -fd, 0.02 * std::abs(fd)) << "parameter " << j;
+  }
+
+  // The plane a point gets is a function of that point, not of how many points came before it,
+  // so splitting the domain across work units must not change the value. Drawing from a running
+  // per-work-unit generator instead would give each unit its own sequence and move the value.
+  // Exact equality is the right bar: each point contributes the same term in the same order to
+  // the same accumulator whatever the partition, so only a different PLANE can move the result.
+  EXPECT_DOUBLE_EQ(static_cast<double>(makeMetric(4, 1)->GetValue()), static_cast<double>(value))
+    << "the sampled planes must not depend on the work-unit partition";
+
+  // This is the assertion that carries the feature. Every layer is kept and the feature subset
+  // is the whole channel set, so the seed reaches nothing but the plane: were the plane left
+  // axis-aligned, the seed would be dead and these two values would be bit-identical. They must
+  // still land close together, since both integrate the same images over orientations.
+  const double otherSeed = static_cast<double>(makeMetric(1, 7)->GetValue());
+  EXPECT_NE(otherSeed, static_cast<double>(value)) << "a different seed must draw different planes";
+  EXPECT_NEAR(otherSeed, static_cast<double>(value), 0.05 * std::abs(static_cast<double>(value)))
+    << "different planes over the same images must still agree on roughly the same value";
+}
+
+// --- End-to-end: a real ITK optimizer reduces the metric and recovers a shift -
+// Every distance must drive the optimizer downhill, not just the one the test happened to pick.
+// L1 and L2 used to be rescaled by the inverse of their own first value, which made their reported
+// energy exactly 1.0 at every transform: this test passed on NCC and would have failed on L1.
+TEST(ImpactMetric, TranslationRegistrationConvergesForEveryDistance)
+{
+  for (const std::string distance : { "NCC", "L1", "L2", "Cosine", "L1Cosine" })
+  {
   using VirtualImageType = itk::Image<double, 3>;
   using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
   using TransformType = itk::TranslationTransform<double, 3>;
@@ -646,7 +769,7 @@ TEST(ImpactMetric, TranslationRegistrationConverges)
                        std::vector<bool>{ true, true },
                        false);
   metric->SetModelsConfiguration(configs);
-  metric->SetDistance({ "NCC" });
+  metric->SetDistance({ distance });
   metric->SetLayersWeight({ 1.f });
   metric->SetSubsetFeatures({ 4 });
   metric->SetPCA({ 0 });
@@ -686,14 +809,15 @@ TEST(ImpactMetric, TranslationRegistrationConverges)
 
   // The metric, through its analytic derivative, must drive the optimizer downhill.
   const double finalValue = static_cast<double>(metric->GetValue());
-  EXPECT_LT(finalValue, initialValue) << "optimization should reduce the metric";
+  EXPECT_LT(finalValue, initialValue) << distance << ": optimization should reduce the metric";
 
   // The optimizer recovers the true geometric alignment: bringing the moving blob
   // (x=10) onto the fixed one (x=6) is a +4 voxel translation in x, with no y/z motion.
   const TransformType::ParametersType recovered = transform->GetParameters();
-  EXPECT_NEAR(recovered[0], 4.0, 0.5) << "recovered x-translation should reach the +4 alignment";
-  EXPECT_LT(std::abs(recovered[1]), 0.2) << "motion should stay on the x axis";
-  EXPECT_LT(std::abs(recovered[2]), 0.2) << "motion should stay on the x axis";
+  EXPECT_NEAR(recovered[0], 4.0, 0.5) << distance << ": recovered x-translation should reach +4";
+  EXPECT_LT(std::abs(recovered[1]), 0.2) << distance << ": motion should stay on the x axis";
+  EXPECT_LT(std::abs(recovered[2]), 0.2) << distance << ": motion should stay on the x axis";
+  }
 }
 
 // --- Regression: extracting a later layer must not corrupt an earlier one --------
@@ -844,13 +968,11 @@ TEST(ImpactBackend, PerAxisOverlapBlendsAndRejectsAnOverlapAsLargeAsThePatch)
   EXPECT_THROW(run({ 8, 8, 8 }), itk::ExceptionObject);
 }
 
-// An anisotropic patch is the shape the model was exported for, so it is consumed in the
-// tensor's axis order -- the reverse of ITK's. GetPatchSize()[0] therefore tiles the LAST ITK
-// axis. The reconstruction test above cannot see this (every window reconstructs a passthrough
-// whatever the layout), so it is pinned here on the convolution layer, where the patch seams
-// are visible. Note that GetVoxelSize() is read in ITK order instead; the two are declared in
-// opposite orders, which only matters for an anisotropic configuration.
-TEST(ImpactBackend, AnisotropicPatchIsTiledInTensorAxisOrder)
+// An anisotropic patch is declared in ITK axis order, like the voxel size beside it: entry 0 is
+// x. The reconstruction test above cannot see this -- every window reconstructs a passthrough
+// whatever the layout -- so it is pinned here on the convolution layer, where the patch seams
+// are visible.
+TEST(ImpactBackend, AnisotropicPatchIsTiledInItkAxisOrder)
 {
   using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
   const ImageType::SizeType size = { { 20, 17, 13 } };
@@ -870,9 +992,8 @@ TEST(ImpactBackend, AnisotropicPatchIsTiledInTensorAxisOrder)
     return f;
   };
 
-  // The 8 is patch entry 0, so it lands on the last ITK axis: z (extent 13) is tiled into two
-  // patches, at 0 and 8. Entry 2 (13) lands on x (extent 20), tiled at 0 and 13. The
-  // whole-image run is the seam-free reference.
+  // The 8 is patch entry 0, so it tiles x (extent 20): patches at 0, 8 and 16. y takes its full
+  // 17 and z its full 13, one patch each. The whole-image run is the seam-free reference.
   auto tiled = run({ 8, 17, 13 });
   auto whole = run({ 0, 0, 0 });
   auto tiledMap = tiled->GetOutput(0);
@@ -893,17 +1014,97 @@ TEST(ImpactBackend, AnisotropicPatchIsTiledInTensorAxisOrder)
     return worst;
   };
 
-  // z's second patch starts at 8, so the convolution on that plane sees its zero padding.
-  EXPECT_GT(diffAt(8, 8, 8), 1.0) << "patch entry 0 tiles z: a seam is expected at z = 8";
-  // The same column at z = 4 lies inside every patch that covers it. Were the patch consumed in
-  // ITK order the 8 would tile x instead, and x = 8 would be the seam.
-  EXPECT_LT(diffAt(8, 8, 4), 1e-3) << "z = 4 is interior to its patch: no seam may appear";
+  // x's second patch starts at 8, so the convolution there sees its zero padding.
+  EXPECT_GT(diffAt(8, 8, 8), 1.0) << "patch entry 0 tiles x: a seam is expected at x = 8";
+  // x = 4 is interior to the first patch, and y and z hold a single patch each. Were the patch
+  // consumed in the tensor's order the 8 would tile z instead, and this voxel would be clean
+  // while z = 8 carried the seam.
+  EXPECT_LT(diffAt(4, 8, 8), 1e-3) << "x = 4 is interior to its patch: no seam may appear";
 }
 
 // A model of lower dimension than the image is swept over the axes it does not span: a 2D model
 // on a volume is run slice by slice, along the last ITK axis. The passthrough layer must
 // therefore reconstruct the volume exactly -- every slice is blended into a partition of unity
 // of its own -- and the swept axis must keep its extent and its spacing.
+// The online path exists only for the elastix metric, which samples a patch into a flat buffer
+// in GetPatchIndex() order -- ITK axis 0 fastest -- and hands it back as a tensor. A row-major
+// tensor over that buffer therefore has ITK x as its LAST, fastest axis, so its shape is the
+// patch size reversed. Give it the un-reversed shape and every axis but the middle one is
+// misread: for [3, 5, 7] the model is not handed a transposed patch but a re-partitioned one.
+// Isotropic patches hide this completely, which is why it needs a test of its own.
+TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
+{
+  const std::vector<unsigned int> patch = { 3, 5, 7 }; // x, y, z -- no two axes equal
+  const int64_t                   px = 3, py = 5, pz = 7;
+  itk::ModelConfiguration         config(ToyModelPath(),
+                                 3,
+                                 1,
+                                 patch,
+                                 std::vector<float>{ 1.f, 1.f, 1.f },
+                                 0,
+                                 std::vector<bool>{ true, false }, // keep the conv: it is not symmetric
+                                 false);
+
+  const torch::Device                  device(torch::kCPU);
+  std::vector<itk::ModelConfiguration> configs{ config };
+  // Probes the model and records where the center of each output layer is; GenerateOutputs
+  // needs it, and it is the same call the metric makes before its first evaluation.
+  ASSERT_NO_THROW(itk::Impact::GetModelOutputsExample(configs, "fixed", device));
+
+  // An intensity that depends on all three axes differently, so a re-partitioned patch cannot
+  // coincide with a correct one.
+  auto intensity = [](int64_t ix, int64_t iy, int64_t iz) {
+    return static_cast<float>(std::sin(0.7 * ix) + 0.3 * iy - 0.11 * iz * iz);
+  };
+
+  // The reference patch, built directly at the shape the model expects: ITK x innermost.
+  torch::Tensor reference = torch::zeros({ 1, 1, pz, py, px }, torch::kFloat32);
+  auto          referenceAccessor = reference.accessor<float, 5>();
+  for (int64_t iz = 0; iz < pz; ++iz)
+    for (int64_t iy = 0; iy < py; ++iy)
+      for (int64_t ix = 0; ix < px; ++ix)
+        referenceAccessor[0][0][iz][iy][ix] = intensity(ix, iy, iz);
+
+  torch::Tensor referenceCenter;
+  {
+    torch::NoGradGuard ng;
+    referenceCenter = itk::Forward(configs[0], reference)[0].toTensor().index({ "...", pz / 2, py / 2, px / 2 });
+  }
+
+  // What the elastix evaluator does: fill a flat buffer in patch-offset order, then wrap it in
+  // a tensor at the shape it was handed. The offsets carry (index - patchSize/2) at unit voxel
+  // size, so the index each one came from is recoverable.
+  auto evaluator = [&](const itk::Point<double, 3> &,
+                       const std::vector<std::vector<float>> & patchIndex,
+                       const std::vector<int64_t> &            shape) {
+    std::vector<float> values(patchIndex.size(), 0.0f);
+    for (size_t i = 0; i < patchIndex.size(); ++i)
+    {
+      values[i] = intensity(static_cast<int64_t>(patchIndex[i][0]) + px / 2,
+                            static_cast<int64_t>(patchIndex[i][1]) + py / 2,
+                            static_cast<int64_t>(patchIndex[i][2]) + pz / 2);
+    }
+    return torch::from_blob(values.data(), { torch::IntArrayRef(shape) }, torch::kFloat32).unsqueeze(0).clone();
+  };
+
+  std::vector<itk::Point<double, 3>>                        fixedPoints(1);
+  std::vector<std::vector<std::vector<std::vector<float>>>> patchIndex(1);
+  patchIndex[0].push_back(configs[0].GetPatchIndex());
+  ASSERT_EQ(patchIndex[0][0].size(), static_cast<size_t>(px * py * pz));
+
+  const std::vector<torch::Tensor> subset{ torch::arange(4, torch::kInt64) };
+  std::vector<torch::Tensor>       outputs = itk::Impact::GenerateOutputs<itk::Point<double, 3>>(
+    configs, fixedPoints, patchIndex, subset, device, evaluator);
+
+  ASSERT_EQ(outputs.size(), 1u);
+  ASSERT_EQ(outputs[0].sizes(), (std::vector<int64_t>{ 1, 4 }));
+  for (int64_t c = 0; c < 4; ++c)
+  {
+    EXPECT_NEAR(outputs[0][0][c].item<float>(), referenceCenter[0][c].item<float>(), 1e-4)
+      << "channel " << c << ": the online patch must be the one the model would see directly";
+  }
+}
+
 TEST(ImpactBackend, TwoDimensionalModelIsSweptOverAVolume)
 {
   using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;

@@ -258,8 +258,13 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
 
     // A model of lower dimension than the image (a 2D backbone like SAM on a 3D volume) cannot take the
     // whole {1,C,z,y,x} tensor -- it expects {N,C,H,W}. Run it slice-by-slice over the leading spatial
-    // axes it does not cover and stack the per-slice feature layers back, mirroring the Patch-based
-    // slicing ImageToFeaturesMap does. A native-dimension model keeps the single whole-volume forward.
+    // axes it does not cover and stack the per-slice feature layers back.
+    //
+    // RunTiledModel sweeps the same axes and would do this, and with a patch size of 0 it is exact
+    // to the voxel -- a single patch whose blend weight is one everywhere. It is deliberately not
+    // used here: this branch also serves withGrad, whose caller re-runs the network inside the Adam
+    // loop, and routing it through the accumulator would add a map-sized allocation and a second
+    // pass over every feature per iteration to save thirty lines. The two sweeps must stay in step.
     const unsigned int              modelDim = config.GetDimension();
     std::vector<torch::jit::IValue> outputs;
     if (modelDim < Dim)
@@ -305,39 +310,6 @@ ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
   return layers;
 }
 
-/** Fit a PCA basis on a feature tensor {C, spatial...} (no batch): channel-covariance
- * eigendecomposition, keep the top `newC` principal components. Returns the {C, newC} basis.
- * Matches itkImageToFeaturesMap::pca_fit (eigh is ascending, so the largest live at the end). */
-inline torch::Tensor
-PcaFit(const torch::Tensor & input, int64_t newC)
-{
-  const int64_t C = input.size(0);
-  const int64_t N = input.numel() / C;
-  torch::Tensor reshaped = input.reshape({ C, N });
-  torch::Tensor centered = reshaped - reshaped.mean(1, /*keepdim=*/true);
-  torch::Tensor covariance = torch::matmul(centered, centered.t()) / static_cast<double>(N - 1);
-  torch::Tensor eigenvalues, eigenvectors;
-  std::tie(eigenvalues, eigenvectors) = torch::linalg_eigh(covariance);
-  return eigenvectors.narrow(1, C - newC, newC); // {C, newC}, largest-eigenvalue components
-}
-
-/** Project a feature tensor {C, spatial...} onto a PCA basis {C, K} -> {K, spatial...}.
- * Matches itkImageToFeaturesMap::pca_transform (input centered by its own channel mean). */
-inline torch::Tensor
-PcaTransform(const torch::Tensor & input, const torch::Tensor & basis)
-{
-  const int64_t C = input.size(0);
-  const int64_t N = input.numel() / C;
-  torch::Tensor reshaped = input.reshape({ C, N });
-  torch::Tensor projected = torch::matmul(basis.t(), reshaped - reshaped.mean(1, /*keepdim=*/true)); // {K, N}
-  std::vector<int64_t> shape;
-  shape.push_back(basis.size(1));
-  for (int64_t d = 1; d < input.dim(); ++d)
-  {
-    shape.push_back(input.size(d));
-  }
-  return projected.reshape(shape);
-}
 
 /** Channel-first {1, Dim, z,y,x} -> channel-last {z,y,x, Dim} permutation (drops batch). */
 template <unsigned int Dim>

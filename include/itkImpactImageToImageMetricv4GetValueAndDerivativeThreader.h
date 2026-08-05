@@ -202,6 +202,14 @@ protected:
 
   /** Pre-cast associate metric, kept to avoid a dynamic_cast in tight loops. */
   TImpactMetric * m_ImpactAssociate{};
+
+  /** Base seed for the per-point plane a lower-dimensional model is sampled on. Fixed on the
+   * first evaluation and never redrawn: two evaluations of the same parameters have to sample
+   * the same planes, or the metric is not a function of them and its derivative means nothing.
+   * A Seed of zero still means "vary from run to run", it just varies once per metric rather
+   * than once per evaluation. Shared by every work unit, so the value cannot depend on how the
+   * domain was partitioned. */
+  unsigned int m_PlaneSeed{ 0 };
 };
 
 } // end namespace itk

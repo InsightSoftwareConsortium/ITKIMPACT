@@ -47,9 +47,6 @@ namespace itk::Impact
  */
 class Loss
 {
-private:
-  mutable double m_normalization = 0;
-
 protected:
   double        m_value;
   torch::Tensor m_derivative;
@@ -57,13 +54,14 @@ protected:
   int           m_nb_parameters;
 
 public:
-  Loss(bool isLossNormalized)
-  {
-    if (!isLossNormalized)
-    {
-      this->m_normalization = 1.0;
-    }
-  }
+  /** The base used to rescale L1 and L2 by the inverse of their own first value, to make layers
+   * comparable so that one learning rate transferred between them. It could not work: the metric
+   * threader builds fresh loss objects on every evaluation, so the factor was re-latched at every
+   * iteration and the reported value was pinned at 1.0 whatever the transform -- a flat energy,
+   * a gradient magnitude that GREW towards the optimum, a multi-layer descent direction rotated
+   * by each layer's own residual, and a NaN on a perfect match. Losses now report what they
+   * measure; use LayersWeight to balance them. */
+  Loss() = default;
 
   void
   SetNumberOfParameters(int numberOfParameters)
@@ -136,17 +134,13 @@ public:
   virtual double
   GetValue(double N) const
   {
-    if (this->m_normalization == 0)
-    {
-      this->m_normalization = 1 / (this->m_value / N);
-    }
-    return this->m_normalization * this->m_value / N;
+    return this->m_value / N;
   }
 
   virtual torch::Tensor
   GetDerivative(double N) const
   {
-    return this->m_normalization * this->m_derivative.to(torch::kCPU) / N;
+    return this->m_derivative.to(torch::kCPU) / N;
   }
 
   virtual ~Loss() = default;
@@ -228,7 +222,7 @@ class L1 : public Loss
 {
 public:
   L1()
-    : Loss(true)
+    : Loss()
   {}
 
   void
@@ -267,7 +261,7 @@ class L2 : public Loss
 {
 public:
   L2()
-    : Loss(true)
+    : Loss()
   {}
 
   void
@@ -312,7 +306,7 @@ class Dice : public Loss
 {
 public:
   Dice()
-    : Loss(false)
+    : Loss()
   {}
 
   void
@@ -381,7 +375,7 @@ private:
 
 public:
   L1Cosine()
-    : Loss(false)
+    : Loss()
   {
     this->lambda = 0.1;
   }
@@ -442,7 +436,7 @@ class Cosine : public Loss
 {
 public:
   Cosine()
-    : Loss(false)
+    : Loss()
   {}
 
   void
@@ -491,7 +485,7 @@ class DotProduct : public Loss
 {
 public:
   DotProduct()
-    : Loss(false)
+    : Loss()
   {}
 
   void
@@ -560,7 +554,7 @@ private:
 
 public:
   NCC()
-    : Loss(false)
+    : Loss()
   {}
 
   /** NCC is a GLOBAL statistic: forwardValue() reduces over the point axis (per-channel sums over all

@@ -57,6 +57,19 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
 
   const ThreadIdType numWorkUnitsUsed = this->GetNumberOfWorkUnitsUsed();
 
+  // The plane seed follows Seed while it is set, so SetSeed() takes effect whenever it is
+  // called. A Seed of zero asks for run-to-run variation: draw the clock ONCE and keep it, so
+  // the planes still do not move between two evaluations of the same parameters. The clock
+  // value is forced odd so it never collides with the "not yet drawn" zero.
+  if (const unsigned int seed = this->m_ImpactAssociate->GetSeed(); seed > 0)
+  {
+    this->m_PlaneSeed = seed;
+  }
+  else if (this->m_PlaneSeed == 0)
+  {
+    this->m_PlaneSeed = static_cast<unsigned int>(time(nullptr)) | 1u;
+  }
+
   m_LossThreadStruct = make_unique_for_overwrite<AlignedLossPerThreadStruct[]>(numWorkUnitsUsed);
 
   for (ThreadIdType i = 0; i < numWorkUnitsUsed; ++i)
@@ -210,9 +223,11 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
     // A patch step of one voxel along image axis d is the d-th column of the image's
     // direction matrix, scaled by the requested voxel size -- not world axis d. This is the
     // same index-to-physical map the Static path applies (via
-    // TransformContinuousIndexToPhysicalPoint in ImageToTensorFilter), so both modes hand the
-    // model the same neighborhood; adding the offsets component-wise in world coordinates is
-    // correct only for an identity direction and silently rotates the patch otherwise.
+    // TransformContinuousIndexToPhysicalPoint in ImageToTensorFilter), so a model of the
+    // image's own dimension gets the same neighborhood in both modes; adding the offsets
+    // component-wise in world coordinates is correct only for an identity direction and
+    // silently rotates the patch otherwise. A model of lower dimension is the exception: the
+    // Static path sweeps axis-aligned slices, while the plane sampled below is oriented.
     const auto & fixedDirection = this->m_ImpactAssociate->GetFixedImage()->GetDirection();
     const auto & movingDirection = this->m_ImpactAssociate->GetMovingImage()->GetDirection();
 
@@ -251,6 +266,57 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
       torch::Tensor movingGrad = torch::zeros({ nVox, static_cast<int64_t>(movingDimension) }, torch::kFloat32);
       auto          movingGradAccessor = movingGrad.accessor<float, 2>();
 
+      // Which image axes the patch spans. A model of the image's own dimension spans them all, so
+      // each patch axis is one image axis and `plane` is the identity. A model of lower dimension
+      // -- a 2D backbone on a volume -- spans a plane, and taking the same plane at every point
+      // would only ever show the network one orientation of the anatomy; it is drawn afresh for
+      // each sampled point instead, so the metric integrates over orientations as the sampler
+      // walks the image. This is what the elastix metric does through Impact::GetPatchIndex.
+      //
+      // The plane is drawn from a generator seeded by the sampled point itself rather than from
+      // the work unit's running generator, so it depends on WHERE the point is and not on how
+      // many points were processed before it. That distinction is what keeps the metric a
+      // function of the parameters: a transform perturbed by a finite-difference step pushes a
+      // few points out of the moving buffer, which drops them from the sequence, and a running
+      // generator would then hand every later point a different plane -- the two arms of the
+      // difference would sample different anatomy and the derivative would be meaningless. It
+      // also makes the value independent of the work-unit partition.
+      constexpr unsigned int fixedDimension = ImageToImageMetricv4Type::FixedImageDimension;
+      double                 plane[fixedDimension][fixedDimension] = {};
+      for (unsigned int d = 0; d < fixedDimension; ++d)
+      {
+        plane[d][d] = 1.0;
+      }
+      // Only a plane in a volume is rotated: that is the case a lower-dimensional model actually
+      // occurs in, and the one elastix rotates.
+      if (dim == 2 && fixedDimension == 3)
+      {
+        // Mixing the model index in as well keeps two models configured at the same point from
+        // being handed the identical plane, as elastix draws one per (point, model).
+        std::uint_fast32_t pointSeed = static_cast<std::uint_fast32_t>(this->m_PlaneSeed) + 0x9e3779b9u * (i + 1u);
+        for (unsigned int d = 0; d < fixedDimension; ++d)
+        {
+          pointSeed = pointSeed * 2654435761u + static_cast<std::uint_fast32_t>(virtualIndex[d]);
+        }
+        std::mt19937                           pointGenerator(pointSeed);
+        std::uniform_real_distribution<double> angles(0.0, 2.0 * itk::Math::pi);
+        const double                           a = angles(pointGenerator);
+        const double                           b = angles(pointGenerator);
+        const double                           c = angles(pointGenerator);
+        const double ca = std::cos(a), sa = std::sin(a), cb = std::cos(b), sb = std::sin(b);
+        const double cc = std::cos(c), sc = std::sin(c);
+        // Rz * Ry * Rx, as elastix composes them.
+        plane[0][0] = cc * cb;
+        plane[0][1] = cc * sb * sa - sc * ca;
+        plane[0][2] = cc * sb * ca + sc * sa;
+        plane[1][0] = sc * cb;
+        plane[1][1] = sc * sb * sa + cc * ca;
+        plane[1][2] = sc * sb * ca - cc * sa;
+        plane[2][0] = -sb;
+        plane[2][1] = cb * sa;
+        plane[2][2] = cb * ca;
+      }
+
       for (int64_t flat = 0; flat < nVox; ++flat)
       {
         // Decode the multi-index with image axis 0 varying FASTEST, so that reshaping the flat
@@ -263,10 +329,25 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
           const int64_t idx = rem % patchSize[d];
           rem /= patchSize[d];
           const double off = (static_cast<double>(idx) - (patchSize[d] - 1) / 2.0) * voxelSize[d];
-          for (unsigned int r = 0; r < ImageToImageMetricv4Type::FixedImageDimension; ++r)
-            fixedPt[r] += fixedDirection[r][d] * off;
-          for (unsigned int r = 0; r < movingDimension; ++r)
-            movingPt[r] += movingDirection[r][d] * off;
+          // Patch axis `d` points along the plane's `d`-th COLUMN, expressed in the image's own
+          // frame -- elastix spans its patch with `matrix * (x, y, 0)`, whose basis vectors are
+          // the columns, and the rows would span the transposed rotation's plane instead. With
+          // the identity plane this is the direction column `d`, as before.
+          for (unsigned int j = 0; j < fixedDimension; ++j)
+          {
+            const double component = plane[j][d] * off;
+            if (component == 0.0)
+            {
+              continue;
+            }
+            for (unsigned int r = 0; r < fixedDimension; ++r)
+              fixedPt[r] += fixedDirection[r][j] * component;
+            if (j < movingDimension)
+            {
+              for (unsigned int r = 0; r < movingDimension; ++r)
+                movingPt[r] += movingDirection[r][j] * component;
+            }
+          }
         }
 
         if (this->m_ImpactAssociate->m_FixedInterpolator->IsInsideBuffer(fixedPt))

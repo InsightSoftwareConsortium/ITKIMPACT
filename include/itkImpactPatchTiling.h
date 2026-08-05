@@ -32,6 +32,9 @@
 // TotalSegmentator's or MRSegmentator's TorchScript export through it reproduces what those
 // tools produce themselves.
 //
+// The PCA reduction both consumers apply to what it produces lives here too, for the same reason:
+// there was a copy on each side, kept in step by a comment.
+//
 // Include only from translation units that already depend on torch.
 
 #include "itkModelConfigurationDetail.h"
@@ -754,14 +757,15 @@ RunTiledModel(const ModelConfiguration &                                        
   for (unsigned int d = 0; d < dimension; ++d)
   {
     // `d` indexes the TENSOR axes the model spans, which come after the swept ones and run in the
-    // reverse of ITK's order. The patch size is the shape the model was exported for, so it is
-    // consumed in that same order, and the overlap alongside it -- the two only ever have to
-    // agree with each other.
+    // reverse of ITK's order; the patch size and the overlap are declared in ITK order, like the
+    // voxel size beside them, so they are reversed onto it here. A model that spans fewer axes
+    // than the image keeps the leading ITK ones: a 2D patch is (x, y), swept along z.
+    const unsigned int itkAxis = dimension - 1 - d;
     inputShape[d] = input.size(sweptAxes + d + 1);
-    if (configuredPatchSize[d] > 0)
+    if (configuredPatchSize[itkAxis] > 0)
     {
-      patchSize[d] = configuredPatchSize[d];
-      overlaps[d] = d < configuredOverlaps.size() ? static_cast<int64_t>(configuredOverlaps[d]) : 0;
+      patchSize[d] = configuredPatchSize[itkAxis];
+      overlaps[d] = itkAxis < configuredOverlaps.size() ? static_cast<int64_t>(configuredOverlaps[itkAxis]) : 0;
     }
     else
     {
@@ -928,6 +932,45 @@ RunTiledModel(const ModelConfiguration &                                        
 
   return assembled;
 }
+
+namespace Impact
+{
+
+/** Fit a PCA basis on a feature tensor {C, spatial...} (no batch): channel-covariance
+ * eigendecomposition, keep the top `newC` principal components. Returns the {C, newC} basis.
+ * eigh returns ascending eigenvalues, so the largest components live at the end. */
+inline torch::Tensor
+PcaFit(const torch::Tensor & input, int64_t newC)
+{
+  const int64_t C = input.size(0);
+  const int64_t N = input.numel() / C;
+  torch::Tensor reshaped = input.reshape({ C, N });
+  torch::Tensor centered = reshaped - reshaped.mean(1, /*keepdim=*/true);
+  torch::Tensor covariance = torch::matmul(centered, centered.t()) / static_cast<double>(N - 1);
+  torch::Tensor eigenvalues, eigenvectors;
+  std::tie(eigenvalues, eigenvectors) = torch::linalg_eigh(covariance);
+  return eigenvectors.narrow(1, C - newC, newC); // {C, newC}, largest-eigenvalue components
+}
+
+/** Project a feature tensor {C, spatial...} onto a PCA basis {C, K} -> {K, spatial...}.
+ * The input is centred by its own channel mean, as PcaFit centred the data it fitted on. */
+inline torch::Tensor
+PcaTransform(const torch::Tensor & input, const torch::Tensor & basis)
+{
+  const int64_t C = input.size(0);
+  const int64_t N = input.numel() / C;
+  torch::Tensor reshaped = input.reshape({ C, N });
+  torch::Tensor projected = torch::matmul(basis.t(), reshaped - reshaped.mean(1, /*keepdim=*/true)); // {K, N}
+  std::vector<int64_t> shape;
+  shape.push_back(basis.size(1));
+  for (int64_t d = 1; d < input.dim(); ++d)
+  {
+    shape.push_back(input.size(d));
+  }
+  return projected.reshape(shape);
+}
+
+} // namespace Impact
 
 } // namespace itk
 

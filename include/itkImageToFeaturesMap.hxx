@@ -120,44 +120,6 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateOutputInformation()
   // the declaration in itkImageToFeaturesMap.h for the full rationale.
 }
 
-/**
- * ******************* pca_fit ***********************
- */
-inline torch::Tensor
-pca_fit(torch::Tensor input, int new_C)
-{
-
-  int     C = input.size(0);
-  int64_t N = std::accumulate(input.sizes().begin() + 1, input.sizes().end(), 1LL, std::multiplies<int64_t>());
-  
-  // Flatten spatial dimensions to compute PCA across feature channels
-  torch::Tensor reshaped = input.view({ C, N });
-  
-  torch::Tensor centered = reshaped - reshaped.mean(1, true);
-  // Channel-wise covariance matrix of the centered data.
-  torch::Tensor covariance = torch::matmul(centered, centered.t()) / (N - 1);
-
-  torch::Tensor eigenvalues, eigenvectors;
-  std::tie(eigenvalues, eigenvectors) = torch::linalg_eigh(covariance);
-  // Select top-k eigenvectors as principal components
-  return eigenvectors.narrow(1, C - new_C, new_C);
-} // end pca_fit
-
-/**
- * ******************* pca_transform ***********************
- */
-inline torch::Tensor
-pca_transform(torch::Tensor input, torch::Tensor principal_components)
-{
-  int           C = input.size(0);
-  int64_t       N = std::accumulate(input.sizes().begin() + 1, input.sizes().end(), 1LL, std::multiplies<int64_t>());
-  torch::Tensor reshaped = input.view({ C, N });
-  torch::Tensor projected = torch::matmul(principal_components.t(), reshaped - reshaped.mean(1, true));
-
-  std::vector<int64_t> final_shape = { principal_components.size(1) };
-  final_shape.insert(final_shape.end(), input.sizes().begin() + 1, input.sizes().end());
-  return projected.view(final_shape);
-} // end pca_transform
 
 template <typename TInputImage, typename TInterpolator>
 void
@@ -231,9 +193,9 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
     // the moving image) so both share the same basis.
     if (!m_Internals->principalComponents[i].defined())
     {
-      m_Internals->principalComponents[i] = pca_fit(maps[i], m_PCA);
+      m_Internals->principalComponents[i] = Impact::PcaFit(maps[i], m_PCA);
     }
-    tensorToImageFilter->SetTensor(pca_transform(maps[i], m_Internals->principalComponents[i]));
+    tensorToImageFilter->SetTensor(Impact::PcaTransform(maps[i], m_Internals->principalComponents[i]));
     tensorToImageFilter->Update();
     this->ProcessObject::GetOutput(i)->Graft(tensorToImageFilter->GetOutput());
   }

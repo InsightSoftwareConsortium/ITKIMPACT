@@ -301,11 +301,14 @@ ImpactImageToImageMetricv4<TFixedImage,
       ModelTo(config, device);
       const std::vector<int64_t> & patchSize = config.GetPatchSize();
       std::vector<int64_t>         shape = { 1, static_cast<int64_t>(config.GetNumberOfChannels()) };
+      // Reversed onto the tensor axes, exactly as the threader builds the real patch: the probe
+      // has to ask the model the same question the inference will, or an anisotropic patch is
+      // validated at a shape that is never used.
       for (unsigned int d = 0; d < config.GetDimension(); ++d)
       {
         if (d >= patchSize.size() || patchSize[d] <= 0)
           return -1;
-        shape.push_back(patchSize[d]);
+        shape.push_back(patchSize[config.GetDimension() - 1 - d]);
       }
       torch::NoGradGuard ng;
       torch::Tensor      dummy =

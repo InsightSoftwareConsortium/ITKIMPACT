@@ -133,6 +133,9 @@ public:
   {
     return m_numberOfChannels;
   }
+  /** The patch the model was exported for, in ITK axis order (x, y, z) -- the order the voxel
+   * size beside it is given in, and the one every consumer reads it in. A model of lower
+   * dimension than the image declares only the axes it spans, the leading ITK ones. */
   const std::vector<int64_t> &
   GetPatchSize() const
   {
@@ -149,9 +152,8 @@ public:
     return m_overlap;
   }
 
-  /** The patch overlap per axis, in voxels of the model's own grid and in the same axis order
-   * as GetPatchSize() -- the shape the model was exported for, so the tensor's order, which is
-   * the reverse of ITK's. The reassembly only ever needs the two to agree with each other.
+  /** The patch overlap per axis, in voxels of the model's own grid, in ITK axis order (x, y, z)
+   * like GetPatchSize() and GetVoxelSize().
    *
    * Always Dimension entries long: the constructor broadcasts its scalar `overlap` across the
    * axes, so this is the one the reassembly reads and the scalar above stays what it always
@@ -164,10 +166,9 @@ public:
     return m_overlaps;
   }
 
-  /** Override the per-axis overlap. Same axis order as GetPatchSize(), i.e. the model's, which
-   * is the reverse of the order GetVoxelSize() is read in. Fewer entries than Dimension repeat
-   * the last one, so a single value still means "the same on every axis". Ignored by a
-   * configuration that has no model, whose dimension is zero. */
+  /** Override the per-axis overlap, in ITK axis order like GetPatchSize(). Fewer entries than
+   * Dimension repeat the last one, so a single value still means "the same on every axis".
+   * Ignored by a configuration that has no model, whose dimension is zero. */
   void
   SetOverlaps(const std::vector<unsigned int> & overlaps)
   {
