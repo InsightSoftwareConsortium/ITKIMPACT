@@ -22,8 +22,21 @@
 # overlap, layersMask, mixedPrecision) and passes it to ImageToFeaturesMap / the metric.
 itk_wrap_simple_class("itk::ModelConfiguration")
 
-# NOTE: to drive the metric's SetFixedModelsConfiguration / SetMovingModelsConfiguration
-# from Python, std::vector<itk::ModelConfiguration> must also be wrapped. That needs
-# ITK's std::vector wrapping support (stdvector.h), which is set up per the WrapITK
-# vector infrastructure -- a follow-up. ModelConfiguration itself is wrapped and usable
-# (and ImageToFeaturesMap returns an itk.VectorImage, so feature extraction is reachable).
+# The metric and registration filters take a std::vector<itk::ModelConfiguration>
+# (SetFixedModelsConfiguration / SetMovingModelsConfiguration / SetModelsConfiguration),
+# so wrap that container too -- otherwise those setters are unusable from Python. This
+# is the value-type analogue of the std::vector<X_Pointer> containers WrapITK emits
+# automatically for itk::Object subclasses (see Wrapping/TypedefMacros.cmake); with the
+# %template declared, SWIG converts a plain Python list of ModelConfiguration to the
+# std::vector argument (e.g. metric.SetFixedModelsConfiguration([cfgA, cfgB])).
+string(
+  APPEND
+  ITK_WRAP_PYTHON_SWIG_EXT
+  "%template(vectoritkModelConfiguration) std::vector< itkModelConfiguration >;\n"
+)
+add_python_config_template(
+  "vector"
+  "std::vector"
+  "vectoritkModelConfiguration"
+  "itk::ModelConfiguration"
+)

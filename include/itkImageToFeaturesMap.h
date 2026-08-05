@@ -31,6 +31,7 @@
 
 #include <functional>
 #include <memory>
+#include <type_traits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -82,11 +83,17 @@ public:
   using Slice = std::vector<int>;
 
 
+  /** Interpolator used to resample the input into the model's voxel grid. A default
+   * instance is created by the constructor, so setting one is optional and only needed to
+   * customize it (e.g. a different B-spline order) from C++. Not usable from Python: the
+   * interpolator type is wrapped in another module and WrapITK does not share that SWIG
+   * type across module boundaries -- rely on the default there. */
   void
   SetInterpolator(typename TInterpolator::Pointer interp)
   {
     m_Interpolator = interp;
   }
+  itkGetModifiableObjectMacro(Interpolator, TInterpolator);
 
   /** Optional point transform applied while resampling the input into the model's patch
    * grid (e.g. to sample a moving image at transformed points). Set before AddInput().
@@ -134,10 +141,15 @@ public:
     return dynamic_cast<const TInputImage *>(this->ProcessObject::GetInput(index));
   }
 
-  typename OutputImageType::ConstPointer
+  /** The feature map produced for the idx-th kept layer.
+   *
+   * Returns a non-const Pointer (rather than a ConstPointer) on purpose: WrapITK wraps
+   * SmartPointer<VectorImage> but not SmartPointer<const VectorImage>, so a ConstPointer
+   * reaches Python as an opaque, leaking SWIG object instead of an itk.VectorImage. */
+  typename OutputImageType::Pointer
   GetOutput(unsigned int idx)
   {
-    return static_cast<const OutputImageType *>(this->ProcessObject::GetOutput(idx));
+    return static_cast<OutputImageType *>(this->ProcessObject::GetOutput(idx));
   }
 
   typename OutputImageType::ConstPointer

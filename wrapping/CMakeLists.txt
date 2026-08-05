@@ -17,6 +17,13 @@
 #==========================================================================
 
 itk_wrap_module(Impact)
+# Wrap itkModelConfiguration first: it declares the %template for
+# std::vector<itk::ModelConfiguration> (the type the metric/registration setters take).
+# With per-class SWIG modules, that template must be registered before its consumers'
+# submodules are generated, or their SetFixedModelsConfiguration / SetModelsConfiguration
+# see it as an opaque type and reject Python lists. WRAPPER_SUBMODULE_ORDER is honored
+# ahead of the default alphabetical order by itk_auto_load_submodules().
+set(WRAPPER_SUBMODULE_ORDER itkModelConfiguration)
 itk_auto_load_submodules()
 itk_end_wrap_module()
 

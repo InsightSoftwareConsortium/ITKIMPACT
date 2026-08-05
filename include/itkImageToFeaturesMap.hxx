@@ -31,6 +31,20 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::ImageToFeaturesMap()
 {
   this->SetNumberOfRequiredOutputs(1); // minimal; raised by SetModelConfiguration
   this->SetNthOutput(0, OutputImageType::New());
+  // Default interpolator, following the ITK convention that a filter which resamples
+  // provides one (cf. ResampleImageFilter). The wrapped instantiations use a cubic
+  // B-spline, which is what every call site used to set by hand. This also keeps the
+  // filter usable from Python: SetInterpolator() takes a type wrapped in another module
+  // (ITKImageFunction), and WrapITK does not share that SWIG type across module
+  // boundaries, so a Python-created interpolator cannot be passed in.
+  //
+  // TInterpolator may be an abstract interpolator base (Elastix instantiates the filter
+  // on itk::InterpolateImageFunction and injects its own concrete interpolator through
+  // SetInterpolator); such a type has no New(), so only default-construct a concrete one.
+  if constexpr (!std::is_abstract_v<TInterpolator>)
+  {
+    m_Interpolator = TInterpolator::New();
+  }
 }
 
 template <typename TInputImage, typename TInterpolator>
@@ -139,6 +153,16 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
   using TensorToImageFilterType = itk::TensorToImageFilter<ImageDimension>;
   const torch::Device device(m_Device);
 
+  // Static feature extraction is pure inference: no gradient ever flows back through the
+  // model here (the metric/registration derivatives go through the feature-map
+  // interpolator, and the online mode has its own autograd path). Without this guard each
+  // patch's forward builds an autograd graph that the kept layer tensors keep alive --
+  // moving them to the CPU does not release it, since they still carry a grad_fn -- so the
+  // device activations of *every* patch stay resident and memory grows with the number of
+  // patches, exhausting the GPU on realistic volumes.
+  torch::NoGradGuard noGrad;
+
+
   // Run the model on the configured device; input patches are moved to it and
   // outputs are pulled back to the CPU below.
   ModelTo(m_ModelConfiguration, device);
@@ -173,7 +197,7 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
     if (accumulators.empty()){
       try
       {
-        outputsList = GetModel(m_ModelConfiguration).forward({inputPatch}).toList().vec();
+        outputsList = Forward(m_ModelConfiguration, inputPatch);
       }
       catch (const std::exception & e)
       {
@@ -219,7 +243,7 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
         }
       }
     } else {
-      outputsList = GetModel(m_ModelConfiguration).forward({inputPatch}).toList().vec();
+      outputsList = Forward(m_ModelConfiguration, inputPatch);
       for (int i = 0, index=0, it = 0; it < outputsList.size(); ++it)
       {
         if (m_ModelConfiguration.GetLayersMask()[it])

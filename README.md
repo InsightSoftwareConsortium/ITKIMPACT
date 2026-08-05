@@ -186,8 +186,39 @@ warped    = fine.GetWarpedMovingImage()
 ```
 
 Leaving the model configuration empty makes both filters use a raw-intensity (MSE/SSD)
-similarity instead of features. See [`examples/`](examples/) for a metric-based registration
-demo (C++ and Python).
+similarity instead of features. See [`examples/`](examples/) for the runnable scripts below
+(C++ and Python).
+
+## Examples
+
+Three self-contained scripts in [`examples/`](examples/), each shown below on clinical data
+(a thoraco-abdominal CT, and a CT–MR pair). Everything runs from Python — no `import torch`.
+
+### 1. Inference engine — [`ImpactInferenceExample.py`](examples/ImpactInferenceExample.py)
+
+`itk.ImageToFeaturesMap` turns any patch-based TorchScript model into an ITK filter. A single
+forward pass exposes the whole hierarchy, so one run of a TotalSegmentator network yields both
+a mid-level **feature map** and the final **segmentation** — the layers you keep are chosen by
+the `layersMask`. Patch tiling with blended overlap keeps memory bounded on full volumes.
+
+![Inference: CT, feature map (PCA-RGB), segmentation](examples/images/example-inference.png)
+
+### 2. Similarity metric — [`ImpactMetricExample.py`](examples/ImpactMetricExample.py)
+
+`itk.ImpactImageToImageMetricv4` compares images through features rather than intensities, and
+plugs straight into `itk.ImageRegistrationMethodv4`. Driven by the modality-invariant MIND
+descriptor with an NCC distance, it recovers a rigid **CT↔MR** misalignment to ~0.7 mm.
+Overlaying the MR's edges on the CT makes the alignment easy to check.
+
+![Metric v4: CT, MR, before, after](examples/images/example-metricv4.png)
+
+### 3. ConvexAdam deformable — [`ImpactConvexAdamExample.py`](examples/ImpactConvexAdamExample.py)
+
+`itk.ImpactCoarseRegistration` builds a coarse displacement field from a cost volume, then
+`itk.ImpactFineRegistration` refines it with Adam on the same features — a dense, multi-modal
+deformable registration entirely on the GPU.
+
+![ConvexAdam: CT, MR, before, after](examples/images/example-convexadam.png)
 
 ## Quick start (C++)
 
