@@ -17,7 +17,12 @@
 #==========================================================================
 
 [build-system]
-requires = ["scikit-build-core"]
+# torch is a BUILD requirement as well as a runtime one: find_package(Torch) needs the
+# LibTorch headers/libs that ship inside the torch package. Declaring it here lets pip
+# provision it in its build environment, which is the only thing that works under build
+# isolation -- there, the module cannot install it itself, since the isolated environment
+# has no pip to call. Keep the version in lock-step with the runtime dependency below.
+requires = ["scikit-build-core", "torch == 2.12.*"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -82,7 +87,11 @@ cmake.version = ">=3.16.3"
 cmake.args = []
 
 # A table of defines to pass to CMake when configuring the project. Additive.
-cmake.define = {}
+# BUILD_TESTING: none of the test drivers end up in the wheel, and building them needs more
+# of the environment than the module itself (an ITK built with GoogleTest, the ExternalData
+# test images), so a source install would fail on tests nobody asked for. Run the test suite
+# from a regular CMake build instead.
+cmake.define = { BUILD_TESTING = "OFF" }
 
 # Verbose printout when building.
 cmake.verbose = true

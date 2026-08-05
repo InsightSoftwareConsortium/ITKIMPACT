@@ -20,6 +20,10 @@
 # re-used it for documentation here
 get_filename_component(MY_CURRENT_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
 file(READ "${MY_CURRENT_DIR}/README.md" DOCUMENTATION)
+# The README goes through itk_module(DESCRIPTION ...) as a single argument, but CMake reads
+# an unescaped ';' as a list separator: every statement in the C++ snippets would otherwise
+# be split off and reported as "Unknown argument" by itk_module()'s parser.
+string(REPLACE ";" "\\;" DOCUMENTATION "${DOCUMENTATION}")
 
 # itk_module() defines the module dependencies in Impact
 # Impact depends on ITKCommon

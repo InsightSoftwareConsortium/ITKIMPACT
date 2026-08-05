@@ -51,6 +51,16 @@ if(NOT Torch_DIR AND NOT DEFINED Torch_ROOT)
 
     if(NOT IMPACT_Torch_query EQUAL 0 AND IMPACT_AUTO_INSTALL_TORCH)
       message(STATUS "IMPACT: the torch Python package was not found; installing the CPU build via pip ...")
+      # An environment created without pip (e.g. `uv venv`) still ships ensurepip in the
+      # standard library, so bootstrap pip rather than failing on `-m pip`.
+      execute_process(
+        COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip --version
+        RESULT_VARIABLE IMPACT_pip_present OUTPUT_QUIET ERROR_QUIET)
+      if(NOT IMPACT_pip_present EQUAL 0)
+        execute_process(
+          COMMAND "${IMPACT_Python_EXECUTABLE}" -m ensurepip --upgrade
+          RESULT_VARIABLE IMPACT_ensurepip OUTPUT_QUIET ERROR_QUIET)
+      endif()
       execute_process(
         COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip install "torch==2.12.*"
                 --index-url https://download.pytorch.org/whl/cpu
@@ -75,6 +85,18 @@ if(NOT Torch_DIR AND NOT DEFINED Torch_ROOT)
     if(IMPACT_Torch_query EQUAL 0 AND IMPACT_Torch_cmake_prefix)
       message(STATUS "IMPACT: using LibTorch from the installed torch package: ${IMPACT_Torch_cmake_prefix}")
       list(APPEND CMAKE_PREFIX_PATH "${IMPACT_Torch_cmake_prefix}")
+    else()
+      # Say what to do here: the bare find_package(Torch) failure below names a
+      # TorchConfig.cmake the user has no reason to know how to get.
+      message(WARNING
+        "IMPACT: no usable torch for '${IMPACT_Python_EXECUTABLE}', and it could not be "
+        "installed automatically. LibTorch ships inside the torch Python package, so either\n"
+        "  * install it first:  ${IMPACT_Python_EXECUTABLE} -m pip install 'torch==2.12.*'\n"
+        "    (add --index-url https://download.pytorch.org/whl/cpu for the smaller CPU build)\n"
+        "  * or point CMake at an existing one:  -DTorch_DIR=<prefix>/share/cmake/Torch\n"
+        "Under `pip install`, the build runs in an isolated environment with no pip of its "
+        "own, so the automatic install cannot run; torch is declared as a build requirement "
+        "for that case -- use --no-build-isolation only if you provide torch yourself.")
     endif()
   endif()
 endif()

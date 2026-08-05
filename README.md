@@ -119,6 +119,27 @@ To use a manually downloaded LibTorch C++ distribution instead of the pip packag
 inside the ITK source tree by enabling `-DModule_Impact=ON`; with `-DITK_WRAP_PYTHON=ON` this
 also produces the Python wrapping.
 
+### Python (from source)
+
+Installing from a checkout compiles the module, so it needs what a C++ build needs:
+
+```bash
+export ITK_DIR=/path/to/ITK-build          # configured with -DITK_WRAP_PYTHON=ON
+pip install -e /path/to/ITKIMPACT
+```
+
+**LibTorch is handled for you.** `torch` is a build requirement, so pip provisions it in its
+build environment; a plain `cmake` invocation installs the CPU build itself if the package is
+missing. Pass `-DTorch_DIR=<prefix>/share/cmake/Torch` to use a specific one.
+
+**ITK is not, and cannot be.** The `itk` wheels ship the built modules only — no CMake
+configuration and no wrapping infrastructure — so nothing can be fetched from PyPI to build
+against. Point `ITK_DIR` at an ITK build tree, through the environment as above or with
+`--config-settings=cmake.define.ITK_DIR=...`; it must be wrapping-enabled
+(`-DITK_WRAP_PYTHON=ON`) to produce the Python bindings, and built for the same Python. If you
+only want to *use* the module, prefer the released wheel — `pip install itk-impact` needs none
+of this.
+
 ## The Torch registration pipeline
 
 Layer 3 aligns images by their anatomical features in two stages — a coarse discrete

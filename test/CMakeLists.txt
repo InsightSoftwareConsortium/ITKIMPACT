@@ -32,6 +32,28 @@ set(ImpactTests
 
 CreateTestDriver(Impact "${Impact-Test_LIBRARIES}" "${ImpactTests}")
 
+# When ITK is built with ITK_WRAP_PYTHON=ON, ITKCommon embeds itk::PyCommand and so carries
+# undefined Python C-API symbols (PyGILState_Ensure, PyObject_Call, ...). They are referenced
+# by that shared library rather than by our own objects, so --as-needed would drop libpython
+# and leave them unresolved: link it explicitly, for every executable that links ITK.
+function(impact_link_python_embed target)
+  if(NOT ITK_WRAP_PYTHON OR NOT TARGET ${target})
+    return()
+  endif()
+  find_package(Python3 COMPONENTS Development.Embed QUIET)
+  set(_impact_pylib "")
+  if(TARGET Python3::Python)
+    set(_impact_pylib Python3::Python)
+  elseif(IMPACT_PYTHON_EMBED_LIBRARY)
+    set(_impact_pylib ${IMPACT_PYTHON_EMBED_LIBRARY})
+  endif()
+  if(_impact_pylib)
+    target_link_libraries(${target} -Wl,--no-as-needed ${_impact_pylib} -Wl,--as-needed)
+  endif()
+endfunction()
+
+impact_link_python_embed(ImpactTestDriver)
+
 # These tests are self-contained: each synthesizes its own small input at run time.
 # itkImageToFeaturesMapTest runs the committed tiny toy model (Data/ImpactToyModel.pt).
 itk_add_test(NAME itkImageToTensorFilterTest
@@ -56,25 +78,22 @@ itk_add_test(NAME itkInterpolateVectorImageFunctionTest
 # sampleIO demo; a direct object's main() takes precedence, whereas the gtest
 # main archive would be skipped once the shared one resolves the symbol. We
 # therefore link the ITK-provided GTest::GTest (the library only, no main).
+#
+# ITK only exports GTest::GTest when it was built with its GoogleTest module enabled, which
+# is not the case for every ITK a user builds this module against -- and a source install
+# (pip) configures the tests too, so a missing target would fail the whole build over unit
+# tests nobody asked for. Skip this driver in that case; the CTest-driven tests above still
+# run, and CI builds against an ITK that provides it.
+if(NOT TARGET GTest::GTest)
+  message(STATUS
+    "Impact: ITK provides no GTest::GTest target (built without Module_ITKGoogleTest); "
+    "skipping the GoogleTest driver.")
+  return()
+endif()
+
 add_executable(ImpactGTestDriver itkImpactBackendGTest.cxx)
 target_link_libraries(ImpactGTestDriver ${Impact-Test_LIBRARIES} Impact GTest::GTest)
-# When ITK is built with ITK_WRAP_PYTHON=ON, ITKCommon embeds itk::PyCommand (Python C
-# API), so executables linking ITK must also link libpython (the embed library).
-if(ITK_WRAP_PYTHON)
-  find_package(Python3 COMPONENTS Development.Embed QUIET)
-  set(_impact_pylib "")
-  if(TARGET Python3::Python)
-    set(_impact_pylib Python3::Python)
-  elseif(IMPACT_PYTHON_EMBED_LIBRARY)
-    set(_impact_pylib ${IMPACT_PYTHON_EMBED_LIBRARY})
-  endif()
-  # --no-as-needed: the Python C-API symbols are referenced by libITKCommon (a shared
-  # object), not by this executable's own objects, so the default --as-needed would
-  # drop libpython and leave them unresolved.
-  if(_impact_pylib)
-    target_link_libraries(ImpactGTestDriver -Wl,--no-as-needed ${_impact_pylib} -Wl,--as-needed)
-  endif()
-endif()
+impact_link_python_embed(ImpactGTestDriver)
 # The ImpactConvexAdam.RealLungCT* gtest runs on a real lung-CT pair (and the M258 model)
 # kept out of git. Fetch them via ITK ExternalData from the committed .sha512 content links
 # (blobs hosted on data.kitware.com); the gtest skips gracefully if they are unavailable.

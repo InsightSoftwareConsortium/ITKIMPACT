@@ -34,6 +34,20 @@ endif()
 
 if(NOT ITK_SOURCE_DIR)
   include(itk-module-init.cmake)
+  # Unlike LibTorch, ITK cannot be provisioned from its Python package: the itk wheels ship
+  # the built modules only, with no CMake configuration and no wrapping infrastructure. A
+  # source build therefore needs an ITK build tree (configured with ITK_WRAP_PYTHON=ON if
+  # the Python bindings are wanted), which the bare "ITKConfig.cmake not found" below does
+  # not tell you.
+  # find_package() also accepts ITK_DIR from the environment, so only advise when neither
+  # the CMake variable nor the environment names a build tree.
+  if(NOT ITK_DIR AND NOT DEFINED ITK_ROOT AND NOT DEFINED ENV{ITK_DIR})
+    message(STATUS
+      "IMPACT: ITK_DIR is not set. If the configuration fails below, point it at an ITK "
+      "build tree -- as a CMake option (-DITK_DIR=/path/to/ITK-build, or through pip "
+      "--config-settings=cmake.define.ITK_DIR=...) or simply by exporting ITK_DIR. "
+      "`pip install itk` does not provide one -- those wheels carry no CMake files.")
+  endif()
   find_package(ITK REQUIRED)
   list(APPEND CMAKE_MODULE_PATH ${ITK_CMAKE_DIR})
   include(ITKModuleExternal)
