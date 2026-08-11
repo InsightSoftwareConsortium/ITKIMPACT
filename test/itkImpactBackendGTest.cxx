@@ -303,6 +303,91 @@ TEST(ImpactBackend, ImageToFeaturesMapOnCudaWhenAvailable)
   EXPECT_EQ(filter->GetOutput(0)->GetNumberOfComponentsPerPixel(), 4u); // conv features
 }
 
+// Static extracts the moving features once, from the image as acquired, and then samples that
+// frozen map at the transformed point -- so the network never sees the anatomy as it currently
+// aligns. SetFeaturesMapUpdateInterval() re-extracts the map with the transform of the moment
+// applied. The knob existed and was read by nothing, so the map never moved.
+TEST(ImpactMetric, StaticFeaturesMapRefreshFollowsTheTransform)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeBlobImage(12, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(12, 1.2, -0.8, 0.5, 2.0);
+
+  // The passthrough layer is the one to watch: its "features" ARE the intensities, so a map
+  // that followed the transform is directly readable as the resampled image.
+  auto build = [&](int interval, TransformType * transform) {
+    auto                                 metric = MetricType::New();
+    std::vector<itk::ModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         2,
+                         std::vector<bool>{ false, true }, // passthrough only
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ "L2" });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Static");
+    metric->SetSeed(1);
+    metric->SetDevice("cpu");
+    metric->SetFeaturesMapUpdateInterval(interval);
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+    return metric;
+  };
+
+  MetricType::MeasureType    value;
+  MetricType::DerivativeType derivative;
+
+  // Refresh disabled: the map is built once at Initialize() and must never move again, however
+  // far the transform travels.
+  auto transformOff = TransformType::New();
+  transformOff->SetIdentity();
+  auto off = build(0, transformOff);
+  off->GetValueAndDerivative(value, derivative);
+  const double offBefore = static_cast<double>(off->GetValue());
+  MetricType::ParametersType shifted = transformOff->GetParameters();
+  shifted[0] += 3.0;
+  transformOff->SetParameters(shifted);
+  off->GetValueAndDerivative(value, derivative); // would refresh, if the interval allowed it
+  transformOff->SetParameters(MetricType::ParametersType(shifted.GetSize(), 0.0));
+  EXPECT_DOUBLE_EQ(static_cast<double>(off->GetValue()), offBefore)
+    << "with the refresh disabled the moving map must be exactly the one built at Initialize()";
+
+  // Refresh every evaluation: the same round trip must NOT come back to the same value, because
+  // the map was rebuilt while the transform was displaced.
+  auto transformOn = TransformType::New();
+  transformOn->SetIdentity();
+  auto on = build(1, transformOn);
+  on->GetValueAndDerivative(value, derivative);
+  const double onBefore = static_cast<double>(on->GetValue());
+  MetricType::ParametersType shiftedOn = transformOn->GetParameters();
+  shiftedOn[0] += 3.0;
+  transformOn->SetParameters(shiftedOn);
+  on->GetValueAndDerivative(value, derivative); // rebuilds the map at the displaced transform
+  transformOn->SetParameters(MetricType::ParametersType(shiftedOn.GetSize(), 0.0));
+  EXPECT_NE(static_cast<double>(on->GetValue()), onBefore)
+    << "the refresh must have rebuilt the moving map from the displaced transform";
+
+  // And the refresh must not cost the derivative: the moving features are still read at the
+  // transformed point, which is the only parameter-dependent point there is.
+  double norm = 0.0;
+  for (unsigned int j = 0; j < derivative.GetSize(); ++j)
+    norm += derivative[j] * derivative[j];
+  EXPECT_GT(norm, 1e-12) << "a refreshed map must still produce a gradient";
+}
+
 // --- B: the Static-mode metric value is ~0 for identical images, > 0 otherwise
 TEST(ImpactMetric, StaticValueZeroForIdenticalPositiveForDifferent)
 {
@@ -320,7 +405,7 @@ TEST(ImpactMetric, StaticValueZeroForIdenticalPositiveForDifferent)
                          std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
                          2,
-                         std::vector<bool>{ true, true },
+                         std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
     metric->SetDistance({ "Cosine" });   // non-normalized: value is the actual similarity
@@ -374,7 +459,7 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
                          std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
                          2,
-                         std::vector<bool>{ true, true },
+                         std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
     metric->SetDistance({ std::string(lossName) });
@@ -456,7 +541,7 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferencesDisplacementField)
                        std::vector<unsigned int>{ 0, 0, 0 },
                        std::vector<float>{ 1.f, 1.f, 1.f },
                        2,
-                       std::vector<bool>{ true, true },
+                       std::vector<bool>{ true, false },
                        false);
   metric->SetModelsConfiguration(configs);
   metric->SetDistance({ "DotProduct" });
@@ -555,7 +640,7 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
                          std::vector<unsigned int>{ 3, 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
                          0,
-                         std::vector<bool>{ true, true },
+                         std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
     metric->SetDistance({ std::string(lossName) });
@@ -622,6 +707,238 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
   checkLoss("NCC");        // cross-point statistics path
 }
 
+// Online mode runs the model on a batch of points at a time, so what a point contributes must not
+// depend on which batch it happened to land in. For a loss that is a mean of per-point terms that
+// is arithmetic. For NCC it is not: NCC correlates the sampled points with one another, and it
+// holds only because the derivative is accumulated as sums and combined in closed form once every
+// point has been seen. Seeding the backward pass with NCC's own gradient instead would measure the
+// correlation WITHIN a batch -- which at a batch of one is a zero variance, hence an identically
+// zero gradient, silently.
+TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1); // different => non-trivial gradient
+  auto identityFixed = itk::IdentityTransform<double, 3>::New();
+
+  auto evaluate = [&](const char * lossName, unsigned int batchSize, MetricType::DerivativeType & derivative) {
+    auto                                 metric = MetricType::New();
+    std::vector<itk::ModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         0,
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    // All four channels: the feature subset is then drawn without consuming the generator, so a
+    // different number of batches cannot shift the random sequence and confound the comparison.
+    metric->SetSubsetFeatures({ 4 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(1);
+    metric->SetDevice("cpu");
+    metric->SetBatchSize(batchSize);
+
+    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+    movingInterp->SetSplineOrder(3);
+    metric->SetMovingInterpolator(movingInterp);
+
+    auto transform = TransformType::New();
+    transform->SetIdentity();
+
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(identityFixed);
+    metric->SetMovingTransform(transform);
+    metric->SetUseFixedImageGradientFilter(false);
+    metric->SetUseMovingImageGradientFilter(false);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  // The bars are relative rather than exact: batching changes how the per-point terms are grouped
+  // before they are summed, and float addition is not associative. Anything that actually depends
+  // on the batch moves far more than this.
+  for (const char * lossName : { "DotProduct", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType perPoint, ragged, single;
+    // 7 divides neither the 512 sampled points nor anything else here, so the last batch is
+    // short -- the case a batch-boundary mistake shows up in.
+    const double perPointValue = evaluate(lossName, 1, perPoint);
+    const double raggedValue = evaluate(lossName, 7, ragged);
+    const double singleValue = evaluate(lossName, 4096, single);
+
+    EXPECT_NEAR(raggedValue, perPointValue, 1e-6 * std::abs(perPointValue));
+    EXPECT_NEAR(singleValue, perPointValue, 1e-6 * std::abs(perPointValue));
+
+    double norm = 0.0;
+    for (unsigned int j = 0; j < perPoint.GetSize(); ++j)
+    {
+      norm += perPoint[j] * perPoint[j];
+    }
+    ASSERT_GT(norm, 1e-8) << "a derivative of zero would satisfy the comparisons below vacuously";
+
+    for (unsigned int j = 0; j < perPoint.GetSize(); ++j)
+    {
+      EXPECT_NEAR(ragged[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
+      EXPECT_NEAR(single[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
+    }
+  }
+}
+
+// LayersMask is what asks for several depths of the same network to be compared at once -- an
+// early layer answers for texture, a late one for structure. Each kept layer therefore gets its
+// own feature map, its own loss and its own weight, and the value is their weighted sum. The
+// metric used to extract every kept layer and then compare only the first, silently: the rest
+// were computed, allocated and dropped.
+TEST(ImpactMetric, EveryKeptLayerIsCompared)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1); // different => non-trivial gradient
+  auto identityFixed = itk::IdentityTransform<double, 3>::New();
+
+  auto evaluate = [&](const char *                 mode,
+                      const std::vector<bool> &    layersMask,
+                      const std::vector<float> &   layersWeight,
+                      MetricType::DerivativeType & derivative) {
+    const auto layers = static_cast<size_t>(std::count(layersMask.begin(), layersMask.end(), true));
+    auto       metric = MetricType::New();
+    std::vector<itk::ModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         0,
+                         layersMask,
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance(std::vector<std::string>(layers, "L2"));
+    metric->SetLayersWeight(layersWeight);
+    // Larger than either layer has channels: Initialize clamps it, and a subset that is the
+    // whole set is drawn without touching the generator, so the comparison stays deterministic
+    // even though the two layers are not the same width.
+    metric->SetSubsetFeatures(std::vector<unsigned int>(layers, 1000));
+    metric->SetPCA({ 0 }); // one entry per MODEL, not per layer
+    metric->SetMode(mode);
+    metric->SetSeed(1);
+    metric->SetDevice("cpu");
+
+    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+    movingInterp->SetSplineOrder(3);
+    metric->SetMovingInterpolator(movingInterp);
+
+    auto transform = TransformType::New();
+    transform->SetIdentity();
+
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(identityFixed);
+    metric->SetMovingTransform(transform);
+    metric->SetUseFixedImageGradientFilter(false);
+    metric->SetUseMovingImageGradientFilter(false);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  for (const char * mode : { "Static", "Jacobian" })
+  {
+    SCOPED_TRACE(mode);
+    MetricType::DerivativeType firstOnly, secondOnly, both;
+    const double               firstValue = evaluate(mode, { true, false }, { 1.f }, firstOnly);
+    const double               secondValue = evaluate(mode, { false, true }, { 1.f }, secondOnly);
+    const double               bothValue = evaluate(mode, { true, true }, { 1.f, 1.f }, both);
+
+    // The toy model's layer 1 is a passthrough and layer 0 a convolution, so the two disagree.
+    // Without this the sum below would hold just as well if the second layer were the first.
+    EXPECT_GT(std::abs(secondValue - firstValue), 1e-6 * std::abs(firstValue)) << "the two layers must differ";
+    EXPECT_NEAR(bothValue, firstValue + secondValue, 1e-5 * std::abs(firstValue + secondValue));
+
+    ASSERT_EQ(both.GetSize(), firstOnly.GetSize());
+    for (unsigned int j = 0; j < both.GetSize(); ++j)
+    {
+      const double expected = firstOnly[j] + secondOnly[j];
+      EXPECT_NEAR(both[j], expected, 1e-4 * std::abs(expected) + 1e-9) << "parameter " << j;
+    }
+  }
+}
+
+// Every per-layer vector is indexed by the loop over compared layers with no bound check in the
+// hot path, so a size that does not match has to be refused up front: too short reads past the
+// end, too long sums losses that no point ever updated -- over a value that was never even
+// initialized. Too long is exactly what a configuration written for the elastix component looks
+// like, where these vectors are already per kept layer.
+TEST(ImpactMetric, PerLayerVectorsMustMatchTheNumberOfComparedLayers)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  // One model keeping both layers, so two layers are compared: two distances, two weights, two
+  // subsets -- and one PCA, which belongs to the model.
+  auto build = [&](size_t distances, size_t weights, size_t subsets, size_t pca) {
+    auto                                 metric = MetricType::New();
+    std::vector<itk::ModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         0,
+                         std::vector<bool>{ true, true },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance(std::vector<std::string>(distances, "L2"));
+    metric->SetLayersWeight(std::vector<float>(weights, 1.f));
+    metric->SetSubsetFeatures(std::vector<unsigned int>(subsets, 1000));
+    metric->SetPCA(std::vector<unsigned int>(pca, 0));
+    metric->SetMode("Static");
+    metric->SetDevice("cpu");
+
+    auto transform = TransformType::New();
+    transform->SetIdentity();
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->SetUseFixedImageGradientFilter(false);
+    metric->SetUseMovingImageGradientFilter(false);
+    return metric;
+  };
+
+  EXPECT_NO_THROW(build(2, 2, 2, 1)->Initialize());
+  EXPECT_THROW(build(1, 2, 2, 1)->Initialize(), itk::ExceptionObject) << "one distance for two layers";
+  EXPECT_THROW(build(2, 1, 2, 1)->Initialize(), itk::ExceptionObject) << "one weight for two layers";
+  EXPECT_THROW(build(2, 2, 1, 1)->Initialize(), itk::ExceptionObject) << "one subset for two layers";
+  EXPECT_THROW(build(3, 3, 3, 1)->Initialize(), itk::ExceptionObject) << "three entries for two layers";
+  EXPECT_THROW(build(2, 2, 2, 2)->Initialize(), itk::ExceptionObject) << "PCA is per model, not per layer";
+}
+
+
 // A 2D model on a volume samples a plane through each point, and that plane is drawn at random so
 // the metric integrates over orientations instead of always showing the network the same one.
 // Random, but a function of where the point is -- so the value is reproducible, which is what
@@ -654,7 +971,7 @@ TEST(ImpactMetric, TwoDimensionalModelJacobianDerivativeMatchesFiniteDifferences
                          std::vector<unsigned int>{ 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
                          0,
-                         std::vector<bool>{ true, true },
+                         std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
     metric->SetDistance({ "DotProduct" });
@@ -766,7 +1083,7 @@ TEST(ImpactMetric, TranslationRegistrationConvergesForEveryDistance)
                        std::vector<unsigned int>{ 0, 0, 0 },
                        std::vector<float>{ 1.f, 1.f, 1.f },
                        2,
-                       std::vector<bool>{ true, true },
+                       std::vector<bool>{ true, false },
                        false);
   metric->SetModelsConfiguration(configs);
   metric->SetDistance({ distance });

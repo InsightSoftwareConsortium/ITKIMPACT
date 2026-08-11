@@ -53,6 +53,7 @@ public:
   using typename Superclass::AssociateType;
 
   using ImageToImageMetricv4Type = typename Superclass::ImageToImageMetricv4Type;
+  using typename Superclass::VirtualImageType;
   using typename Superclass::VirtualPointType;
   using typename Superclass::VirtualIndexType;
   using typename Superclass::FixedImagePointType;
@@ -196,6 +197,65 @@ protected:
   itkPadStruct(ITK_CACHE_LINE_ALIGNMENT, LossPerThreadStruct, PaddedLossPerThreadStruct);
 
   itkAlignedTypedef(ITK_CACHE_LINE_ALIGNMENT, PaddedLossPerThreadStruct, AlignedLossPerThreadStruct);
+
+  /** A point of the virtual domain that maps inside both images, resolved into each of them.
+   * Online mode evaluates points in batches, so it gathers them before running any model. */
+  struct Sample
+  {
+    VirtualIndexType     m_VirtualIndex;
+    VirtualPointType     m_VirtualPoint;
+    FixedImagePointType  m_FixedPoint;
+    MovingImagePointType m_MovingPoint;
+  };
+
+  /** The plane a patch is cut on, as a matrix whose COLUMNS are the patch axes expressed in
+   * the image's own frame. */
+  using PatchPlaneType = Matrix<double,
+                                ImageToImageMetricv4Type::FixedImageDimension,
+                                ImageToImageMetricv4Type::FixedImageDimension>;
+
+  /** Walk this work unit's share of the domain. Online mode walks it here so it can run the
+   * models on a batch of points at a time; Static mode is left to the framework's own
+   * per-point walk, which ends in ProcessPoint(). */
+  void
+  ThreadedExecution(const DomainType & domain, const ThreadIdType threadId) override;
+
+  /** Gather the points of the domain that map inside both images. Overloaded on the two
+   * domain types the v4 partitioners hand out: a region of the virtual image when the metric
+   * samples densely, a range of indices into the sampled point set when it does not. */
+  std::vector<Sample>
+  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region) const;
+  std::vector<Sample>
+  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange) const;
+
+  /** Resolve one virtual point into both image spaces; false if it falls outside either. */
+  bool
+  ResolveSample(const VirtualIndexType & virtualIndex, const VirtualPointType & virtualPoint, Sample & sample) const;
+
+  /** The plane model \p modelIndex cuts its patch on at \p virtualIndex. Identity for a model
+   * of the image's own dimension; a rotation for a lower-dimensional one. */
+  PatchPlaneType
+  PatchPlane(const VirtualIndexType & virtualIndex, size_t modelIndex, unsigned int modelDimension) const;
+
+  /** Sample model \p modelIndex's intensity patch around one point in both images, and the
+   * moving interpolator's spatial gradient at every patch voxel, into row \p row of the batch
+   * tensors ([B, nVox] for the values, [B, nVox, MovingDim] for the gradient). */
+  void
+  SamplePatch(const Sample &  sample,
+              size_t          modelIndex,
+              int64_t         row,
+              torch::Tensor & fixedPatches,
+              torch::Tensor & movingPatches,
+              torch::Tensor & movingGradients,
+              bool            computeDerivative) const;
+
+  /** Run the models on one batch of points, accumulating the layer losses and, when a
+   * derivative is requested, their gradient. */
+  void
+  EvaluateJacobianBatch(typename std::vector<Sample>::const_iterator first,
+                        typename std::vector<Sample>::const_iterator last,
+                        const ThreadIdType                           threadId,
+                        LossPerThreadStruct &                        loss) const;
 
   /** One accumulator per work unit, allocated in BeforeThreadedExecution. */
   mutable std::unique_ptr<AlignedLossPerThreadStruct[]> m_LossThreadStruct{ nullptr };

@@ -251,6 +251,17 @@ private:
   std::shared_ptr<detail::ModelConfigurationImpl> m_impl;
 };
 
+/** How many of a model's layers are compared. Comparing several depths of the same network is
+ * what LayersMask is for -- an early layer answers for texture, a late one for structure -- so
+ * each kept layer gets its own feature map, its own loss and its own weight. This is the single
+ * definition of that count: the metric sizes Distance, LayersWeight and SubsetFeatures by the
+ * sum of it over the models, and ImageToFeaturesMap allocates one output per unit of it. */
+inline unsigned int
+NumberOfKeptLayers(const ModelConfiguration & configuration)
+{
+  const std::vector<bool> & layersMask = configuration.GetLayersMask();
+  return static_cast<unsigned int>(std::count(layersMask.begin(), layersMask.end(), true));
+}
 
 } // end namespace itk
 

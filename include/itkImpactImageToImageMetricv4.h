@@ -188,11 +188,60 @@ public:
   itkSetMacro(Seed, unsigned int);
   itkGetConstMacro(Seed, unsigned int);
 
-  /** Set/Get how often (in optimizer iterations) the feature maps are refreshed.
-   * 0 disables refreshes; positive values enable periodic updates.
+  /** Set/Get how many sampled points the online ("Jacobian") mode runs through a model at
+   * once. Online mode cuts a patch around every point and pushes it through the network, so
+   * evaluating points one at a time costs one forward and one backward pass each; a batch
+   * amortises both over all of its points, which is what makes the mode affordable. The batch
+   * also bounds the memory: it holds one patch and the model's activations for each of its
+   * points, so lower it for large patches and raise it for small ones. Ignored in Static
+   * mode, which interpolates a precomputed map instead of running the model.
+   *
+   * The default is not a compromise between speed and memory so much as a floor. A batch of a
+   * few points makes tensors that are large enough for LibTorch to hand its ops to the whole
+   * intra-op thread pool and far too small to pay for the barriers, which measured two orders
+   * of magnitude slower than either a batch of one or a batch past a few dozen. Values well
+   * below the default are best avoided whatever the memory. */
+  itkSetMacro(BatchSize, unsigned int);
+  itkGetConstMacro(BatchSize, unsigned int);
+
+  /** Set/Get how often the moving feature map is recomputed, in derivative evaluations.
+   * Zero or negative disables it, which is the default and the behaviour of every release
+   * before this one.
+   *
+   * Static mode extracts the moving features once, from the moving image as acquired, and then
+   * samples that frozen map at the transformed point. The network therefore never sees the
+   * anatomy as it currently aligns. A refresh re-extracts the map with the transform of the
+   * moment applied, which is what makes a hybrid between Static's cost and the online mode's
+   * fidelity.
+   *
+   * The interval counts GetValueAndDerivative() calls, which is one per iteration for a
+   * gradient optimizer -- the metric has no other notion of an iteration. A value-only
+   * GetValue(), as a line search issues, does not count.
+   *
+   * The refreshed map keeps the moving image's grid and is still sampled at the transformed
+   * point, matching the elastix component. That is what preserves the derivative: the moving
+   * features have to be read at a parameter-dependent point for a gradient to exist at all,
+   * and the only such point is the transformed one. It also means the transform is applied
+   * once when building the map and once when reading it, so the refreshed features answer for
+   * a point further along than the one being scored. The approximation is exact at the moment
+   * of the refresh, when the map is fresh, and degrades as the transform moves away from it --
+   * shorter intervals keep it closer.
    */
   itkSetMacro(FeaturesMapUpdateInterval, int);
   itkGetConstMacro(FeaturesMapUpdateInterval, int);
+
+  /** Recompute the moving feature map with the current transform applied, reusing the PCA
+   * basis fitted on the fixed image. Called on the schedule GetFeaturesMapUpdateInterval()
+   * sets; call it directly to drive the refresh from a host framework's own iteration hook.
+   * Does nothing outside Static mode, which is the only mode holding a precomputed map. */
+  void
+  UpdateMovingFeaturesMaps();
+
+  /** Counts the evaluation and refreshes the moving feature map when one is due, then defers
+   * to the base metric. */
+  void
+  GetValueAndDerivative(typename Superclass::MeasureType &    value,
+                        typename Superclass::DerivativeType & derivative) const override;
 
   void
   Initialize() override;
@@ -238,7 +287,10 @@ private:
   std::vector<unsigned int> m_PCA;
   std::vector<float>        m_LayersWeight;
   std::vector<std::string>  m_Distance;
-  int                       m_FeaturesMapUpdateInterval;
+  int                       m_FeaturesMapUpdateInterval{ 0 };
+  /** Derivative evaluations since Initialize(), the metric's stand-in for an iteration count.
+   * Mutable because GetValueAndDerivative() is const, as the base metric declares it. */
+  mutable unsigned long     m_CurrentIteration{ 0 };
   std::string               m_Mode;
   std::string               m_FeatureMapsPath;
   std::string               m_Device = "cpu";
@@ -246,6 +298,7 @@ private:
   // It must have a value even when the user never calls SetSeed(): it is read on every
   // evaluation, and an indeterminate one would make the metric unreproducible at random.
   unsigned int              m_Seed{ 0 };
+  unsigned int              m_BatchSize{ 64 };
 
   std::vector<std::vector<unsigned int>> m_features_indexes;
 };

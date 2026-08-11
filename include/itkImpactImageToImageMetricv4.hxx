@@ -118,11 +118,15 @@ ImpactImageToImageMetricv4<TFixedImage,
       << "\nPCA: " << GetStringFromVector<unsigned int>(this->GetPCA())
       << "\nLayersWeight: " << GetStringFromVector<float>(this->GetLayersWeight())
       << "\nDistance: " << GetStringFromVector<std::string>(this->GetDistance()) << "\nMode: " << this->GetMode()
-      << "\nDevice: " << this->GetDevice();
+      << "\nDevice: " << this->GetDevice() << "\nSeed: " << this->GetSeed();
 
   if (this->GetMode() == "Static")
   {
     os << "\nFeaturesMapUpdateInterval: " << this->GetFeaturesMapUpdateInterval() << "\nFeatureMapsPath: " << this->GetFeatureMapsPath();
+  }
+  else
+  {
+    os << "\nBatchSize: " << this->GetBatchSize();
   }
 }
 
@@ -155,6 +159,14 @@ ImpactImageToImageMetricv4<TFixedImage,
     typename ImageToFeaturesMapType::Pointer imageToFeaturesMap = ImageToFeaturesMapType::New();
     imageToFeaturesMap->SetModelConfiguration(modelsConfiguration[i]);
     imageToFeaturesMap->SetInterpolator(interpolator);
+    // The moving image is sampled through the transform, so a refresh sees the anatomy as it
+    // currently aligns rather than as acquired. This argument used to be taken and dropped,
+    // which left the map frozen and SetFeaturesMapUpdateInterval() with nothing to act on.
+    // With an identity transform -- the usual state at Initialize() -- it changes nothing.
+    if (fct)
+    {
+      imageToFeaturesMap->SetTransform(fct);
+    }
     imageToFeaturesMap->AddInput(image);
     imageToFeaturesMap->SetPCA(m_PCA[i]);
     imageToFeaturesMap->SetDevice(this->m_Device);
@@ -173,7 +185,6 @@ ImpactImageToImageMetricv4<TFixedImage,
       }
       this->m_Internals->m_Principal_components[i] = GetPrincipalComponents(*imageToFeaturesMap);
     }
-    const auto featuresMap = imageToFeaturesMap->GetOutput(0);
     if (!this->GetFeatureMapsPath().empty())
     {
       typename WriterType::Pointer writer = WriterType::New();
@@ -204,21 +215,86 @@ ImpactImageToImageMetricv4<TFixedImage,
       {
         itkGenericExceptionMacro("Error writing image: " << writer->GetFileName() << " ITK Exception: " << error);
       }
-
-      writer->SetFileName(this->GetFeatureMapsPath() + (fct ? "/Moving_" : "/Fixed_") + std::to_string(i) + ".mha");
-      writer->SetInput(featuresMap);
-      try
-      {
-        writer->Update();
-      }
-      catch (itk::ExceptionObject & error)
-      {
-        itkGenericExceptionMacro("Error writing image: " << writer->GetFileName() << " ITK Exception: " << error);
-      }
     }
-    featuresMaps.emplace_back(featuresMap);
+
+    // One map per KEPT layer, in mask order: comparing several depths of the same network is
+    // what LayersMask asks for, and the filter has already produced them all. They are appended
+    // to one flat list across models, which is the order Distance, LayersWeight and
+    // SubsetFeatures are read in -- the dumped file is named by that same flat index.
+    for (unsigned int layer = 0; layer < NumberOfKeptLayers(modelsConfiguration[i]); ++layer)
+    {
+      const auto featuresMap = imageToFeaturesMap->GetOutput(layer);
+      if (!this->GetFeatureMapsPath().empty())
+      {
+        typename WriterType::Pointer writer = WriterType::New();
+        writer->SetFileName(this->GetFeatureMapsPath() + (fct ? "/Moving_" : "/Fixed_") +
+                            std::to_string(featuresMaps.size()) + ".mha");
+        writer->SetInput(featuresMap);
+        try
+        {
+          writer->Update();
+        }
+        catch (itk::ExceptionObject & error)
+        {
+          itkGenericExceptionMacro("Error writing image: " << writer->GetFileName() << " ITK Exception: " << error);
+        }
+      }
+      featuresMaps.emplace_back(featuresMap);
+    }
   }
   return featuresMaps;
+}
+
+template <typename TFixedImage,
+          typename TMovingImage,
+          typename TVirtualImage,
+          typename TInternalComputationValueType,
+          typename TMetricTraits>
+void
+ImpactImageToImageMetricv4<TFixedImage,
+                                TMovingImage,
+                                TVirtualImage,
+                                TInternalComputationValueType,
+                                TMetricTraits>::UpdateMovingFeaturesMaps()
+{
+  // Only Static holds a precomputed map; the online modes extract per point and have nothing
+  // to refresh.
+  if (this->GetMode() != "Static")
+  {
+    return;
+  }
+  this->m_Internals->m_MovingFeaturesMaps =
+    GetFeaturesMaps<typename Internals::FeaturesMap, TMovingImage>(
+      this->m_MovingImage.GetPointer(),
+      m_MovingModelsConfiguration,
+      std::function<typename TMovingImage::PointType(const typename TMovingImage::PointType &)>(
+        [this](const typename TMovingImage::PointType & point) {
+          return this->GetTransform()->TransformPoint(point);
+        }));
+}
+
+template <typename TFixedImage,
+          typename TMovingImage,
+          typename TVirtualImage,
+          typename TInternalComputationValueType,
+          typename TMetricTraits>
+void
+ImpactImageToImageMetricv4<TFixedImage,
+                                TMovingImage,
+                                TVirtualImage,
+                                TInternalComputationValueType,
+                                TMetricTraits>::GetValueAndDerivative(typename Superclass::MeasureType &    value,
+                                                                      typename Superclass::DerivativeType & derivative) const
+{
+  Superclass::GetValueAndDerivative(value, derivative);
+  // After the evaluation, so the refresh lands between two iterations rather than in the middle
+  // of one -- the value and the derivative just returned belong to the same feature map.
+  ++this->m_CurrentIteration;
+  if (this->GetMode() == "Static" && this->GetFeaturesMapUpdateInterval() > 0 &&
+      this->m_CurrentIteration % static_cast<unsigned long>(this->GetFeaturesMapUpdateInterval()) == 0)
+  {
+    const_cast<Self *>(this)->UpdateMovingFeaturesMaps();
+  }
 }
 
 template <typename TFixedImage,
@@ -234,6 +310,34 @@ ImpactImageToImageMetricv4<TFixedImage,
                                 TMetricTraits>::Initialize(){
   Superclass::Initialize();
   this->m_features_indexes.clear();
+
+  // Every per-layer vector is indexed by the loop over compared layers, with no bound check in
+  // the hot path: too short and it reads past the end, too long and the value sums losses that
+  // no point ever updated. Both are silent, and the second is exactly what a configuration
+  // written for the elastix component looks like, where these vectors are already per layer.
+  const unsigned int comparedLayers = std::accumulate(
+    m_FixedModelsConfiguration.begin(),
+    m_FixedModelsConfiguration.end(),
+    0u,
+    [](unsigned int total, const ModelConfiguration & config) { return total + NumberOfKeptLayers(config); });
+  auto checkPerLayer = [&](const char * name, size_t size) {
+    if (size != comparedLayers)
+    {
+      itkExceptionMacro(<< name << " has " << size << " entries but " << comparedLayers
+                        << " layers are compared (one per kept layer of every model, summed over "
+                        << m_FixedModelsConfiguration.size() << " models). They carry one entry each.");
+    }
+  };
+  checkPerLayer("Distance", this->m_Distance.size());
+  checkPerLayer("LayersWeight", this->m_LayersWeight.size());
+  checkPerLayer("SubsetFeatures", this->m_SubsetFeatures.size());
+  // PCA is a property of the feature extraction, not of a layer: it is set once per model.
+  if (this->m_PCA.size() != m_FixedModelsConfiguration.size())
+  {
+    itkExceptionMacro("PCA has " << this->m_PCA.size() << " entries but there are "
+                                 << m_FixedModelsConfiguration.size() << " models; it carries one entry per model.");
+  }
+
   if (this->GetMode() == "Static")
   {
     auto & fixedFeaturesMaps = this->m_Internals->m_FixedFeaturesMaps;
@@ -243,11 +347,9 @@ ImpactImageToImageMetricv4<TFixedImage,
     this->m_Internals->m_Principal_components.clear();
 
     fixedFeaturesMaps = GetFeaturesMaps<typename Internals::FeaturesMap, TFixedImage>(this->m_FixedImage.GetPointer(), m_FixedModelsConfiguration);
-    movingFeaturesMaps = GetFeaturesMaps<typename Internals::FeaturesMap, TMovingImage>(this->m_MovingImage.GetPointer(), m_MovingModelsConfiguration,
-    std::function<typename TMovingImage::PointType(const typename TMovingImage::PointType &)>(
-      [this](const typename TMovingImage::PointType & point) {
-        return this->GetTransform()->TransformPoint(point);
-      }));
+    // The fixed map has to exist first: it is what fits the PCA basis the moving map reuses.
+    this->m_CurrentIteration = 0;
+    this->UpdateMovingFeaturesMaps();
 
     if (fixedFeaturesMaps.size() != movingFeaturesMaps.size())
     {
@@ -294,10 +396,11 @@ ImpactImageToImageMetricv4<TFixedImage,
     }
 
     const torch::Device device(this->m_Device);
-    // Channel count of the model's first kept layer (the one the metric compares, as
-    // GetFeaturesMaps keeps GetOutput(0)). Returns -1 if the patch size is not strictly
-    // positive (required online) or no layer is kept.
-    auto featureChannels = [&device](const ModelConfiguration & config) -> int {
+    // Channel count of every KEPT layer, in mask order, from one dummy forward -- the online
+    // counterpart of Static reading GetNumberOfComponentsPerPixel() off each feature map.
+    // Empty if the patch size is not strictly positive (required online), if no layer is kept,
+    // or if the model returns fewer outputs than the mask claims.
+    auto featureChannels = [&device](const ModelConfiguration & config) -> std::vector<int64_t> {
       ModelTo(config, device);
       const std::vector<int64_t> & patchSize = config.GetPatchSize();
       std::vector<int64_t>         shape = { 1, static_cast<int64_t>(config.GetNumberOfChannels()) };
@@ -307,37 +410,53 @@ ImpactImageToImageMetricv4<TFixedImage,
       for (unsigned int d = 0; d < config.GetDimension(); ++d)
       {
         if (d >= patchSize.size() || patchSize[d] <= 0)
-          return -1;
+          return {};
         shape.push_back(patchSize[config.GetDimension() - 1 - d]);
       }
       torch::NoGradGuard ng;
       torch::Tensor      dummy =
         torch::zeros(shape, torch::TensorOptions().dtype(GetModelDtype(config)).device(device));
-      auto        outputs = GetModel(config).forward({ dummy }).toList().vec();
+      auto         outputs = GetModel(config).forward({ dummy }).toList().vec();
       const auto & mask = config.GetLayersMask();
-      for (size_t it = 0; it < outputs.size(); ++it)
-        if (it < mask.size() && mask[it])
-          return static_cast<int>(outputs[it].toTensor().size(1));
-      return -1;
+      if (outputs.size() < mask.size())
+      {
+        return {};
+      }
+      std::vector<int64_t> channels;
+      for (size_t it = 0; it < mask.size(); ++it)
+      {
+        if (mask[it])
+        {
+          channels.push_back(outputs[it].toTensor().size(1));
+        }
+      }
+      return channels;
     };
 
     for (unsigned int i = 0; i < m_FixedModelsConfiguration.size(); ++i)
     {
-      const int fixedChannels = featureChannels(m_FixedModelsConfiguration[i]);
-      const int movingChannels = featureChannels(m_MovingModelsConfiguration[i]);
-      if (fixedChannels <= 0)
+      const std::vector<int64_t> fixedChannels = featureChannels(m_FixedModelsConfiguration[i]);
+      const std::vector<int64_t> movingChannels = featureChannels(m_MovingModelsConfiguration[i]);
+      if (fixedChannels.empty())
       {
-        itkExceptionMacro("Jacobian mode requires a strictly positive patch size in every dimension and at least "
-                          "one kept layer (model " << i << ").");
+        itkExceptionMacro("Jacobian mode requires a strictly positive patch size in every dimension, at least one "
+                          "kept layer, and a model returning at least as many outputs as LayersMask has entries "
+                          "(model " << i << ").");
       }
       if (fixedChannels != movingChannels)
       {
-        itkExceptionMacro("Jacobian mode: fixed/moving feature-channel mismatch at model "
-                          << i << " (" << fixedChannels << " vs " << movingChannels << ").");
+        itkExceptionMacro("Jacobian mode: fixed/moving feature-channel mismatch at model " << i << '.');
       }
-      this->m_SubsetFeatures[i] = std::clamp<unsigned int>(this->GetSubsetFeatures()[i], 1, fixedChannels);
-      this->m_features_indexes.push_back(std::vector<unsigned int>(fixedChannels));
-      std::iota(this->m_features_indexes[i].begin(), this->m_features_indexes[i].end(), 0);
+      // One entry per kept layer, appended to the same flat list Static builds, so both modes
+      // read Distance, LayersWeight and SubsetFeatures at the same index.
+      for (const int64_t channels : fixedChannels)
+      {
+        const size_t comparison = this->m_features_indexes.size();
+        this->m_SubsetFeatures[comparison] =
+          std::clamp<unsigned int>(this->GetSubsetFeatures()[comparison], 1, static_cast<unsigned int>(channels));
+        this->m_features_indexes.push_back(std::vector<unsigned int>(channels));
+        std::iota(this->m_features_indexes[comparison].begin(), this->m_features_indexes[comparison].end(), 0);
+      }
     }
   }
   else
