@@ -42,6 +42,7 @@ GROUND = "#151b22"
 FRAME = "#4bbec7"
 LABEL = "#e6edf2"
 EDGE = "#f0a52a"
+REFERENCE = "#4bbec7"
 
 I3, UC3 = itk.Image[itk.F, 3], itk.Image[itk.UC, 3]
 
@@ -79,7 +80,12 @@ def dice(reference, candidate):
         if c == 0:
             continue
         r, p = reference == c, candidate == c
-        if p.sum() == 0 and r.sum() == 0:
+        # Either side empty means the label has no counterpart, so there is nothing to align
+        # and its zero says nothing about the registration. The test used to be "and", which
+        # kept exactly the case the docstring excludes: on this pair label 4 is absent from the
+        # moving image entirely, scored a flat zero at every stage, and pulled every reported
+        # mean down by a quarter.
+        if p.sum() == 0 or r.sum() == 0:
             continue
         scores[int(c)] = 2 * np.logical_and(p, r).sum() / (p.sum() + r.sum())
     return scores
@@ -91,16 +97,43 @@ def edges(volume, quantile=0.93):
     return gradient > np.quantile(gradient, quantile)
 
 
+def organ_contour(labels):
+    """The outline of the labelled organs. An intensity edge map is dominated by the body/air
+    boundary and by bone, so it draws the skin rather than the structures Dice is computed on:
+    the caption then reports one thing and the picture shows another."""
+    body = labels > 0
+    inner = body.copy()
+    for axis in (0, 1):
+        for shift in (1, -1):
+            inner &= np.roll(body, shift, axis=axis)
+    return body & ~inner
+
+
+def checkerboard(reference, candidate, tiles=8):
+    """Alternate tiles of the two images. Structures that cross a tile boundary without a step
+    are aligned there; a visible break is a residual offset, read directly off the anatomy
+    rather than off a contour someone had to choose a threshold for."""
+    rows, columns = reference.shape
+    size = max(rows, columns) // tiles or 1
+    y, x = np.ogrid[:rows, :columns]
+    take_reference = ((y // size) + (x // size)) % 2 == 0
+    return np.where(take_reference, reference, candidate)
+
+
 def normalise(volume):
     low, high = np.percentile(volume, (1, 99))
     return np.clip((volume - low) / max(high - low, 1e-6), 0, 1)
 
 
-def plate(ax, background, edge=None, title="", detail=""):
+def plate(ax, background, edge=None, title="", detail="", reference=None):
     ax.imshow(background, cmap="gray", vmin=0, vmax=1, interpolation="bilinear")
-    if edge is not None:
-        ax.imshow(np.ma.masked_where(~edge, edge.astype(float)), cmap=matplotlib.colors.ListedColormap([EDGE]),
-                  interpolation="nearest", alpha=0.9)
+    # The reference outline goes underneath, so that where the two agree the moving one covers
+    # it: alignment reads as a single contour, misalignment as two.
+    for mask, colour in ((reference, REFERENCE), (edge, EDGE)):
+        if mask is not None:
+            ax.imshow(np.ma.masked_where(~mask, mask.astype(float)),
+                      cmap=matplotlib.colors.ListedColormap([colour]),
+                      interpolation="nearest", alpha=0.9)
     ax.set_facecolor(GROUND)
     for spine in ax.spines.values():
         spine.set_edgecolor(FRAME)
@@ -116,8 +149,8 @@ def row(views, width, name, outdir, suptitle):
     ratios = [v[0].shape[1] / v[0].shape[0] for v in views]
     fig = plt.figure(figsize=(width, width / sum(ratios) * 1.30), facecolor=GROUND)
     grid = fig.add_gridspec(1, len(views), width_ratios=ratios, wspace=0.025)
-    for i, (background, edge, title, detail) in enumerate(views):
-        plate(fig.add_subplot(grid[0, i]), background, edge, title, detail)
+    for i, (background, edge, title, detail, reference) in enumerate(views):
+        plate(fig.add_subplot(grid[0, i]), background, edge, title, detail, reference)
     fig.text(0.008, 0.985, suptitle, color=FRAME, fontsize=9.5, va="top", fontweight="bold")
     fig.subplots_adjust(left=0.008, right=0.992, top=0.945, bottom=0.14)
     fig.savefig(os.path.join(outdir, name), dpi=140, facecolor=GROUND)
@@ -204,9 +237,13 @@ def main():
     registration.SetMetric(metric)
     registration.SetOptimizer(optimizer)
     registration.SetInitialTransform(transform)
-    # Three levels, coarse to fine. A single level only converges when the images already
-    # nearly overlap: a local optimiser cannot walk out of a centimetre-scale offset without
-    # first seeing the images blurred and shrunk.
+    # A single level. The usual argument for a pyramid is that a local optimiser cannot walk out
+    # of a centimetre-scale offset without first seeing the images blurred and shrunk, and the
+    # comment here used to claim three levels while the code set one. Two and three levels were
+    # tried: the recovered Dice came out 0.479 at one level, 0.446 at three and 0.349 at two --
+    # non-monotonic, so a single run per setting says nothing, the sampler draws 10% of the
+    # voxels at random and is not seeded. Left at one level, which is what was measured for the
+    # figure; anyone tuning this should repeat each setting before believing a difference.
     registration.SetNumberOfLevels(1)
     registration.SetSmoothingSigmasPerLevel([0])
     registration.SetShrinkFactorsPerLevel([1])
@@ -223,10 +260,24 @@ def main():
         moving_labels, transform=final, use_reference_image=True, reference_image=fixed_labels,
         interpolator=nearest)))
 
-    # --- deformable ------------------------------------------------------------------------
+
+
+    # --- deformable, on top of the rigid ----------------------------------------------------
+    # The deformable filters refine; they are not meant to walk out of a centimetre-scale rigid
+    # offset on their own, and asking them to makes the field absorb a translation instead of
+    # the anatomy. They are handed the rigidly resampled moving image, which is how the pair
+    # would actually be registered, so the panel answers "what does the deformable step add on
+    # top of the rigid one" rather than "can a dense field imitate a rigid transform".
+    rigid_image = itk.resample_image_filter(
+        moving, transform=final, use_reference_image=True, reference_image=fixed,
+        default_pixel_value=-1024.0)
+    rigid_labels = itk.resample_image_filter(
+        moving_labels, transform=final, use_reference_image=True, reference_image=fixed_labels,
+        interpolator=nearest)
+
     coarse = itk.ImpactCoarseRegistration[I3, I3].New()
     coarse.SetFixedImage(fixed)
-    coarse.SetMovingImage(moving)
+    coarse.SetMovingImage(rigid_image)
     for c in configs(args):
         coarse.AddModelConfiguration(c)
     coarse.SetDevice(args.device)
@@ -235,7 +286,7 @@ def main():
 
     fine = itk.ImpactFineRegistration[I3, I3].New()
     fine.SetFixedImage(fixed)
-    fine.SetMovingImage(moving)
+    fine.SetMovingImage(rigid_image)
     for c in configs(args):
         fine.AddModelConfiguration(c)
     fine.SetInitialDisplacementField(coarse.GetOutput())
@@ -254,55 +305,88 @@ def main():
         w.Update()
         return itk.array_from_image(w.GetOutput())
 
-    deformable_moving = warp(moving, I3)
-    deformable_dice = dice(reference, warp(moving_labels, UC3, nearest))
+    deformable_moving = warp(rigid_image, I3)
+    deformable_labels = warp(rigid_labels, UC3, nearest)
+    deformable_dice = dice(reference, deformable_labels)
 
     # --- plates ----------------------------------------------------------------------------
     grey_fixed = normalise(itk.array_from_image(fixed))
     grey_before = normalise(itk.array_from_image(on_fixed))
     grey_rigid = normalise(rigid_moving)
     grey_deformable = normalise(deformable_moving)
+    rigid_labels_array = itk.array_from_image(rigid_labels)
     z = int(np.argmax([(reference[k] > 0).sum() for k in range(reference.shape[0])]))
 
     def mean(scores):
         return float(np.mean(list(scores.values()))) if scores else float("nan")
 
+    reference_contour = organ_contour(reference[z])
+    before_labels_slice = before_labels[z]
     row(
         [
-            (grey_fixed[z], None, "MR\\ (fixed)", "axial"),
-            (grey_before[z], None, "CT\\ (moving)", "resampled on the MR grid"),
-            (grey_fixed[z], edges(grey_before[z]), "Before", f"misaligned · Dice {mean(before):.3f}"),
-            (grey_fixed[z], edges(grey_rigid[z]), "After", f"rigid · Dice {mean(rigid_dice):.3f} of {mean(aligned):.3f} · {rigid_time:.0f} s"),
+            (grey_fixed[z], None, "MR\\ (fixed)", "axial", None),
+            (grey_before[z], None, "CT\\ (moving)", "resampled on the MR grid", None),
+            (checkerboard(grey_fixed[z], grey_before[z]), organ_contour(before_labels_slice),
+             "Before", f"misaligned \u00b7 Dice {mean(before):.3f}", reference_contour),
+            (checkerboard(grey_fixed[z], grey_rigid[z]), organ_contour(rigid_labels_array[z]),
+             "After\\ rigid", f"Dice {mean(rigid_dice):.3f} of {mean(aligned):.3f} \u00b7 {rigid_time:.0f} s",
+             reference_contour),
         ],
         width=15.0,
         name="example-metricv4.png",
         outdir=args.outdir,
-        suptitle="itk.ImpactImageToImageMetricv4 · MIND features, NCC distance · CT edges over the MR",
+        suptitle="itk.ImpactImageToImageMetricv4 · MIND features, NCC distance · "
+                 "teal: MR organs · orange: CT organs",
     )
 
-    magnitude = np.linalg.norm(itk.array_from_image(field), axis=-1)
+    # A magnitude map only says how far things moved, which is mostly a restatement of the
+    # misalignment. The Jacobian determinant of the transform says what the field DID to the
+    # tissue: below 1 it compressed, above 1 it expanded, and at or below 0 it folded the space
+    # onto itself, which is the one thing a deformation field must never do. Two thirds of this
+    # volume is air, where nothing constrains the field, so it is read inside the body.
+    jacobian = itk.DisplacementFieldJacobianDeterminantFilter[type(field), itk.F].New()
+    jacobian.SetInput(field)
+    jacobian.Update()
+    determinant = itk.array_from_image(jacobian.GetOutput())
+    # The body region is derived from the fixed image rather than taken from --fixed-mask: the
+    # mask that ships with this case is a coarse region whose straight posterior edge cuts across
+    # real anatomy, and reading the field through it would draw that edge rather than the patient.
+    body = normalise(itk.array_from_image(fixed)) > 0.08
+    inside = determinant[body]
+    folded = float((inside <= 0).mean())
+    displacement_detail = (f"{np.percentile(inside, 5):.2f}\u2013{np.percentile(inside, 95):.2f} "
+                           f"(5\u201395th pct) \u00b7 {folded:.2%} folded")
+    shown = np.where(body[z], determinant[z], np.nan)
     fig = plt.figure(figsize=(15.0, 4.6), facecolor=GROUND)
     ratios = [grey_fixed[z].shape[1] / grey_fixed[z].shape[0]] * 4
     grid = fig.add_gridspec(1, 4, width_ratios=ratios, wspace=0.025)
+    reference_contour = organ_contour(reference[z])
     plate(fig.add_subplot(grid[0, 0]), grey_fixed[z], None, "MR\\ (fixed)", "axial")
-    plate(fig.add_subplot(grid[0, 1]), grey_fixed[z], edges(grey_before[z]), "Before",
-          f"Dice {mean(before):.3f}")
-    plate(fig.add_subplot(grid[0, 2]), grey_fixed[z], edges(grey_deformable[z]), "After",
-          f"deformable · Dice {mean(deformable_dice):.3f} · {deformable_time:.0f} s")
+    plate(fig.add_subplot(grid[0, 1]), checkerboard(grey_fixed[z], grey_rigid[z]),
+          organ_contour(rigid_labels_array[z]), "After\\ rigid", f"Dice {mean(rigid_dice):.3f}",
+          reference=reference_contour)
+    plate(fig.add_subplot(grid[0, 2]), checkerboard(grey_fixed[z], grey_deformable[z]),
+          organ_contour(deformable_labels[z]), "After\\ deformable",
+          f"Dice {mean(deformable_dice):.3f} of {mean(aligned):.3f} · {deformable_time:.0f} s",
+          reference=reference_contour)
     ax = fig.add_subplot(grid[0, 3])
-    image = ax.imshow(magnitude[z], cmap="magma", interpolation="bilinear")
+    # Diverging around 1, so "unchanged volume" is the neutral colour and compression and
+    # expansion read as opposite directions rather than as two shades of the same ramp.
+    span = max(0.6, float(np.nanpercentile(np.abs(shown - 1.0), 98)))
+    image = ax.imshow(shown, cmap="RdBu_r", vmin=1 - span, vmax=1 + span, interpolation="bilinear")
     ax.set_facecolor(GROUND)
     for spine in ax.spines.values():
         spine.set_edgecolor(FRAME)
         spine.set_linewidth(1.1)
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_xlabel(f"$\\bf{{Displacement}}$\nup to {magnitude.max():.0f} mm", color=LABEL, fontsize=9,
+    ax.set_xlabel(f"$\\bf{{Jacobian}}$\n{displacement_detail}", color=LABEL, fontsize=9,
                   labelpad=8, linespacing=1.7)
     ax.xaxis.label.set_horizontalalignment("left")
     ax.xaxis.set_label_coords(0, -0.04)
     fig.text(0.008, 0.985,
-             "itk.ImpactCoarseRegistration + itk.ImpactFineRegistration · MIND features, on the GPU",
+             "itk.ImpactCoarseRegistration + itk.ImpactFineRegistration, on top of the rigid result · "
+             "teal: MR organs · orange: CT organs",
              color=FRAME, fontsize=9.5, va="top", fontweight="bold")
     fig.subplots_adjust(left=0.008, right=0.992, top=0.945, bottom=0.14)
     fig.savefig(os.path.join(args.outdir, "example-convexadam.png"), dpi=140, facecolor=GROUND)

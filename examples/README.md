@@ -157,9 +157,10 @@ modality-invariant MIND descriptor with an NCC distance, it aligns an abdominal 
 ![MR, CT, before and after registration](images/example-metricv4.png)
 
 Measured on Learn2Reg AbdomenMRCT case 1, with a known 12 / −8 / 6 mm and ~4° misalignment
-applied to the CT so that there is something to recover: organ Dice **0.225 → 0.355**, against
-the 0.422 the pair reaches when perfectly aligned — so roughly two thirds of the offset is taken
-back, in 54 s on one GPU.
+applied to the CT so that there is something to recover: organ Dice **0.300 → 0.476**, against
+the 0.563 the pair reaches when perfectly aligned, so roughly two thirds of the offset is taken
+back, in 37 s on one GPU. The metric samples 10% of the voxels at random and is not seeded, so
+rerunning moves the third decimal.
 
 Two things decide whether this works at all, and both are easy to get wrong:
 
@@ -203,10 +204,17 @@ deformable registration entirely on the GPU.
 
 ![MR, before, after, displacement field](images/example-convexadam.png)
 
-On the same case and the same misalignment: organ Dice **0.225 → 0.465 in 3 s**, i.e. past the
-0.422 a rigid transform can reach, because the field also takes up the deformation between the
-two acquisitions. Left to their own initialisation the two filters recover **0.563 → 0.810** on
-the organs present in both images.
+The two filters refine; they are not meant to walk out of a centimetre-scale rigid offset on
+their own, so they are given the rigid result and the panel answers what the deformable step
+*adds*. On the same case: organ Dice **0.476 → 0.706 in 4 s**, past the **0.563** any rigid
+transform can reach on this pair, because the field also takes up the deformation between the
+two acquisitions.
+
+Each panel is a checkerboard of the MR and the registered CT: a structure that crosses a tile
+boundary without a step is aligned there. The MR organs are outlined in teal, the CT ones in
+orange. One organ lags: on this case the Dice per structure is 0.838, 0.382 and 0.891. The fourth panel
+is the Jacobian determinant of the field: below 1 the tissue was compressed, above 1 expanded,
+and at or below 0 the field folded, which the caption reports as a percentage.
 
 Leaving the model configuration empty makes both filters fall back to a raw-intensity (MSE)
 similarity, which is a useful baseline to compare against.
