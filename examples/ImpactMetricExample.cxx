@@ -87,7 +87,7 @@ main(int argc, char * argv[])
   auto                                 metric = MetricType::New();
   std::vector<itk::ModelConfiguration> models{ config };
   metric->SetModelsConfiguration(models);
-  metric->SetDistance({ "NCC" });      // per-layer loss: L1, L2, NCC, Cosine, Dice, ...
+  metric->SetDistance({ "L2" });       // per-layer loss: L1, L2, NCC, Cosine, Dice, ...
   metric->SetLayersWeight({ 1.0f });
   metric->SetSubsetFeatures({ 4 });    // random channel subset for speed (0 = all)
   metric->SetPCA({ 0 });

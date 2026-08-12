@@ -1,6 +1,6 @@
 # ITKImpact examples
 
-Four runnable scripts, each self-contained. Everything below runs from Python with no
+Five runnable scripts, each self-contained. Everything below runs from Python with no
 `import torch` — the LibTorch inside your installed `torch` is reused by the wheel.
 
 ```bash
@@ -152,28 +152,27 @@ config = itk.ModelConfiguration(
 
 `itk.ImpactImageToImageMetricv4` compares images through features rather than intensities and
 plugs straight into `itk.ImageRegistrationMethodv4` — only the comparison changes. Driven by the
-modality-invariant MIND descriptor with an NCC distance, it aligns an abdominal **CT to an MR**.
+modality-invariant MIND descriptor with an L2 distance, it aligns an abdominal **CT to an MR**.
 
 ![MR, CT, before and after registration](images/example-metricv4.png)
 
-Measured on Learn2Reg AbdomenMRCT case 1, with a known 12 / −8 / 6 mm and ~4° misalignment
-applied to the CT so that there is something to recover: organ Dice **0.300 → 0.476**, against
-the 0.563 the pair reaches when perfectly aligned, so roughly two thirds of the offset is taken
-back, in 37 s on one GPU. The metric samples 10% of the voxels at random and is not seeded, so
-rerunning moves the third decimal.
+Three things decide whether this works at all, and all three are easy to get wrong:
 
-Two things decide whether this works at all, and both are easy to get wrong:
-
-**Give the metric a mask.** Air agrees between modalities everywhere, so a whole-image domain
-measures mostly background. On this pair the similarity varies by 1e-4 over a two-centimetre
-offset without a mask — no optimizer can follow that — against 5e-2 inside the body.
+**Mask the region you want aligned.** Air agrees between modalities everywhere, so a whole-image
+domain measures mostly background and the similarity barely moves with the transform. A body mask
+is little better: wall and fat agree well between modalities and outvote the organs. Mask what
+you want aligned.
 
 ```python
 mask = itk.ImageMaskSpatialObject[3].New()
-mask.SetImage(itk.imread("body_mask.nii.gz", itk.UC))
+mask.SetImage(itk.imread("organs.nii.gz", itk.UC))
 mask.Update()
 metric.SetFixedImageMask(mask)
 ```
+
+No labels needed to build one: segment the fixed image with the model matching its modality and
+dilate what it does not call background. `organ_mask()` in
+[`MakeRegistrationImages.py`](MakeRegistrationImages.py) does exactly that.
 
 **Let ITK estimate the optimizer scales.** The rotation-versus-translation ratio depends on the
 metric's own gradient magnitude; guessing it by hand walks the transform off the image.
@@ -182,6 +181,16 @@ metric's own gradient magnitude; guessing it by hand walks the transform off the
 estimator = itk.RegistrationParameterScalesFromPhysicalShift[type(metric)].New()
 estimator.SetMetric(metric)
 optimizer.SetScalesEstimator(estimator)
+```
+
+**Centre the rigid transform through the direction cosines**, on the fixed image, which is the
+domain the moving transform maps from. `origin + 0.5 * spacing * size` ignores them: on an image
+stored LPS rather than RAS it names a point hundreds of millimetres outside the anatomy, and
+every degree of rotation then arrives with that much lever arm.
+
+```python
+size = fixed.GetLargestPossibleRegion().GetSize()
+centre = list(fixed.TransformIndexToPhysicalPoint([size[0] // 2, size[1] // 2, size[2] // 2]))
 ```
 
 Two modes:
@@ -206,29 +215,61 @@ deformable registration entirely on the GPU.
 
 The two filters refine; they are not meant to walk out of a centimetre-scale rigid offset on
 their own, so they are given the rigid result and the panel answers what the deformable step
-*adds*. On the same case: organ Dice **0.476 → 0.706 in 4 s**, past the **0.563** any rigid
-transform can reach on this pair, because the field also takes up the deformation between the
-two acquisitions.
+*adds*: the field takes up the deformation between the two acquisitions, which no rigid transform
+can express.
 
-Each panel is a checkerboard of the MR and the registered CT: a structure that crosses a tile
-boundary without a step is aligned there. The MR organs are outlined in teal, the CT ones in
-orange. One organ lags: on this case the Dice per structure is 0.838, 0.382 and 0.891. The fourth panel
-is the Jacobian determinant of the field: below 1 the tissue was compressed, above 1 expanded,
-and at or below 0 the field folded, which the caption reports as a percentage.
+Each panel lays the MR organs (teal) over the registered CT ones (orange), in axial and coronal.
+One plane is not enough to judge an alignment: a cranio-caudal offset barely disturbs an axial
+slice while moving every organ, which is why the coronal panels are there. The last panel is the
+Jacobian determinant of the field: below 1 the tissue was compressed, above 1 expanded, and at or
+below 0 the field folded, which the caption reports as a percentage.
 
 Leaving the model configuration empty makes both filters fall back to a raw-intensity (MSE)
 similarity, which is a useful baseline to compare against.
 
 Both figures are regenerated by [`MakeRegistrationImages.py`](MakeRegistrationImages.py), which
-also prints the per-organ Dice.
+also prints the per-organ Dice and builds the organ mask for you:
+
+```bash
+./MakeRegistrationImages.py fixed_MR.nii.gz moving_CT.nii.gz MIND/R1D2_3D.pt \
+    --fixed-labels f.nii.gz --moving-labels m.nii.gz --mask-model MRSeg/MRSeg.pt
+```
+
+---
+
+## 5. Rigid then B-spline — the metric in ITK's own pipeline
+
+[`ImpactRigidBSplineExample.py`](ImpactRigidBSplineExample.py)
+
+The same metric drives both stages; only the transform and the optimizer change. Euler3D with a
+scales estimator, then `BSplineTransform` with `LBFGSBOptimizerv4`, as ITK lays it out in
+`Examples/RegistrationITKv4/DeformableRegistration12.cxx`. The composed transform can be written
+out, so the alignment carries to a segmentation or another sequence.
+
+Use it when the pipeline has to be an ITKv4 one. When what matters is the alignment itself, the
+dedicated filters of section 4 go further and take seconds rather than minutes: ITK accumulates
+the metric derivative densely over every transform parameter for every sampled point, which caps
+how many evaluations of a control grid are affordable.
+
+```bash
+./ImpactRigidBSplineExample.py fixed_MR.nii.gz moving_CT.nii.gz MIND/R1D2_3D.pt \
+    --mask organs.nii.gz --grid-spacing 40 --sampling 0.03 --bspline-iterations 60
+```
+
+The script's docstring covers the two settings that decide the outcome: the mask, again, and a
+single resolution level, because ITK's shrink factors never reach the model. `ImageToFeaturesMap`
+resamples whatever it is handed to the `ModelConfiguration` voxel size, so a shrunk image is
+interpolated straight back up before the network sees it.
 
 ---
 
 ## Data used on this page
 
-The CT is case `pair_0001_0004` of [AMOS22](https://amos22.grand-challenge.org/), the CT–MR pair
-comes from [SynthRAD2023](https://synthrad2023.grand-challenge.org/). Any CT works — pass your
-own to the scripts.
+The CT in sections 1 and 2 is case `pair_0001_0004` of
+[AMOS22](https://amos22.grand-challenge.org/). The CT–MR pair every registration number on this
+page is measured on is case 1 of the AbdomenMRCT task of
+[Learn2Reg](https://learn2reg.grand-challenge.org/), which ships the organ labels the Dice is
+computed against. Any CT works for sections 1 and 2 — pass your own to the scripts.
 
 Figures are produced with matplotlib, which the module itself does not depend on:
 

@@ -55,12 +55,19 @@ def parse():
     p.add_argument("--fixed-labels", required=True)
     p.add_argument("--moving-labels", required=True)
     p.add_argument("--fixed-mask", default=None,
-                   help="body mask; without one the metric measures mostly air")
+                   help="mask for the metric; prefer --mask-model, which builds a tighter one")
+    p.add_argument("--mask-model", default=None,
+                   help="segmentation model for the FIXED image's modality (MRSeg for MR, TS for\n"
+                        "CT). Its organs, dilated, become the metric mask. This is worth more\n"
+                        "than any other setting here: see organ_mask()")
     p.add_argument("--outdir", default="images")
     p.add_argument("--voxel", type=float, default=2.0)
     p.add_argument("--device", default="cuda:0")
-    # The pair ships rigidly aligned, so the rigid demo has to create something to recover.
-    p.add_argument("--misalign", type=float, nargs=6, default=[0.06, -0.04, 0.05, 12.0, -8.0, 6.0],
+    # No synthetic offset by default. The pair ships close to aligned but not aligned, and the
+    # registration improves on it, so there is something to recover without inventing any. An
+    # offset given here is read through the rotation centre: the same six numbers describe a
+    # different displacement depending on where that centre sits.
+    p.add_argument("--misalign", type=float, nargs=6, default=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                    help="rx ry rz (rad) tx ty tz (mm) applied to the moving image before registering")
     p.add_argument("--sampling", type=float, default=0.10,
                    help="fraction of voxels the metric samples per iteration")
@@ -70,6 +77,54 @@ def parse():
 def configs(args):
     for path in args.models:
         yield itk.ModelConfiguration(path, 3, 1, [0, 0, 0], [args.voxel] * 3, 0, [True], False)
+
+
+def organ_mask(fixed, model, device, dilation=10):
+    """A mask around the organs, from the network rather than from any ground truth.
+
+    Segment the fixed image with the model that matches its modality, keep everything it does
+    not call background, and dilate so the metric still sees the tissue around each structure.
+    On the pair below this covers 17% of the volume against 35% for the body mask, and carries
+    organ Dice from 0.480 to 0.620.
+    """
+    import scipy.ndimage as ndi
+
+    layers = [False] * 8
+    layers[7] = True   # the class logits, the last layer of a segmentation network
+    segmenter = itk.ImageToFeaturesMap[
+        I3, itk.BSplineInterpolateImageFunction[I3, itk.D, itk.F]].New()
+    segmenter.SetModelConfiguration(
+        itk.ModelConfiguration(model, 3, 1, [128, 128, 128], [1.5] * 3, 32, layers, False))
+    segmenter.SetDevice(device)
+    segmenter.AddInput(fixed)
+    segmenter.Update()
+    logits = segmenter.GetOutput(0)
+
+    labels = np.argmax(itk.array_view_from_image(logits), axis=-1)
+    organs = itk.image_from_array((labels > 0).astype(np.uint8))
+    organs.CopyInformation(logits)
+    on_grid = itk.resample_image_filter(
+        organs, use_reference_image=True, reference_image=fixed,
+        interpolator=itk.NearestNeighborInterpolateImageFunction[UC3, itk.D].New())
+    dilated = ndi.binary_dilation(itk.array_from_image(on_grid) > 0, iterations=dilation)
+    mask = itk.image_from_array(dilated.astype(np.uint8))
+    mask.CopyInformation(fixed)
+    print(f"organ mask: {dilated.sum():,} voxels, {100 * dilated.mean():.1f}% of the volume")
+    return mask
+
+
+def plane(volume, axis, index):
+    """One slice, oriented for display. Arrays come out of ITK indexed [z, y, x], so the two
+    views that carry the cranio-caudal axis need flipping to put the head up.
+
+    A single axial slice is not enough to judge an alignment: a purely cranio-caudal offset
+    barely changes it while moving every organ. Whatever is shown, show more than one plane.
+    """
+    if axis == 0:
+        return volume[index]
+    if axis == 1:
+        return np.flipud(volume[:, index, :])
+    return np.flipud(volume[:, :, index])
 
 
 def dice(reference, candidate):
@@ -169,11 +224,16 @@ def main():
 
     reference = itk.array_from_image(fixed_labels)
 
-    # The pair ships rigidly aligned, which is the ceiling any rigid step can reach; a known
-    # misalignment is applied so that there is something to recover, and the recovered Dice can
-    # be read against that ceiling rather than against nothing.
-    centre = [o + 0.5 * s * n for o, s, n in zip(
-        moving.GetOrigin(), moving.GetSpacing(), moving.GetLargestPossibleRegion().GetSize())]
+    # A known misalignment is applied so that there is something to recover, and the recovered
+    # Dice can be read against the delivered alignment rather than against nothing.
+    #
+    # The centre goes through the direction cosines, and comes from the fixed image, the domain
+    # the moving transform maps from. Computed as origin + 0.5 * spacing * size it ignores them:
+    # on an image stored LPS it sits hundreds of millimetres outside the anatomy, and the same
+    # rotation parameters then displace the organs by tens of millimetres through the lever arm
+    # rather than turning them in place.
+    size = fixed.GetLargestPossibleRegion().GetSize()
+    centre = list(fixed.TransformIndexToPhysicalPoint([size[0] // 2, size[1] // 2, size[2] // 2]))
     misalignment = itk.Euler3DTransform[itk.D].New()
     misalignment.SetIdentity()
     misalignment.SetCenter(centre)
@@ -202,18 +262,27 @@ def main():
     models = list(configs(args))
     for c in models:
         metric.AddModelConfiguration(c)
-    metric.SetDistance(["NCC"] * len(models))
+    metric.SetDistance(["L2"] * len(models))
     metric.SetLayersWeight([1.0] * len(models))
     metric.SetSubsetFeatures([12] * len(models))
     metric.SetPCA([0] * len(models))
     metric.SetMode("Static")
     metric.SetDevice(args.device)
-    if args.fixed_mask:
+    mask_image = None
+    if args.mask_model:
+        mask_image = organ_mask(fixed, args.mask_model, args.device)
+    elif args.fixed_mask:
+        mask_image = itk.imread(args.fixed_mask, itk.UC)
+    if mask_image is not None:
         # Air agrees between modalities everywhere, so a whole-image domain measures mostly
         # background: the similarity varies by 1e-4 over a two-centimetre offset, which no
         # optimiser can follow. Restricted to the body it varies by 5e-2 over the same range.
+        #
+        # How tight the mask is then decides the rest. Wall and fat make up most of a body mask,
+        # they agree well between MR and CT, and they outvote the organs: on this pair that is
+        # organ Dice 0.480 against 0.620 for a mask around the organs, three seeds each.
         mask = itk.ImageMaskSpatialObject[3].New()
-        mask.SetImage(itk.imread(args.fixed_mask, itk.UC))
+        mask.SetImage(mask_image)
         mask.Update()
         metric.SetFixedImageMask(mask)
 
@@ -320,22 +389,40 @@ def main():
     def mean(scores):
         return float(np.mean(list(scores.values()))) if scores else float("nan")
 
-    reference_contour = organ_contour(reference[z])
-    before_labels_slice = before_labels[z]
+    y = int(np.argmax([(reference[:, k, :] > 0).sum() for k in range(reference.shape[1])]))
+    before_state = 'as delivered' if not any(args.misalign) else 'offset applied'
+
+    def background(axis, index, candidate):
+        """Checkerboard where both images fill the frame, plain fixed image where one does not.
+
+        The MR here has a limited field of view, so in coronal the tiles alternate between
+        anatomy and black bands and the eye loses the thread. There the two contours over the
+        fixed image say the same thing without the noise.
+        """
+        if axis == 0:
+            return checkerboard(plane(grey_fixed, axis, index), plane(candidate, axis, index))
+        return plane(grey_fixed, axis, index)
+
+    def pair(axis, index, name):
+        """The same plane before and after, so the two can be read against each other."""
+        return [
+            (background(axis, index, grey_before),
+             organ_contour(plane(before_labels, axis, index)),
+             f"Before,\\ {name}", f"{before_state} \u00b7 Dice {mean(before):.3f}",
+             organ_contour(plane(reference, axis, index))),
+            (background(axis, index, grey_rigid),
+             organ_contour(plane(rigid_labels_array, axis, index)),
+             f"After\\ rigid,\\ {name}", f"Dice {mean(rigid_dice):.3f} \u00b7 {rigid_time:.0f} s",
+             organ_contour(plane(reference, axis, index))),
+        ]
+
     row(
-        [
-            (grey_fixed[z], None, "MR\\ (fixed)", "axial", None),
-            (grey_before[z], None, "CT\\ (moving)", "resampled on the MR grid", None),
-            (checkerboard(grey_fixed[z], grey_before[z]), organ_contour(before_labels_slice),
-             "Before", f"misaligned \u00b7 Dice {mean(before):.3f}", reference_contour),
-            (checkerboard(grey_fixed[z], grey_rigid[z]), organ_contour(rigid_labels_array[z]),
-             "After\\ rigid", f"Dice {mean(rigid_dice):.3f} of {mean(aligned):.3f} \u00b7 {rigid_time:.0f} s",
-             reference_contour),
-        ],
-        width=15.0,
+        [(grey_fixed[z], None, "MR\\ (fixed)", "axial", None)]
+        + pair(0, z, "axial") + pair(1, y, "coronal"),
+        width=18.0,
         name="example-metricv4.png",
         outdir=args.outdir,
-        suptitle="itk.ImpactImageToImageMetricv4 · MIND features, NCC distance · "
+        suptitle="itk.ImpactImageToImageMetricv4 · MIND features, L2 distance · "
                  "teal: MR organs · orange: CT organs",
     )
 
@@ -357,19 +444,26 @@ def main():
     displacement_detail = (f"{np.percentile(inside, 5):.2f}\u2013{np.percentile(inside, 95):.2f} "
                            f"(5\u201395th pct) \u00b7 {folded:.2%} folded")
     shown = np.where(body[z], determinant[z], np.nan)
-    fig = plt.figure(figsize=(15.0, 4.6), facecolor=GROUND)
-    ratios = [grey_fixed[z].shape[1] / grey_fixed[z].shape[0]] * 4
-    grid = fig.add_gridspec(1, 4, width_ratios=ratios, wspace=0.025)
-    reference_contour = organ_contour(reference[z])
-    plate(fig.add_subplot(grid[0, 0]), grey_fixed[z], None, "MR\\ (fixed)", "axial")
-    plate(fig.add_subplot(grid[0, 1]), checkerboard(grey_fixed[z], grey_rigid[z]),
-          organ_contour(rigid_labels_array[z]), "After\\ rigid", f"Dice {mean(rigid_dice):.3f}",
-          reference=reference_contour)
-    plate(fig.add_subplot(grid[0, 2]), checkerboard(grey_fixed[z], grey_deformable[z]),
-          organ_contour(deformable_labels[z]), "After\\ deformable",
-          f"Dice {mean(deformable_dice):.3f} of {mean(aligned):.3f} · {deformable_time:.0f} s",
-          reference=reference_contour)
-    ax = fig.add_subplot(grid[0, 3])
+    # Rigid and deformable in both planes, so the deformable step can be judged where a rigid
+    # residual would still be hiding: a cranio-caudal offset barely shows in axial.
+    panels = []
+    for axis, index, name in ((0, z, "axial"), (1, y, "coronal")):
+        panels.append((background(axis, index, grey_rigid),
+                       organ_contour(plane(rigid_labels_array, axis, index)),
+                       f"After\\ rigid,\\ {name}", f"Dice {mean(rigid_dice):.3f}",
+                       organ_contour(plane(reference, axis, index))))
+        panels.append((background(axis, index, grey_deformable),
+                       organ_contour(plane(deformable_labels, axis, index)),
+                       f"After\\ deformable,\\ {name}",
+                       f"Dice {mean(deformable_dice):.3f} \u00b7 {deformable_time:.0f} s",
+                       organ_contour(plane(reference, axis, index))))
+
+    fig = plt.figure(figsize=(19.0, 4.6), facecolor=GROUND)
+    ratios = [p[0].shape[1] / p[0].shape[0] for p in panels] + [grey_fixed[z].shape[1] / grey_fixed[z].shape[0]]
+    grid = fig.add_gridspec(1, len(panels) + 1, width_ratios=ratios, wspace=0.025)
+    for i, (background, edge, title, detail, contour) in enumerate(panels):
+        plate(fig.add_subplot(grid[0, i]), background, edge, title, detail, reference=contour)
+    ax = fig.add_subplot(grid[0, len(panels)])
     # Diverging around 1, so "unchanged volume" is the neutral colour and compression and
     # expansion read as opposite directions rather than as two shades of the same ramp.
     span = max(0.6, float(np.nanpercentile(np.abs(shown - 1.0), 98)))
@@ -393,7 +487,7 @@ def main():
     plt.close(fig)
     print("wrote example-convexadam.png")
 
-    print(f"DICE aligned(ceiling) {mean(aligned):.4f} · misaligned {mean(before):.4f} · "
+    print(f"DICE delivered {mean(aligned):.4f} · offset {mean(before):.4f} · "
       f"rigid {mean(rigid_dice):.4f} · deformable {mean(deformable_dice):.4f}")
     for c in sorted(before):
         print(f"  label {c}: {before[c]:.3f} -> rigid {rigid_dice.get(c, float('nan')):.3f} "
