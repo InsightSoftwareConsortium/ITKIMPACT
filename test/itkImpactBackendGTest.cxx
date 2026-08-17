@@ -1041,9 +1041,14 @@ TEST(ImpactMetric, TwoDimensionalModelJacobianDerivativeMatchesFiniteDifferences
   // The plane a point gets is a function of that point, not of how many points came before it,
   // so splitting the domain across work units must not change the value. Drawing from a running
   // per-work-unit generator instead would give each unit its own sequence and move the value.
-  // Exact equality is the right bar: each point contributes the same term in the same order to
-  // the same accumulator whatever the partition, so only a different PLANE can move the result.
-  EXPECT_DOUBLE_EQ(static_cast<double>(makeMetric(4, 1)->GetValue()), static_cast<double>(value))
+  //
+  // The bar is a tight relative tolerance rather than exact equality. Each work unit accumulates
+  // its own partial sum and those are reduced afterwards, so the order of the additions follows
+  // the partition and the last bits of the total move with it: on arm64 the two totals
+  // here differ by 2e-9 relative. A plane that actually changed would move the value by orders of
+  // magnitude more, which is what this is here to catch.
+  const double single = static_cast<double>(makeMetric(4, 1)->GetValue());
+  EXPECT_NEAR(single, static_cast<double>(value), 1e-6 * std::abs(single))
     << "the sampled planes must not depend on the work-unit partition";
 
   // This is the assertion that carries the feature. Every layer is kept and the feature subset
