@@ -30,7 +30,7 @@
 // Pulls in LibTorch; included only from .hxx files, never part of the castxml surface.
 
 #include "itkImpactPatchTiling.h"
-#include "itkModelConfigurationDetail.h"
+#include "itkImpactModelConfigurationDetail.h"
 
 #include <itkImage.h>
 #include <itkVector.h>
@@ -177,7 +177,7 @@ ImageToBatchTensor(const TImage * image)
  * the common coarse grid), so features are never upsampled to full res here. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
-ExtractFeatureLayers(const std::vector<ModelConfiguration> & configs,
+ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
                      const torch::Tensor &                   imageTensor, // {1,1,spatial...} on device
                      const torch::Device &                   device,
                      const std::vector<unsigned int> &       subset,

@@ -21,7 +21,7 @@
 
 This script NEVER imports torch and uses only ITK/STL/POD types: it proves the
 torch-free public facade is usable from Python end-to-end. It builds a
-ModelConfiguration from a TorchScript model PATH (loading the model in C++),
+ImpactModelConfiguration from a TorchScript model PATH (loading the model in C++),
 wraps the core ImageToFeaturesMap, and runs the metric's Initialize()/GetValue()
 (which executes the TorchScript inference and the loss) on two synthetic images.
 
@@ -49,10 +49,10 @@ def blob(n, cx):
 
 fixed, moving = blob(16, -2.0), blob(16, 2.0)
 
-# 1) The torch-free ModelConfiguration loads a TorchScript model from a path string.
-cfg = itk.ModelConfiguration(model_path, 3, 1, [0, 0, 0], [1.0, 1.0, 1.0], 2, [True, True], False)
+# 1) The torch-free ImpactModelConfiguration loads a TorchScript model from a path string.
+cfg = itk.ImpactModelConfiguration(model_path, 3, 1, [0, 0, 0], [1.0, 1.0, 1.0], 2, [True, True], False)
 assert cfg.GetModelPath() == model_path and cfg.GetDimension() == 3
-print("1) ModelConfiguration:", cfg.GetModelPath(), "dim", cfg.GetDimension(),
+print("1) ImpactModelConfiguration:", cfg.GetModelPath(), "dim", cfg.GetDimension(),
       "channels", cfg.GetNumberOfChannels())
 
 # 2) The core feature-extraction filter is wrapped (GetOutput is an itk.VectorImage).

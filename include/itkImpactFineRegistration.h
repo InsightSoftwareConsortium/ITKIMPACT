@@ -19,7 +19,7 @@
 #define itkImpactFineRegistration_h
 
 // Torch-free public header so castxml can parse it and it is exposable to Python (WrapITK),
-// like itkModelConfiguration.h and itkImpactImageToImageMetricv4.h. All torch state (the
+// like itkImpactModelConfiguration.h and itkImpactImageToImageMetricv4.h. All torch state (the
 // displacement-field leaf tensor, the grid_sample warp, the IMPACT feature loss and the
 // torch::optim::Adam loop) lives in the .hxx, included only when ITK_MANUAL_INSTANTIATION
 // is undefined.
@@ -28,7 +28,7 @@
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
-#include <itkModelConfiguration.h>
+#include <itkImpactModelConfiguration.h>
 
 #include <string>
 #include <vector>
@@ -51,7 +51,7 @@ namespace itk
  *
  * The similarity term is pluggable: with no model configuration it compares raw intensities
  * (MSE); with IMPACT model configurations it compares deep features from the pretrained
- * TorchScript models (reusing the \c ModelConfiguration / loss vocabulary of
+ * TorchScript models (reusing the \c ImpactModelConfiguration / loss vocabulary of
  * ImpactImageToImageMetricv4).
  *
  * ITK convention handling (axis reversal between ITK \f$x,y,z\f$ and the torch \f$z,y,x\f$
@@ -108,19 +108,19 @@ public:
   /** \name IMPACT feature-loss configuration (mirrors ImpactImageToImageMetricv4).
    * Leaving the model configuration empty selects the intensity (MSE) similarity. */
   /** @{ */
-  itkSetMacro(FixedModelsConfiguration, std::vector<ModelConfiguration>);
-  itkGetConstReferenceMacro(FixedModelsConfiguration, std::vector<ModelConfiguration>);
-  itkSetMacro(MovingModelsConfiguration, std::vector<ModelConfiguration>);
-  itkGetConstReferenceMacro(MovingModelsConfiguration, std::vector<ModelConfiguration>);
+  itkSetMacro(FixedModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkGetConstReferenceMacro(FixedModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkSetMacro(MovingModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkGetConstReferenceMacro(MovingModelsConfiguration, std::vector<ImpactModelConfiguration>);
 
   void
-  SetModelsConfiguration(const std::vector<ModelConfiguration> & configuration)
+  SetModelsConfiguration(const std::vector<ImpactModelConfiguration> & configuration)
   {
     this->SetFixedModelsConfiguration(configuration);
     this->SetMovingModelsConfiguration(configuration);
   }
   void
-  AddModelConfiguration(const ModelConfiguration & configuration)
+  AddModelConfiguration(const ImpactModelConfiguration & configuration)
   {
     m_FixedModelsConfiguration.push_back(configuration);
     m_MovingModelsConfiguration.push_back(configuration);
@@ -238,8 +238,8 @@ private:
   typename MovingImageType::ConstPointer       m_MovingImage{ nullptr };
   typename DisplacementFieldType::Pointer      m_InitialDisplacementField{ nullptr };
 
-  std::vector<ModelConfiguration> m_FixedModelsConfiguration;
-  std::vector<ModelConfiguration> m_MovingModelsConfiguration;
+  std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
+  std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
   std::vector<std::string>        m_Distance;
   std::vector<float>              m_LayersWeight;
   std::vector<unsigned int>       m_SubsetFeatures;

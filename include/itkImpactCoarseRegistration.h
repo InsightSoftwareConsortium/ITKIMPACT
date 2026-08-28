@@ -25,7 +25,7 @@
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
-#include <itkModelConfiguration.h>
+#include <itkImpactModelConfiguration.h>
 
 #include <string>
 #include <vector>
@@ -97,18 +97,18 @@ public:
   /** \name Optional IMPACT feature configuration. With no model the cost volume is built on
    * raw intensities; with model(s) it is built on their (concatenated) feature channels. */
   /** @{ */
-  itkSetMacro(FixedModelsConfiguration, std::vector<ModelConfiguration>);
-  itkGetConstReferenceMacro(FixedModelsConfiguration, std::vector<ModelConfiguration>);
-  itkSetMacro(MovingModelsConfiguration, std::vector<ModelConfiguration>);
-  itkGetConstReferenceMacro(MovingModelsConfiguration, std::vector<ModelConfiguration>);
+  itkSetMacro(FixedModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkGetConstReferenceMacro(FixedModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkSetMacro(MovingModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkGetConstReferenceMacro(MovingModelsConfiguration, std::vector<ImpactModelConfiguration>);
   void
-  SetModelsConfiguration(const std::vector<ModelConfiguration> & configuration)
+  SetModelsConfiguration(const std::vector<ImpactModelConfiguration> & configuration)
   {
     this->SetFixedModelsConfiguration(configuration);
     this->SetMovingModelsConfiguration(configuration);
   }
   void
-  AddModelConfiguration(const ModelConfiguration & configuration)
+  AddModelConfiguration(const ImpactModelConfiguration & configuration)
   {
     m_FixedModelsConfiguration.push_back(configuration);
     m_MovingModelsConfiguration.push_back(configuration);
@@ -169,8 +169,8 @@ private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer m_MovingImage{ nullptr };
 
-  std::vector<ModelConfiguration> m_FixedModelsConfiguration;
-  std::vector<ModelConfiguration> m_MovingModelsConfiguration;
+  std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
+  std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
   std::vector<unsigned int>       m_SubsetFeatures;
 
   std::string  m_Device{ "cpu" };

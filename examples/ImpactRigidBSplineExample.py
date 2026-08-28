@@ -39,7 +39,7 @@ translation parameter, and a gradient descent divides its update by that. LBFGSB
 and builds its own conditioning, which is why ITK pairs it with the B-spline transform.
 
 **One resolution level.** ITK's shrink factors never reach the model: `ImageToFeaturesMap`
-resamples whatever it is handed to the `ModelConfiguration` voxel size, so a shrunk image is
+resamples whatever it is handed to the `ImpactModelConfiguration` voxel size, so a shrunk image is
 interpolated straight back up before the network sees it, leaving the smoothing and the lost
 detail. Coarsening the model's voxel size is the real knob, and for a local descriptor like MIND
 it describes different anatomy rather than the same anatomy more coarsely.
@@ -102,7 +102,7 @@ moving = itk.imread(args.moving_image, itk.F)
 metric = itk.ImpactImageToImageMetricv4[ImageType, ImageType].New()
 for path in args.models:
     metric.AddModelConfiguration(
-        itk.ModelConfiguration(path, Dimension, 1, [0, 0, 0], [args.voxel] * Dimension, 0, [True], False)
+        itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], [args.voxel] * Dimension, 0, [True], False)
     )
 metric.SetDistance(["L2"] * len(args.models))
 metric.SetLayersWeight([1.0] * len(args.models))

@@ -104,7 +104,7 @@ endif()
 find_package(Torch REQUIRED)
 
 # The module is mostly header-only (templates), plus a small compiled Impact library
-# (src/) for the torch-free ModelConfiguration facade. Its public templates still
+# (src/) for the torch-free ImpactModelConfiguration facade. Its public templates still
 # instantiate LibTorch in client code, so LibTorch is propagated as an extra library
 # clients must link, in addition to the Impact library itself.
 set(Impact_LIBRARIES Impact ${TORCH_LIBRARIES})

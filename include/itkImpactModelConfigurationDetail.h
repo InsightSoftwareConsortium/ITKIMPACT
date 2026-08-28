@@ -16,15 +16,15 @@
  *
  *=========================================================================*/
 
-#ifndef itkModelConfigurationDetail_h
-#define itkModelConfigurationDetail_h
+#ifndef itkImpactModelConfigurationDetail_h
+#define itkImpactModelConfigurationDetail_h
 
-// Internal companion to itkModelConfiguration.h: pulls in LibTorch, so it is included
+// Internal companion to itkImpactModelConfiguration.h: pulls in LibTorch, so it is included
 // ONLY by translation units that already depend on torch (the feature-extraction
-// internals and the compiled itkModelConfiguration.cxx). Never part of the public,
+// internals and the compiled itkImpactModelConfiguration.cxx). Never part of the public,
 // castxml-parsed surface.
 
-#include "itkModelConfiguration.h"
+#include "itkImpactModelConfiguration.h"
 #include "itkStatisticsImageFilter.h"
 
 #include <torch/script.h>
@@ -38,8 +38,8 @@ namespace itk
 {
 namespace detail
 {
-/** The LibTorch state held opaquely by ModelConfiguration. */
-struct ModelConfigurationImpl
+/** The LibTorch state held opaquely by ImpactModelConfiguration. */
+struct ImpactModelConfigurationImpl
 {
   std::shared_ptr<torch::jit::script::Module> model;
   torch::ScalarType                           dtype{ torch::kFloat32 };
@@ -58,21 +58,21 @@ struct ModelConfigurationImpl
 
 /** Access the loaded TorchScript module of a configuration. */
 inline torch::jit::script::Module &
-GetModel(const ModelConfiguration & configuration)
+GetModel(const ImpactModelConfiguration & configuration)
 {
   return *configuration.GetImpl()->model;
 }
 
 /** The scalar type the model runs in (float32, or float16 in mixed precision). */
 inline torch::ScalarType
-GetModelDtype(const ModelConfiguration & configuration)
+GetModelDtype(const ImpactModelConfiguration & configuration)
 {
   return configuration.GetImpl()->dtype;
 }
 
 /** Move the model to a device (e.g. CPU or CUDA). */
 inline void
-ModelTo(const ModelConfiguration & configuration, const torch::Device & device)
+ModelTo(const ImpactModelConfiguration & configuration, const torch::Device & device)
 {
   configuration.GetImpl()->model->to(device);
 }
@@ -82,9 +82,9 @@ ModelTo(const ModelConfiguration & configuration, const torch::Device & device)
  * the image stats and direction tensors (see SetupImageMetadata) when it takes >= 4.
  * Returns the per-layer output tensors. */
 inline std::vector<torch::jit::IValue>
-Forward(const ModelConfiguration & configuration, torch::Tensor inputPatch)
+Forward(const ImpactModelConfiguration & configuration, torch::Tensor inputPatch)
 {
-  detail::ModelConfigurationImpl * impl = configuration.GetImpl();
+  detail::ImpactModelConfigurationImpl * impl = configuration.GetImpl();
   std::vector<torch::jit::IValue>  args;
   args.reserve(impl->nArgs);
   args.emplace_back(inputPatch);
@@ -111,9 +111,9 @@ Forward(const ModelConfiguration & configuration, torch::Tensor inputPatch)
  * by simpler models, but cheap and always safe to call. */
 template <typename TImage>
 void
-SetupImageMetadata(const ModelConfiguration & configuration, typename TImage::ConstPointer image)
+SetupImageMetadata(const ImpactModelConfiguration & configuration, typename TImage::ConstPointer image)
 {
-  detail::ModelConfigurationImpl * impl = configuration.GetImpl();
+  detail::ImpactModelConfigurationImpl * impl = configuration.GetImpl();
 
   auto imageStats = itk::StatisticsImageFilter<TImage>::New();
   imageStats->SetInput(image);
@@ -140,12 +140,12 @@ SetupImageMetadata(const ModelConfiguration & configuration, typename TImage::Co
 
 /** Per-layer center-extraction indices used by the online inference (read/write). */
 inline const std::vector<std::vector<torch::indexing::TensorIndex>> &
-GetCentersIndexLayers(const ModelConfiguration & configuration)
+GetCentersIndexLayers(const ImpactModelConfiguration & configuration)
 {
   return configuration.GetImpl()->centersIndexLayers;
 }
 inline void
-SetCentersIndexLayers(const ModelConfiguration &                               configuration,
+SetCentersIndexLayers(const ImpactModelConfiguration &                         configuration,
                       std::vector<std::vector<torch::indexing::TensorIndex>> & centersIndexLayers)
 {
   configuration.GetImpl()->centersIndexLayers = centersIndexLayers;
@@ -153,4 +153,4 @@ SetCentersIndexLayers(const ModelConfiguration &                               c
 
 } // end namespace itk
 
-#endif // end #ifndef itkModelConfigurationDetail_h
+#endif // end #ifndef itkImpactModelConfigurationDetail_h

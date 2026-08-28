@@ -22,7 +22,7 @@
 # in the .hxx, skipped under ITK_MANUAL_INSTANTIATION). The moving-image template
 # parameter defaults to the fixed one; instantiated for scalar float images in 2D/3D.
 # From Python, configure IMPACT models with AddModelConfiguration() (the
-# std::vector<ModelConfiguration> setters need stdvector wrapping -- a follow-up).
+# std::vector<ImpactModelConfiguration> setters need stdvector wrapping -- a follow-up).
 itk_wrap_class("itk::ImpactFineRegistration" POINTER)
   itk_wrap_template("IF2IF2" "itk::Image<float, 2>, itk::Image<float, 2>")
   itk_wrap_template("IF3IF3" "itk::Image<float, 3>, itk::Image<float, 3>")

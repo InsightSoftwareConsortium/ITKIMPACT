@@ -76,7 +76,7 @@ def parse():
 
 def configs(args):
     for path in args.models:
-        yield itk.ModelConfiguration(path, 3, 1, [0, 0, 0], [args.voxel] * 3, 0, [True], False)
+        yield itk.ImpactModelConfiguration(path, 3, 1, [0, 0, 0], [args.voxel] * 3, 0, [True], False)
 
 
 def organ_mask(fixed, model, device, dilation=10):
@@ -94,7 +94,7 @@ def organ_mask(fixed, model, device, dilation=10):
     segmenter = itk.ImageToFeaturesMap[
         I3, itk.BSplineInterpolateImageFunction[I3, itk.D, itk.F]].New()
     segmenter.SetModelConfiguration(
-        itk.ModelConfiguration(model, 3, 1, [128, 128, 128], [1.5] * 3, 32, layers, False))
+        itk.ImpactModelConfiguration(model, 3, 1, [128, 128, 128], [1.5] * 3, 32, layers, False))
     segmenter.SetDevice(device)
     segmenter.AddInput(fixed)
     segmenter.Update()

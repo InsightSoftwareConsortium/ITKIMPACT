@@ -137,14 +137,11 @@ template <typename TFixedImage,
           typename TMetricTraits>
 template <typename TFeaturesMap, typename TImage>
 std::vector<TFeaturesMap>
-ImpactImageToImageMetricv4<TFixedImage,
-                                TMovingImage,
-                                TVirtualImage,
-                                TInternalComputationValueType,
-                                TMetricTraits>::GetFeaturesMaps(
-                                typename TImage::ConstPointer image,
-                                const std::vector<ModelConfiguration> & modelsConfiguration,
-                                std::function<typename TImage::PointType(const typename TImage::PointType &)> fct){
+ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalComputationValueType, TMetricTraits>::
+  GetFeaturesMaps(typename TImage::ConstPointer                                                 image,
+                  const std::vector<ImpactModelConfiguration> &                                 modelsConfiguration,
+                  std::function<typename TImage::PointType(const typename TImage::PointType &)> fct)
+{
   using TensorToImageFilterType = itk::TensorToImageFilter<TImage::ImageDimension>;
   using WriterType = itk::ImageFileWriter<FeaturesImageType>;
   using InterpolatorType = itk::BSplineInterpolateImageFunction<TImage, double>;
@@ -319,7 +316,7 @@ ImpactImageToImageMetricv4<TFixedImage,
     m_FixedModelsConfiguration.begin(),
     m_FixedModelsConfiguration.end(),
     0u,
-    [](unsigned int total, const ModelConfiguration & config) { return total + NumberOfKeptLayers(config); });
+    [](unsigned int total, const ImpactModelConfiguration & config) { return total + NumberOfKeptLayers(config); });
   auto checkPerLayer = [&](const char * name, size_t size) {
     if (size != comparedLayers)
     {
@@ -400,7 +397,7 @@ ImpactImageToImageMetricv4<TFixedImage,
     // counterpart of Static reading GetNumberOfComponentsPerPixel() off each feature map.
     // Empty if the patch size is not strictly positive (required online), if no layer is kept,
     // or if the model returns fewer outputs than the mask claims.
-    auto featureChannels = [&device](const ModelConfiguration & config) -> std::vector<int64_t> {
+    auto featureChannels = [&device](const ImpactModelConfiguration & config) -> std::vector<int64_t> {
       ModelTo(config, device);
       const std::vector<int64_t> & patchSize = config.GetPatchSize();
       std::vector<int64_t>         shape = { 1, static_cast<int64_t>(config.GetNumberOfChannels()) };

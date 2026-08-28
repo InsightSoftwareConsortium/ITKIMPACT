@@ -25,7 +25,7 @@ displacement field, driven by the semantic similarity of TorchScript features (n
 similarity is computed on learned + hand-crafted (MIND) features rather than raw
 intensities, it aligns *different modalities* -- e.g. CT to MR.
 
-Each model is an ``itk.ModelConfiguration``; passing several (here a deep segmentation
+Each model is an ``itk.ImpactModelConfiguration``; passing several (here a deep segmentation
 model and the modality-invariant MIND descriptor) combines their features. The output is
 an ``itk.DisplacementField`` (== GetOutput()) on the fixed grid, in millimetres, plus a
 ready-to-use ``itk.DisplacementFieldTransform``.
@@ -59,7 +59,7 @@ voxel = [args.voxel] * Dimension
 def add_models(reg):
     for path in args.models:
         reg.AddModelConfiguration(
-            itk.ModelConfiguration(path, Dimension, 1, [0, 0, 0], voxel, 0, [True], False)
+            itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], voxel, 0, [True], False)
         )
 
 # --- coarse field -----------------------------------------------------------------

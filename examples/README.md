@@ -45,7 +45,7 @@ mask = [False] * 8
 mask[2] = True          # a mid-level feature layer
 mask[7] = True          # the final logits
 
-config = itk.ModelConfiguration(
+config = itk.ImpactModelConfiguration(
     "TS/M291.pt",       # model
     3,                  # dimension the model expects
     1,                  # input channels
@@ -139,7 +139,7 @@ slice at a time along the last image axis; the swept axis keeps its extent and i
 Declare the patch size on the model's axes and the voxel size on the image's:
 
 ```python
-config = itk.ModelConfiguration(
+config = itk.ImpactModelConfiguration(
     "SAM2.1/SAM2.1_Small.pt", 2, 3, [128, 128], [1.5, 1.5, 3.0], 32, [True], False
 )
 ```
@@ -258,7 +258,7 @@ how many evaluations of a control grid are affordable.
 
 The script's docstring covers the two settings that decide the outcome: the mask, again, and a
 single resolution level, because ITK's shrink factors never reach the model. `ImageToFeaturesMap`
-resamples whatever it is handed to the `ModelConfiguration` voxel size, so a shrunk image is
+resamples whatever it is handed to the `ImpactModelConfiguration` voxel size, so a shrunk image is
 interpolated straight back up before the network sees it.
 
 ---

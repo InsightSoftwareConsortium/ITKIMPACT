@@ -363,13 +363,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // Feature-mode setup: extract the fixed/moving feature layers (constants, not differentiated
   // through), optionally PCA-reduce them (fit on fixed), and build one loss per kept layer.
   // Intensity mode skips this and compares raw voxels.
-  std::vector<torch::Tensor>                 fixedLayers;
-  std::vector<torch::Tensor>                 movingLayers;
-  std::vector<torch::Tensor>                 fixedLayersOnline; // "Jacobian" mode: fixed features, in-plane pooled
-  std::vector<torch::Tensor>                 pcaBasis; // per kept layer; undefined entry = no PCA
-  std::vector<std::unique_ptr<Impact::Loss>> losses;
-  std::vector<float>                         layerWeights;
-  const std::vector<ModelConfiguration> &    movingConfigs =
+  std::vector<torch::Tensor>                    fixedLayers;
+  std::vector<torch::Tensor>                    movingLayers;
+  std::vector<torch::Tensor>                    fixedLayersOnline; // "Jacobian" mode: fixed features, in-plane pooled
+  std::vector<torch::Tensor>                    pcaBasis;          // per kept layer; undefined entry = no PCA
+  std::vector<std::unique_ptr<Impact::Loss>>    losses;
+  std::vector<float>                            layerWeights;
+  const std::vector<ImpactModelConfiguration> & movingConfigs =
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
   // Extract the moving feature layers from an image tensor and project them onto the stored PCA
   // bases (used for the initial extraction and for the FeatureMapUpdateInterval re-extraction).

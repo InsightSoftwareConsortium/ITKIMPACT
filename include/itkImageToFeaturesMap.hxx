@@ -19,7 +19,7 @@
 #ifndef itkImageToFeaturesMap_hxx
 #define itkImageToFeaturesMap_hxx
 
-#include "itkModelConfigurationDetail.h"
+#include "itkImpactModelConfigurationDetail.h"
 #include "itkImageToFeaturesMapInternals.h"
 
 #include <algorithm>
@@ -65,7 +65,7 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::AddInput(const TInputImage * inp
   if (!m_Interpolator)
     itkExceptionMacro("Interpolator must be set before SetInput()");
   if (m_ModelConfiguration.GetModelPath().empty())
-    itkExceptionMacro("ModelConfiguration must be set before SetInput()");
+    itkExceptionMacro("ImpactModelConfiguration must be set before SetInput()");
 
   using ImageToTensorFilterType = itk::ImageToTensorFilter<TInputImage, TInterpolator>;
   auto converter = ImageToTensorFilterType::New();
@@ -88,8 +88,9 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::AddInput(const TInputImage * inp
                       << " dimension(s); give one voxel size per image axis, whatever the model's dimension.");
   }
   InputImageSpacingType outputSpacing;
-  for (unsigned int i = 0; i < TInputImage::ImageDimension; ++i) {
-      outputSpacing[i] = m_ModelConfiguration.GetVoxelSize()[i];
+  for (unsigned int i = 0; i < TInputImage::ImageDimension; ++i)
+  {
+    outputSpacing[i] = m_ModelConfiguration.GetVoxelSize()[i];
   }
 
   converter->SetOutputSpacing(outputSpacing);

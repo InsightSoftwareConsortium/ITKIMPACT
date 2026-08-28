@@ -23,7 +23,7 @@
 // through it, so it needs the torch model accessors. This header is only compiled in a
 // C++ build (guarded out of the castxml/wrapping parse by ITK_MANUAL_INSTANTIATION), so
 // pulling in LibTorch here keeps the public metric header torch-free.
-#include "itkModelConfigurationDetail.h"
+#include "itkImpactModelConfigurationDetail.h"
 // PatchTensorShape(): the single place that knows a patch reaches the model with its extents
 // reversed, shared with the elastix metric so both cut the same patch.
 #include "itkImpactOnlineInference.h"
@@ -324,10 +324,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   // derivative consistent with finite differences of the value.
   constexpr double kGradientStep = 1e-3;
 
-  const ModelConfiguration &   config = this->m_ImpactAssociate->GetFixedModelsConfiguration()[modelIndex];
-  const std::vector<int64_t> & patchSize = config.GetPatchSize();
-  const std::vector<float> &   voxelSize = config.GetVoxelSize();
-  const unsigned int           dim = config.GetDimension();
+  const ImpactModelConfiguration & config = this->m_ImpactAssociate->GetFixedModelsConfiguration()[modelIndex];
+  const std::vector<int64_t> &     patchSize = config.GetPatchSize();
+  const std::vector<float> &       voxelSize = config.GetVoxelSize();
+  const unsigned int               dim = config.GetDimension();
 
   // A patch step of one voxel along image axis d is the d-th column of the image's direction
   // matrix, scaled by the requested voxel size -- not world axis d. This is the same
@@ -479,7 +479,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
   // The layers the metric compares, in mask order: one feature map, one loss and one weight
   // each, appended to the same flat list across models that Static builds.
-  auto keptLayers = [](std::vector<torch::jit::IValue> & outputs, const ModelConfiguration & config) {
+  auto keptLayers = [](std::vector<torch::jit::IValue> & outputs, const ImpactModelConfiguration & config) {
     std::vector<torch::Tensor> layers;
     const auto &               mask = config.GetLayersMask();
     for (size_t it = 0; it < mask.size(); ++it)
@@ -506,8 +506,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   size_t comparison = 0; // flat index over (model, kept layer), the one the losses are read at
   for (size_t i = 0; i < fixedConfigs.size(); ++i)
   {
-    const ModelConfiguration & fixedConfig = fixedConfigs[i];
-    const ModelConfiguration & movingConfig = movingConfigs[i];
+    const ImpactModelConfiguration & fixedConfig = fixedConfigs[i];
+    const ImpactModelConfiguration & movingConfig = movingConfigs[i];
     const auto                 channels = static_cast<int64_t>(fixedConfig.GetNumberOfChannels());
 
     const std::vector<int64_t> & patchSize = fixedConfig.GetPatchSize();
@@ -533,7 +533,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     std::vector<int64_t> channelRepeat(patchShape.size(), 1);
     channelRepeat[1] = channels;
 
-    auto toModelPatch = [&](const torch::Tensor & values, const ModelConfiguration & config) {
+    auto toModelPatch = [&](const torch::Tensor & values, const ImpactModelConfiguration & config) {
       return values.reshape(patchShape).repeat(channelRepeat).to(device).to(GetModelDtype(config));
     };
     // The feature vector of one kept layer, restricted to the channels this comparison samples.

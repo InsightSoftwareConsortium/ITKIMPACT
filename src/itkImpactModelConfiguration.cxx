@@ -16,16 +16,16 @@
  *
  *=========================================================================*/
 
-// The only LibTorch-dependent part of ModelConfiguration: loading the TorchScript model.
-// Keeping it here (compiled, linking LibTorch) lets itkModelConfiguration.h stay
+// The only LibTorch-dependent part of ImpactModelConfiguration: loading the TorchScript model.
+// Keeping it here (compiled, linking LibTorch) lets itkImpactModelConfiguration.h stay
 // torch-free and therefore Python-wrappable.
 
-#include "itkModelConfigurationDetail.h"
+#include "itkImpactModelConfigurationDetail.h"
 
 namespace itk
 {
 
-ModelConfiguration::ModelConfiguration(std::string               modelPath,
+ImpactModelConfiguration::ImpactModelConfiguration(std::string               modelPath,
                                        unsigned int              dimension,
                                        unsigned int              numberOfChannels,
                                        std::vector<unsigned int> patchSize,
@@ -40,7 +40,7 @@ ModelConfiguration::ModelConfiguration(std::string               modelPath,
   , m_voxelSize(voxelSize)
   , m_overlap(overlap)
   , m_layersMask(layersMask)
-  , m_impl(std::make_shared<detail::ModelConfigurationImpl>())
+  , m_impl(std::make_shared<detail::ImpactModelConfigurationImpl>())
 {
   // Broadcast the scalar overlap across the axes. The reassembly reads the per-axis vector
   // only, so this is the single place the two representations meet; SetOverlaps() overrides it
@@ -59,7 +59,7 @@ ModelConfiguration::ModelConfiguration(std::string               modelPath,
   m_impl->model->to(m_impl->dtype);
 
   // Introspect how many positional inputs forward expects (besides self) so Forward()
-  // (itkModelConfigurationDetail.h) can pass the optional nLayers / image-metadata
+  // (itkImpactModelConfigurationDetail.h) can pass the optional nLayers / image-metadata
   // arguments to metadata-aware models. The requested layer count is the mask size.
   m_impl->nArgs = m_impl->model->get_method("forward").function().getSchema().arguments().size() - 1;
   m_impl->nLayers = torch::tensor(static_cast<int64_t>(m_layersMask.size()), torch::kInt16);

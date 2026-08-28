@@ -18,9 +18,9 @@
 
 # The module is otherwise header-only; this small library holds the only piece that
 # must be compiled against LibTorch while keeping its public header torch-free:
-# loading the TorchScript model in ModelConfiguration (so the header is Python-wrappable).
+# loading the TorchScript model in ImpactModelConfiguration (so the header is Python-wrappable).
 set(Impact_SRCS
-  itkModelConfiguration.cxx
+  itkImpactModelConfiguration.cxx
 )
 
 itk_module_add_library(Impact ${Impact_SRCS})

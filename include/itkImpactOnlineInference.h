@@ -21,12 +21,12 @@
 // Framework-neutral online ("Jacobian") inference shared one-way (Elastix -> ITKIMPACT):
 // patch-offset sampling, batched TorchScript forward, center extraction, and the autograd
 // value+Jacobian path used by the registration metrics. Depends only on the backend
-// ModelConfiguration (+ its torch accessors) and the IMPACT losses, talking to the host
+// ImpactModelConfiguration (+ its torch accessors) and the IMPACT losses, talking to the host
 // framework through point-sampling callbacks (ImagesPatchValues[AndJacobians]Evaluator).
 // Pulls in LibTorch; never part of the castxml-parsed public surface.
 
-#include "itkModelConfiguration.h"
-#include "itkModelConfigurationDetail.h"
+#include "itkImpactModelConfiguration.h"
+#include "itkImpactModelConfigurationDetail.h"
 #include "ImpactLoss.h"
 
 #include <itkMacro.h>
@@ -57,7 +57,7 @@ namespace Impact
  * silently re-partitions the buffer otherwise. Callbacks are handed this, never the raw patch
  * size, so the convention lives in one place. */
 inline std::vector<int64_t>
-PatchTensorShape(const ModelConfiguration & configuration)
+PatchTensorShape(const ImpactModelConfiguration & configuration)
 {
   const std::vector<int64_t> & patchSize = configuration.GetPatchSize();
   return std::vector<int64_t>(patchSize.rbegin(), patchSize.rend());
@@ -79,7 +79,7 @@ using ImagesPatchValuesAndJacobiansEvaluator = std::function<torch::Tensor(const
                                                                            int)>;
 
 inline std::vector<torch::Tensor>
-GetModelOutputsExample(std::vector<itk::ModelConfiguration> & modelsConfig,
+GetModelOutputsExample(std::vector<itk::ImpactModelConfiguration> & modelsConfig,
                        const std::string &                          modelType,
                        torch::Device                                device)
 {
@@ -140,7 +140,7 @@ GetModelOutputsExample(std::vector<itk::ModelConfiguration> & modelsConfig,
         }
       }
     }
-    for (itk::ModelConfiguration & config : modelsConfig)
+    for (itk::ImpactModelConfiguration & config : modelsConfig)
     {
       std::vector<std::vector<torch::indexing::TensorIndex>> centersIndexLayers;
       for (const torch::Tensor & tensor : outputsTensor)
@@ -160,7 +160,7 @@ GetModelOutputsExample(std::vector<itk::ModelConfiguration> & modelsConfig,
 } // end GetModelOutputsExample
 
 inline std::vector<std::vector<float>>
-GetPatchIndex(const itk::ModelConfiguration & modelConfiguration,
+GetPatchIndex(const itk::ImpactModelConfiguration & modelConfiguration,
               std::mt19937 &                        randomGenerator,
               unsigned int                          dimension)
 {
@@ -226,12 +226,12 @@ GetPatchIndex(const itk::ModelConfiguration & modelConfiguration,
 
 template <typename ImagePointType>
 std::vector<torch::Tensor>
-GenerateOutputs(const std::vector<itk::ModelConfiguration> &                    modelConfig,
-                const std::vector<ImagePointType> &                                   fixedPoints,
-                const std::vector<std::vector<std::vector<std::vector<float>>>> &     patchIndex,
-                const std::vector<torch::Tensor>                                      subsetsOfFeatures,
-                torch::Device                                                         device,
-                const ImagesPatchValuesEvaluator<ImagePointType> & imagesPatchValuesEvaluator)
+GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &                modelConfig,
+                const std::vector<ImagePointType> &                               fixedPoints,
+                const std::vector<std::vector<std::vector<std::vector<float>>>> & patchIndex,
+                const std::vector<torch::Tensor>                                  subsetsOfFeatures,
+                torch::Device                                                     device,
+                const ImagesPatchValuesEvaluator<ImagePointType> &                imagesPatchValuesEvaluator)
 {
 
   std::vector<torch::Tensor> outputsTensor;
@@ -284,15 +284,15 @@ GenerateOutputs(const std::vector<itk::ModelConfiguration> &                    
 
 template <typename ImagePointType>
 std::vector<torch::Tensor>
-GenerateOutputsAndJacobian(const std::vector<itk::ModelConfiguration> &                modelConfig,
-                           const std::vector<ImagePointType> &                               fixedPoints,
-                           const std::vector<std::vector<std::vector<std::vector<float>>>> & patchIndex,
-                           std::vector<torch::Tensor>                                        subsetsOfFeatures,
-                           std::vector<torch::Tensor>                                        fixedOutputsTensor,
-                           torch::Device                                                     device,
-                           std::vector<std::unique_ptr<itk::Impact::Loss>> &                  losses,
-                           const ImagesPatchValuesAndJacobiansEvaluator<ImagePointType> &
-                             imagesPatchValuesAndJacobiansEvaluator)
+GenerateOutputsAndJacobian(
+  const std::vector<itk::ImpactModelConfiguration> &                modelConfig,
+  const std::vector<ImagePointType> &                               fixedPoints,
+  const std::vector<std::vector<std::vector<std::vector<float>>>> & patchIndex,
+  std::vector<torch::Tensor>                                        subsetsOfFeatures,
+  std::vector<torch::Tensor>                                        fixedOutputsTensor,
+  torch::Device                                                     device,
+  std::vector<std::unique_ptr<itk::Impact::Loss>> &                 losses,
+  const ImagesPatchValuesAndJacobiansEvaluator<ImagePointType> &    imagesPatchValuesAndJacobiansEvaluator)
 {
   std::vector<torch::Tensor> layersJacobian;
 

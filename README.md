@@ -52,7 +52,7 @@ plugin build on one implementation.
 Three layers, from the shared foundation up to the applications:
 
 1. **Core — anatomy comparison.** The framework-neutral foundation: **load** a TorchScript
-   model (`itk::ModelConfiguration`), **extract** dense feature maps (`itk::ImageToFeaturesMap`),
+   model (`itk::ImpactModelConfiguration`), **extract** dense feature maps (`itk::ImageToFeaturesMap`),
    and **compare** them with differentiable distances — L1, L2, NCC, cosine, L1-cosine,
    dot-product, Dice (`ImpactLoss.h`). Runs on LibTorch (CPU/CUDA) with ITK images as the
    boundary (`itk::ImageToTensorFilter` / `itk::TensorToImageFilter`). It depends only on ITK
@@ -187,7 +187,7 @@ coarse.SetDevice("cuda:0")          # or "cpu"
 coarse.Update()
 
 # Stage 2 — fast Adam refinement on IMPACT features
-cfg = itk.ModelConfiguration("features_model.pt", 3, 1,
+cfg = itk.ImpactModelConfiguration("features_model.pt", 3, 1,
                              [0, 0, 0], [1.0, 1.0, 1.0], 0, [True, False], False)
 fine = itk.ImpactFineRegistration[ImageType, ImageType].New()
 fine.SetFixedImage(fixed)
@@ -269,7 +269,7 @@ fine->SetFixedImage(fixed);
 fine->SetMovingImage(moving);
 fine->SetDevice("cuda:0");
 fine->SetInitialDisplacementField(coarse->GetDisplacementField());
-itk::ModelConfiguration cfg("features_model.pt", 3, 1, {0,0,0}, {1,1,1}, 0, {true,false}, false);
+itk::ImpactModelConfiguration cfg("features_model.pt", 3, 1, {0,0,0}, {1,1,1}, 0, {true,false}, false);
 fine->AddModelConfiguration(cfg);
 fine->SetDistance({"L2"});
 fine->SetNumberOfIterations(100);
@@ -282,7 +282,7 @@ auto * transform = fine->GetDisplacementFieldTransform();
 
 | Layer | Class / file | Role |
 |---|---|---|
-| Core | `itk::ModelConfiguration` | Configures and loads a TorchScript feature model. |
+| Core | `itk::ImpactModelConfiguration` | Configures and loads a TorchScript feature model. |
 | Core | `itk::ImageToFeaturesMap` | Patch-based TorchScript inference engine (tiling, overlap blending, PCA): dense feature maps — or any model output (segmentation, synthesis, denoising…). |
 | Core | `itk::ImageToTensorFilter` / `itk::TensorToImageFilter` | ITK image ↔ `torch::Tensor` bridge. |
 | Core | `ImpactLoss.h` (`itk::Impact`) | Differentiable feature losses: L1, L2, NCC, Cosine, L1Cosine, DotProduct, Dice. |

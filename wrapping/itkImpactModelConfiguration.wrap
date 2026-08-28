@@ -16,27 +16,27 @@
 #
 #==========================================================================
 
-# ModelConfiguration is a plain (non-itk::Object) value type configuring a TorchScript
+# ImpactModelConfiguration is a plain (non-itk::Object) value type configuring a TorchScript
 # model. Its header is torch-free, so castxml can parse it; from Python a user builds
-# one with itk.ModelConfiguration(path, dimension, channels, patchSize, voxelSize,
+# one with itk.ImpactModelConfiguration(path, dimension, channels, patchSize, voxelSize,
 # overlap, layersMask, mixedPrecision) and passes it to ImageToFeaturesMap / the metric.
-itk_wrap_simple_class("itk::ModelConfiguration")
+itk_wrap_simple_class("itk::ImpactModelConfiguration")
 
-# The metric and registration filters take a std::vector<itk::ModelConfiguration>
+# The metric and registration filters take a std::vector<itk::ImpactModelConfiguration>
 # (SetFixedModelsConfiguration / SetMovingModelsConfiguration / SetModelsConfiguration),
 # so wrap that container too -- otherwise those setters are unusable from Python. This
 # is the value-type analogue of the std::vector<X_Pointer> containers WrapITK emits
 # automatically for itk::Object subclasses (see Wrapping/TypedefMacros.cmake); with the
-# %template declared, SWIG converts a plain Python list of ModelConfiguration to the
+# %template declared, SWIG converts a plain Python list of ImpactModelConfiguration to the
 # std::vector argument (e.g. metric.SetFixedModelsConfiguration([cfgA, cfgB])).
 string(
   APPEND
   ITK_WRAP_PYTHON_SWIG_EXT
-  "%template(vectoritkModelConfiguration) std::vector< itkModelConfiguration >;\n"
+  "%template(vectoritkImpactModelConfiguration) std::vector< itkImpactModelConfiguration >;\n"
 )
 add_python_config_template(
   "vector"
   "std::vector"
-  "vectoritkModelConfiguration"
-  "itk::ModelConfiguration"
+  "vectoritkImpactModelConfiguration"
+  "itk::ImpactModelConfiguration"
 )

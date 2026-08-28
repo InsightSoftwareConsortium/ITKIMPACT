@@ -28,7 +28,7 @@
 #include <itkDefaultImageToImageMetricTraitsv4.h>
 #include <itkBSplineInterpolateImageFunction.h>
 #include <itkVectorImage.h>
-#include <itkModelConfiguration.h>
+#include <itkImpactModelConfiguration.h>
 #include <functional>
 #include <memory>
 
@@ -103,17 +103,17 @@ public:
   /** Set/Get the TorchScript model configurations used to extract features from the fixed
    * image. Each model may target a different resolution, architecture or semantic level.
    */
-  itkSetMacro(FixedModelsConfiguration, std::vector<ModelConfiguration>);
-  itkGetConstReferenceMacro(FixedModelsConfiguration, std::vector<ModelConfiguration>);
+  itkSetMacro(FixedModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkGetConstReferenceMacro(FixedModelsConfiguration, std::vector<ImpactModelConfiguration>);
 
   /** Set/Get the TorchScript model configurations used to extract features from the moving
    * image. Distinct fixed/moving models support asymmetric or multimodal setups.
    */
-  itkSetMacro(MovingModelsConfiguration, std::vector<ModelConfiguration>);
-  itkGetConstReferenceMacro(MovingModelsConfiguration, std::vector<ModelConfiguration>);
+  itkSetMacro(MovingModelsConfiguration, std::vector<ImpactModelConfiguration>);
+  itkGetConstReferenceMacro(MovingModelsConfiguration, std::vector<ImpactModelConfiguration>);
 
   void
-  SetModelsConfiguration(std::vector<ModelConfiguration> & modelsConfiguration)
+  SetModelsConfiguration(std::vector<ImpactModelConfiguration> & modelsConfiguration)
   {
     SetFixedModelsConfiguration(modelsConfiguration);
     SetMovingModelsConfiguration(modelsConfiguration);
@@ -122,20 +122,20 @@ public:
   /** Append a single model configuration. Convenience for callers (e.g. Python) that add
    * configurations one at a time instead of passing a std::vector. */
   void
-  AddFixedModelConfiguration(const ModelConfiguration & configuration)
+  AddFixedModelConfiguration(const ImpactModelConfiguration & configuration)
   {
     m_FixedModelsConfiguration.push_back(configuration);
     this->Modified();
   }
   void
-  AddMovingModelConfiguration(const ModelConfiguration & configuration)
+  AddMovingModelConfiguration(const ImpactModelConfiguration & configuration)
   {
     m_MovingModelsConfiguration.push_back(configuration);
     this->Modified();
   }
   /** Append the same configuration to both the fixed and moving lists. */
   void
-  AddModelConfiguration(const ModelConfiguration & configuration)
+  AddModelConfiguration(const ImpactModelConfiguration & configuration)
   {
     AddFixedModelConfiguration(configuration);
     AddMovingModelConfiguration(configuration);
@@ -275,13 +275,13 @@ protected:
    * this declaration carries no torch types. Defined in the .hxx. */
   template <typename TFeaturesMap, typename TImage>
   std::vector<TFeaturesMap>
-  GetFeaturesMaps(typename TImage::ConstPointer                                                image,
-                  const std::vector<ModelConfiguration> &                                      modelsConfiguration,
+  GetFeaturesMaps(typename TImage::ConstPointer                                                 image,
+                  const std::vector<ImpactModelConfiguration> &                                 modelsConfiguration,
                   std::function<typename TImage::PointType(const typename TImage::PointType &)> fct = nullptr);
 
 private:
-  std::vector<ModelConfiguration> m_FixedModelsConfiguration;
-  std::vector<ModelConfiguration> m_MovingModelsConfiguration;
+  std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
+  std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
 
   std::vector<unsigned int> m_SubsetFeatures;
   std::vector<unsigned int> m_PCA;

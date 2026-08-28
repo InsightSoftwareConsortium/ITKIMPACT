@@ -23,7 +23,7 @@
 returns each requested layer as an ``itk.VectorImage[itk.F, dim]`` -- no ``import torch``
 needed. A single forward pass exposes the whole hierarchy: from low-level features to,
 for a segmentation network, the final label logits. Which layers you keep is chosen by
-the boolean ``layersMask`` in the ``itk.ModelConfiguration``.
+the boolean ``layersMask`` in the ``itk.ImpactModelConfiguration``.
 
 This example runs a TotalSegmentator-style model on a CT and keeps two layers at once:
 a mid-level feature layer and the final segmentation layer.
@@ -71,7 +71,7 @@ mask[args.seg_layer] = True
 # accuracy near the patch borders, where the model has least context.
 voxel = [args.voxel] * Dimension
 patch = [args.patch] * Dimension
-config = itk.ModelConfiguration(args.model, Dimension, 1, patch, voxel, args.overlap, mask, False)
+config = itk.ImpactModelConfiguration(args.model, Dimension, 1, patch, voxel, args.overlap, mask, False)
 config.SetPatchCombine(args.combine)
 # The overlap can also be set per axis, which is what an anisotropic patch needs:
 #   config.SetOverlaps([16, 16, 8])

@@ -29,7 +29,7 @@
 
 #include "itkImageToFeaturesMap.h"
 #include "itkImpactImageToImageMetricv4.h"
-#include "itkModelConfiguration.h"
+#include "itkImpactModelConfiguration.h"
 
 #include <itkImageFileReader.h>
 #include <itkImageFileWriter.h>
@@ -64,7 +64,7 @@ main(int argc, char * argv[])
 
   // A TorchScript model configuration: (path, dimension, channels, patchSize, voxelSize,
   // overlap, layersMask, mixedPrecision). Only POD/STL types cross the API.
-  const itk::ModelConfiguration config(
+  const itk::ImpactModelConfiguration config(
     modelPath, Dimension, 1, { 0, 0, 0 }, { 1.0f, 1.0f, 1.0f }, 2, { true }, false);
 
   // --- 1. core: extract a dense feature map from the fixed image --------------------
@@ -85,7 +85,7 @@ main(int argc, char * argv[])
   // --- 2. metric: register moving onto fixed by comparing anatomical features -------
   using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType>;
   auto                                 metric = MetricType::New();
-  std::vector<itk::ModelConfiguration> models{ config };
+  std::vector<itk::ImpactModelConfiguration> models{ config };
   metric->SetModelsConfiguration(models);
   metric->SetDistance({ "L2" });       // per-layer loss: L1, L2, NCC, Cosine, Dice, ...
   metric->SetLayersWeight({ 1.0f });

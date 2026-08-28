@@ -79,7 +79,7 @@ def extract(args):
     mask[args.feature_layer] = True
     mask[args.seg_layer] = True
 
-    config = itk.ModelConfiguration(
+    config = itk.ImpactModelConfiguration(
         args.model, 3, 1, [args.patch] * 3, [args.voxel] * 3, args.overlap, mask, False
     )
     # nnU-Net's window, so the reassembly matches what TotalSegmentator does itself.

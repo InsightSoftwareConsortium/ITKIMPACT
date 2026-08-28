@@ -151,7 +151,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     std::vector<torch::Tensor> movingLayers;
     if (featureMode)
     {
-      const std::vector<ModelConfiguration> & movingConfigs =
+      const std::vector<ImpactModelConfiguration> & movingConfigs =
         m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
       // Give metadata-aware models (nArgs>=4, e.g. SAM) each image's OWN normalisation stats
       // (min/max/mean/sigma + direction), not the undefined default. Fixed and moving configs added via

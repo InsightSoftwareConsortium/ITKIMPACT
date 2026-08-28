@@ -26,7 +26,7 @@
 
 #include <itkProcessObject.h>
 #include <itkVectorImage.h>
-#include <itkModelConfiguration.h>
+#include <itkImpactModelConfiguration.h>
 #include "itkBSplineInterpolateImageFunction.h"
 
 #include <functional>
@@ -49,7 +49,7 @@ struct ImageToFeaturesMapInternals;
  *
  * The filter wraps an ImageToTensor conversion, a TorchScript inference and a
  * TensorToImageFilter to obtain semantic feature maps. Its interface uses only ITK/STL
- * types (the model is configured through ModelConfiguration and the device through a
+ * types (the model is configured through ImpactModelConfiguration and the device through a
  * string), so the class is wrappable to Python; the torch state is held opaquely.
  *
  * \ingroup Impact
@@ -105,7 +105,7 @@ public:
   }
 
   void
-  SetModelConfiguration(const itk::ModelConfiguration & config)
+  SetModelConfiguration(const itk::ImpactModelConfiguration & config)
   {
     m_ModelConfiguration = config;
 
@@ -121,7 +121,7 @@ public:
     this->Modified();
   }
 
-  itkGetConstReferenceMacro(ModelConfiguration, ModelConfiguration);
+  itkGetConstReferenceMacro(ModelConfiguration, ImpactModelConfiguration);
 
   /** The device the model runs on, as a string ("cpu", "cuda", "cuda:0", ...). */
   itkSetMacro(Device, std::string);
@@ -201,10 +201,10 @@ protected:
 
 
 private:
-  InterpolatorPointer m_Interpolator;
-  ModelConfiguration  m_ModelConfiguration;
-  std::string         m_Device = "cpu";
-  unsigned int        m_PCA = 0;
+  InterpolatorPointer                                             m_Interpolator;
+  ImpactModelConfiguration                                        m_ModelConfiguration;
+  std::string                                                     m_Device = "cpu";
+  unsigned int                                                    m_PCA = 0;
   std::function<InputImagePointType(const InputImagePointType &)> m_Transform;
   // shared_ptr to an incomplete type keeps all special members usable in this
   // torch-free header; the struct is defined in itkImageToFeaturesMapInternals.h.

@@ -58,7 +58,7 @@ metric = itk.ImpactImageToImageMetricv4[ImageType, ImageType].New()
 # Add one configuration per model (applies to both fixed and moving images).
 for path in args.models:
     metric.AddModelConfiguration(
-        itk.ModelConfiguration(path, Dimension, 1, [0, 0, 0], voxel, 0, [True], False)
+        itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], voxel, 0, [True], False)
     )
 metric.SetDistance(["L2"] * len(args.models))      # the distance to reach for; NCC is an ablation
 metric.SetLayersWeight([1.0] * len(args.models))

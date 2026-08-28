@@ -37,7 +37,7 @@
 //
 // Include only from translation units that already depend on torch.
 
-#include "itkModelConfigurationDetail.h"
+#include "itkImpactModelConfigurationDetail.h"
 
 #include <itkMacro.h>
 #include <itkMath.h>
@@ -722,11 +722,11 @@ private:
  * the blend. A caller that needs the graph must run the model whole.
  */
 inline std::vector<torch::Tensor>
-RunTiledModel(const ModelConfiguration &                                                       config,
-              const torch::Tensor &                                                            input,
-              const torch::Device &                                                            device,
-              const torch::Device &                                                            accumulateOn,
-              PathCombineMode                                                                  combine,
+RunTiledModel(const ImpactModelConfiguration &                                                config,
+              const torch::Tensor &                                                           input,
+              const torch::Device &                                                           device,
+              const torch::Device &                                                           accumulateOn,
+              PathCombineMode                                                                 combine,
               const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination = {})
 {
   torch::NoGradGuard noGrad;
