@@ -239,7 +239,7 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
                                                imageTensor.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
                                                device,
                                                device, // stays on the device; no host round-trip
-                                               PathCombineModeFromString(config.GetPatchCombine())))
+                                               PatchCombineModeFromString(config.GetPatchCombine())))
       {
         layers.push_back(keepSubset(map.unsqueeze(0)).contiguous());
       }

@@ -55,8 +55,10 @@
 
 namespace itk
 {
+namespace Impact
+{
 
-/** \class PathCombine
+/** \class PatchCombine
  * \brief The window that weights one patch when a tiled feature map is put back together.
  *
  * A patch's weight is the outer product of one 1-D window per axis. The factors are kept
@@ -70,10 +72,10 @@ namespace itk
  *
  * \ingroup Impact
  */
-class PathCombine
+class PatchCombine
 {
 public:
-  virtual ~PathCombine() = default;
+  virtual ~PatchCombine() = default;
 
   /** Build the 1-D windows for a patch of `patchSize`, tapered over `overlaps` voxels per side
    * on each axis. An axis with no overlap is blended with nothing, so its window is flat. */
@@ -101,7 +103,7 @@ public:
   }
 
   /** The 1-D window along `axis` for the patch at grid `position` of `count`. A weighting is
-   * the same wherever the patch sits; a selection opens its border patches (see PathTrim). */
+   * the same wherever the patch sits; a selection opens its border patches (see PatchTrim). */
   virtual torch::Tensor
   Window(unsigned int axis, std::size_t itkNotUsed(position), std::size_t itkNotUsed(count)) const
   {
@@ -117,14 +119,14 @@ protected:
   std::vector<int64_t>       m_Overlaps;
 };
 
-/** \class PathMean
+/** \class PatchMean
  * \brief Plain average of the patches covering a voxel.
  *
  * The averaging is done by the assembly normalisation, so the window itself is flat.
  *
  * \ingroup Impact
  */
-class PathMean : public PathCombine
+class PatchMean : public PatchCombine
 {
 protected:
   torch::Tensor
@@ -134,12 +136,12 @@ protected:
   }
 };
 
-/** \class PathCosinus
+/** \class PatchCosinus
  * \brief Raised-cosine (sin^2) taper: an exact partition of unity over the overlap.
  *
  * \ingroup Impact
  */
-class PathCosinus : public PathCombine
+class PatchCosinus : public PatchCombine
 {
 protected:
   torch::Tensor
@@ -157,7 +159,7 @@ protected:
   }
 };
 
-/** \class PathGaussian
+/** \class PatchGaussian
  * \brief nnU-Net's Gaussian importance weighting -- what TotalSegmentator and MRSegmentator
  * reassemble with.
  *
@@ -166,10 +168,10 @@ protected:
  *
  * \ingroup Impact
  */
-class PathGaussian : public PathCombine
+class PatchGaussian : public PatchCombine
 {
 public:
-  explicit PathGaussian(double sigmaScale = 0.125)
+  explicit PatchGaussian(double sigmaScale = 0.125)
     : m_SigmaScale(sigmaScale)
   {}
 
@@ -187,7 +189,7 @@ protected:
   double m_SigmaScale;
 };
 
-/** \class PathTrim
+/** \class PatchTrim
  * \brief Selection instead of weighting: each voxel comes from the patch holding it most
  * centrally.
  *
@@ -196,7 +198,7 @@ protected:
  *
  * \ingroup Impact
  */
-class PathTrim : public PathCombine
+class PatchTrim : public PatchCombine
 {
 public:
   bool
@@ -247,12 +249,12 @@ protected:
   }
 };
 
-/** \class PathCombineMode
+/** \class PatchCombineMode
  * \brief The blend windows a caller can ask for by name.
  *
  * \ingroup Impact
  */
-enum class PathCombineMode
+enum class PatchCombineMode
 {
   Mean,
   Cosinus,
@@ -262,8 +264,8 @@ enum class PathCombineMode
 
 /** Parse a blend-window name (case-insensitive). An unknown name throws rather than falling
  * back to a default, so a typo cannot silently change the reassembly. */
-inline PathCombineMode
-PathCombineModeFromString(const std::string & name)
+inline PatchCombineMode
+PatchCombineModeFromString(const std::string & name)
 {
   std::string key;
   key.reserve(name.size());
@@ -273,39 +275,39 @@ PathCombineModeFromString(const std::string & name)
   }
   if (key == "mean")
   {
-    return PathCombineMode::Mean;
+    return PatchCombineMode::Mean;
   }
   if (key == "cosinus" || key == "cosine")
   {
-    return PathCombineMode::Cosinus;
+    return PatchCombineMode::Cosinus;
   }
   if (key == "trim")
   {
-    return PathCombineMode::Trim;
+    return PatchCombineMode::Trim;
   }
   if (key == "gaussian" || key == "gauss")
   {
-    return PathCombineMode::Gaussian;
+    return PatchCombineMode::Gaussian;
   }
   itkGenericExceptionMacro("Unknown patch-combine window '" << name
                                                             << "'; expected one of "
                                                                "mean, cosinus, trim, gaussian.");
 }
 
-inline std::shared_ptr<PathCombine>
-MakePathCombine(PathCombineMode mode)
+inline std::shared_ptr<PatchCombine>
+MakePatchCombine(PatchCombineMode mode)
 {
   switch (mode)
   {
-    case PathCombineMode::Mean:
-      return std::make_shared<PathMean>();
-    case PathCombineMode::Trim:
-      return std::make_shared<PathTrim>();
-    case PathCombineMode::Gaussian:
-      return std::make_shared<PathGaussian>();
-    case PathCombineMode::Cosinus:
+    case PatchCombineMode::Mean:
+      return std::make_shared<PatchMean>();
+    case PatchCombineMode::Trim:
+      return std::make_shared<PatchTrim>();
+    case PatchCombineMode::Gaussian:
+      return std::make_shared<PatchGaussian>();
+    case PatchCombineMode::Cosinus:
     default:
-      return std::make_shared<PathCosinus>();
+      return std::make_shared<PatchCosinus>();
   }
 }
 
@@ -464,11 +466,11 @@ public:
   /** `shape` is the volume extent to assemble into, `patchSize` the extent of the patches the
    * model returns, `overlaps` their per-axis overlap, `combine` the blend window (null means
    * plain overwrite). */
-  Accumulator(std::vector<int64_t>         shape,
-              std::vector<int64_t>         patchSize,
-              std::vector<int64_t>         overlaps,
-              PatchGrid                    grid,
-              std::shared_ptr<PathCombine> combine)
+  Accumulator(std::vector<int64_t>          shape,
+              std::vector<int64_t>          patchSize,
+              std::vector<int64_t>          overlaps,
+              PatchGrid                     grid,
+              std::shared_ptr<PatchCombine> combine)
     : m_Shape(std::move(shape))
     , m_Grid(std::move(grid))
     , m_Combine(std::move(combine))
@@ -605,7 +607,7 @@ public:
 
 private:
   /** Per axis, the blend weight summed over the grid: the denominator of every share. It
-   * factorises (see PathCombine), so it is one vector per axis and never a volume. */
+   * factorises (see PatchCombine), so it is one vector per axis and never a volume. */
   void
   ComputeWeightTotals()
   {
@@ -693,7 +695,7 @@ private:
 
   std::vector<int64_t>                                  m_Shape;
   PatchGrid                                             m_Grid;
-  std::shared_ptr<PathCombine>                          m_Combine;
+  std::shared_ptr<PatchCombine>                         m_Combine;
   torch::Tensor                                         m_Result;
   std::vector<torch::Tensor>                            m_Totals;
   std::vector<std::vector<torch::Tensor>>               m_Shares;
@@ -726,7 +728,7 @@ RunTiledModel(const ImpactModelConfiguration &                                  
               const torch::Tensor &                                                           input,
               const torch::Device &                                                           device,
               const torch::Device &                                                           accumulateOn,
-              PathCombineMode                                                                 combine,
+              PatchCombineMode                                                                combine,
               const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination = {})
 {
   torch::NoGradGuard noGrad;
@@ -892,7 +894,7 @@ RunTiledModel(const ImpactModelConfiguration &                                  
           }
 
           accumulators.emplace_back(
-            layerShape, layerPatchSize, layerOverlaps, layerGrid, MakePathCombine(combine));
+            layerShape, layerPatchSize, layerOverlaps, layerGrid, MakePatchCombine(combine));
 
           // This slice's own sub-view of the layer's buffer.
           torch::Tensor destination = assembled[layerIndex];
@@ -933,8 +935,6 @@ RunTiledModel(const ImpactModelConfiguration &                                  
   return assembled;
 }
 
-namespace Impact
-{
 
 /** Fit a PCA basis on a feature tensor {C, spatial...} (no batch): channel-covariance
  * eigendecomposition, keep the top `newC` principal components. Returns the {C, newC} basis.
@@ -970,8 +970,8 @@ PcaTransform(const torch::Tensor & input, const torch::Tensor & basis)
   return projected.reshape(shape);
 }
 
-} // namespace Impact
 
+} // namespace Impact
 } // namespace itk
 
 #endif // itkImpactPatchTiling_h

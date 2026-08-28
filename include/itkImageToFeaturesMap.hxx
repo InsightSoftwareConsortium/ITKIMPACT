@@ -166,7 +166,7 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
                   m_Internals->inputsTensor[0],
                   device,
                   torch::Device(torch::kCPU), // the map ends up in an ITK buffer, which is on the host
-                  PathCombineModeFromString(m_ModelConfiguration.GetPatchCombine()),
+                  Impact::PatchCombineModeFromString(m_ModelConfiguration.GetPatchCombine()),
                   makeDestination);
 
   if (blendInPlace)
