@@ -65,7 +65,7 @@ main(int argc, char * argv[])
   // A TorchScript model configuration: (path, dimension, channels, patchSize, voxelSize,
   // overlap, layersMask, mixedPrecision). Only POD/STL types cross the API.
   const itk::ImpactModelConfiguration config(
-    modelPath, Dimension, 1, { 0, 0, 0 }, { 1.0f, 1.0f, 1.0f }, 2, { true }, false);
+    modelPath, Dimension, 1, { 0, 0, 0 }, { 1.0f, 1.0f, 1.0f }, { 2, 2, 2 }, { true }, false);
 
   // --- 1. core: extract a dense feature map from the fixed image --------------------
   using InterpolatorType = itk::BSplineInterpolateImageFunction<ImageType, double>;

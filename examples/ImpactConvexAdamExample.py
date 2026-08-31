@@ -59,7 +59,7 @@ voxel = [args.voxel] * Dimension
 def add_models(reg):
     for path in args.models:
         reg.AddModelConfiguration(
-            itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], voxel, 0, [True], False)
+            itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], voxel, [0, 0, 0], [True], False)
         )
 
 # --- coarse field -----------------------------------------------------------------

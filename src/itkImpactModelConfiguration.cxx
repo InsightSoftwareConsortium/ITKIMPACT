@@ -30,7 +30,7 @@ ImpactModelConfiguration::ImpactModelConfiguration(std::string               mod
                                        unsigned int              numberOfChannels,
                                        std::vector<unsigned int> patchSize,
                                        std::vector<float>        voxelSize,
-                                       unsigned int              overlap,
+                                       std::vector<unsigned int> overlap,
                                        std::vector<bool>         layersMask,
                                        bool                      useMixedPrecision)
   : m_modelPath(modelPath)
@@ -38,14 +38,13 @@ ImpactModelConfiguration::ImpactModelConfiguration(std::string               mod
   , m_numberOfChannels(numberOfChannels)
   , m_patchSize(patchSize.begin(), patchSize.end())
   , m_voxelSize(voxelSize)
-  , m_overlap(overlap)
   , m_layersMask(layersMask)
   , m_impl(std::make_shared<detail::ImpactModelConfigurationImpl>())
 {
-  // Broadcast the scalar overlap across the axes. The reassembly reads the per-axis vector
-  // only, so this is the single place the two representations meet; SetOverlaps() overrides it
-  // for a model whose patch is anisotropic.
-  m_overlaps.assign(m_dimension, overlap);
+  // The reassembly reads the per-axis overlap only. Fill the missing axes by repeating the
+  // last entry given, so a single value still means "the same on every axis", and an empty
+  // one means no overlap at all.
+  SetOverlaps(overlap.empty() ? std::vector<unsigned int>(m_dimension, 0u) : overlap);
 
   m_impl->dtype = useMixedPrecision ? torch::kFloat16 : torch::kFloat32;
   // The model runs with the default JIT graph-executor optimization (fusion) enabled.

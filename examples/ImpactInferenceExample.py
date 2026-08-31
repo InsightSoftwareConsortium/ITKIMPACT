@@ -71,7 +71,7 @@ mask[args.seg_layer] = True
 # accuracy near the patch borders, where the model has least context.
 voxel = [args.voxel] * Dimension
 patch = [args.patch] * Dimension
-config = itk.ImpactModelConfiguration(args.model, Dimension, 1, patch, voxel, args.overlap, mask, False)
+config = itk.ImpactModelConfiguration(args.model, Dimension, 1, patch, voxel, [args.overlap] * Dimension, mask, False)
 config.SetPatchCombine(args.combine)
 # The overlap can also be set per axis, which is what an anisotropic patch needs:
 #   config.SetOverlaps([16, 16, 8])

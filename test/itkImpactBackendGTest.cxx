@@ -199,7 +199,7 @@ TEST(ImpactBackend, ImageToFeaturesMapProducesFeatureLayers)
 
   // Toy model returns 2 layers: passthrough (2 channels) and conv features (4).
   itk::ImpactModelConfiguration config(
-    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 2, { true, true }, /*mixedPrecision*/ false);
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, /*mixedPrecision*/ false);
 
   auto filter = FeatMapType::New();
   filter->SetModelConfiguration(config);
@@ -225,7 +225,8 @@ TEST(ImpactBackend, ImageToFeaturesMapOverlapZeroKeepsSize)
   auto interpolator = InterpolatorType::New();
   interpolator->SetSplineOrder(3);
   // overlap = 0 (6th ctor arg), patchSize {0,0,0} = full image -> single patch.
-  itk::ImpactModelConfiguration config(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+  itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false);
   auto                          filter = FeatMapType::New();
   filter->SetModelConfiguration(config);
   filter->SetInterpolator(interpolator);
@@ -248,7 +249,7 @@ TEST(ImpactBackend, ImageToFeaturesMapReusesInjectedPcaBasis)
 
   auto runOn = [&](ImageType::Pointer image, const std::vector<torch::Tensor> * inject) {
     itk::ImpactModelConfiguration config(
-      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 2, { true, true }, false);
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, false);
     auto filter = FeatMapType::New();
     filter->SetModelConfiguration(config);
     filter->SetInterpolator(interpolator);
@@ -289,7 +290,8 @@ TEST(ImpactBackend, ImageToFeaturesMapOnCudaWhenAvailable)
   auto interpolator = InterpolatorType::New();
   interpolator->SetSplineOrder(3);
 
-  itk::ImpactModelConfiguration config(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 2, { true, true }, false);
+  itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, false);
 
   auto filter = FeatMapType::New();
   filter->SetModelConfiguration(config);
@@ -324,7 +326,7 @@ TEST(ImpactMetric, StaticFeaturesMapRefreshFollowsTheTransform)
                          1,
                          std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         2,
+                         std::vector<unsigned int>{ 2, 2, 2 },
                          std::vector<bool>{ false, true }, // passthrough only
                          false);
     metric->SetModelsConfiguration(configs);
@@ -402,7 +404,7 @@ TEST(ImpactMetric, StaticValueZeroForIdenticalPositiveForDifferent)
                          1,
                          std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         2,
+                         std::vector<unsigned int>{ 2, 2, 2 },
                          std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -456,7 +458,7 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
                          1,
                          std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         2,
+                         std::vector<unsigned int>{ 2, 2, 2 },
                          std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -538,7 +540,7 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferencesDisplacementField)
                        1,
                        std::vector<unsigned int>{ 0, 0, 0 },
                        std::vector<float>{ 1.f, 1.f, 1.f },
-                       2,
+                       std::vector<unsigned int>{ 2, 2, 2 },
                        std::vector<bool>{ true, false },
                        false);
   metric->SetModelsConfiguration(configs);
@@ -637,7 +639,7 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
                          1,
                          std::vector<unsigned int>{ 3, 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         0,
+                         std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -730,7 +732,7 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
                          1,
                          std::vector<unsigned int>{ 3, 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         0,
+                         std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -824,7 +826,7 @@ TEST(ImpactMetric, EveryKeptLayerIsCompared)
                          1,
                          std::vector<unsigned int>{ 3, 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         0,
+                         std::vector<unsigned int>{ 0, 0, 0 },
                          layersMask,
                          false);
     metric->SetModelsConfiguration(configs);
@@ -906,7 +908,7 @@ TEST(ImpactMetric, PerLayerVectorsMustMatchTheNumberOfComparedLayers)
                          1,
                          std::vector<unsigned int>{ 3, 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         0,
+                         std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<bool>{ true, true },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -968,7 +970,7 @@ TEST(ImpactMetric, TwoDimensionalModelJacobianDerivativeMatchesFiniteDifferences
                          1,
                          std::vector<unsigned int>{ 3, 3 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         0,
+                         std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -1085,7 +1087,7 @@ TEST(ImpactMetric, TranslationRegistrationConvergesForEveryDistance)
                          1,
                          std::vector<unsigned int>{ 0, 0, 0 },
                          std::vector<float>{ 1.f, 1.f, 1.f },
-                         2,
+                         std::vector<unsigned int>{ 2, 2, 2 },
                          std::vector<bool>{ true, false },
                          false);
     metric->SetModelsConfiguration(configs);
@@ -1152,7 +1154,7 @@ TEST(ImpactBackend, MultiLayerFeatureMapsAreIndependent)
   auto build = [&](std::vector<bool> mask) {
     auto interp = InterpolatorType::New();
     interp->SetSplineOrder(3);
-    itk::ImpactModelConfiguration cfg(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 2, mask, false);
+    itk::ImpactModelConfiguration cfg(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, mask, false);
     auto f = FeatMapType::New();
     f->SetModelConfiguration(cfg);
     f->SetInterpolator(interp);
@@ -1217,7 +1219,7 @@ TEST(ImpactBackend, TiledFeatureMapReconstructsInputForEveryWindow)
     for (const unsigned int overlap : { 0u, 3u, 5u })
     {
       itk::ImpactModelConfiguration cfg(
-        ToyModelPath(), 3, 1, { 8, 8, 8 }, { 1.f, 1.f, 1.f }, overlap, { true, true }, false);
+        ToyModelPath(), 3, 1, { 8, 8, 8 }, { 1.f, 1.f, 1.f }, { overlap, overlap, overlap }, { true, true }, false);
       cfg.SetPatchCombine(window);
       auto interp = InterpolatorType::New();
       interp->SetSplineOrder(3);
@@ -1259,7 +1261,8 @@ TEST(ImpactBackend, PerAxisOverlapBlendsAndRejectsAnOverlapAsLargeAsThePatch)
   auto                      img = MakeRampImage(size);
 
   auto run = [&](const std::vector<unsigned int> & overlaps) {
-    itk::ImpactModelConfiguration cfg(ToyModelPath(), 3, 1, { 8, 8, 8 }, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+    itk::ImpactModelConfiguration cfg(
+      ToyModelPath(), 3, 1, { 8, 8, 8 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false);
     cfg.SetOverlaps(overlaps);
     EXPECT_EQ(cfg.GetOverlaps().size(), 3u);
     auto interp = InterpolatorType::New();
@@ -1299,7 +1302,8 @@ TEST(ImpactBackend, AnisotropicPatchIsTiledInItkAxisOrder)
   auto                      img = MakeRampImage(size);
 
   auto run = [&](const std::vector<unsigned int> & patch) {
-    itk::ImpactModelConfiguration cfg(ToyModelPath(), 3, 1, patch, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+    itk::ImpactModelConfiguration cfg(
+      ToyModelPath(), 3, 1, patch, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false);
     auto                    interp = InterpolatorType::New();
     interp->SetSplineOrder(3);
     auto f = FeatMapType::New();
@@ -1361,7 +1365,7 @@ TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
                                        1,
                                        patch,
                                        std::vector<float>{ 1.f, 1.f, 1.f },
-                                       0,
+                                       std::vector<unsigned int>{ 0, 0, 0 },
                                        std::vector<bool>{ true, false }, // keep the conv: it is not symmetric
                                        false);
 
@@ -1440,7 +1444,7 @@ TEST(ImpactBackend, TwoDimensionalModelIsSweptOverAVolume)
   // The patch is 2D but the voxel size covers every image axis: the resampling grid is the
   // image's, and the swept axis needs a spacing to place its slices.
   itk::ImpactModelConfiguration cfg(
-    model2d, 2, 1, { 8, 8 }, { 1.f, 1.f, 2.5f }, 3, { true, true }, /*mixedPrecision*/ false);
+    model2d, 2, 1, { 8, 8 }, { 1.f, 1.f, 2.5f }, { 3, 3, 3 }, { true, true }, /*mixedPrecision*/ false);
   auto interp = InterpolatorType::New();
   interp->SetSplineOrder(3);
   auto f = FeatMapType::New();
@@ -1526,7 +1530,8 @@ TEST(ImpactBackend, DownsamplingEncoderFeatureMapOverlaysInput)
 
   auto interp = InterpolatorType::New();
   interp->SetSplineOrder(3);
-  itk::ImpactModelConfiguration cfg(downModel, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 2, { true, true }, false);
+  itk::ImpactModelConfiguration cfg(
+    downModel, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, false);
   auto f = FeatMapType::New();
   f->SetModelConfiguration(cfg);
   f->SetInterpolator(interp);
@@ -1805,7 +1810,8 @@ TEST(ImpactTorchAdam, TranslationRecoveryFeatures)
   auto filter = TorchAdamFilterType::New();
   filter->SetFixedImage(fixed);
   filter->SetMovingImage(moving);
-  itk::ImpactModelConfiguration config(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+  itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false);
   filter->AddModelConfiguration(config);
   filter->SetDistance({ "L2", "L2" });
   filter->SetLayersWeight({ 1.f, 1.f });
@@ -1841,7 +1847,8 @@ TEST(ImpactTorchAdam, FeaturePCA)
   auto filter = TorchAdamFilterType::New();
   filter->SetFixedImage(fixed);
   filter->SetMovingImage(moving);
-  itk::ImpactModelConfiguration config(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 0, { true, false }, false);
+  itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
   filter->AddModelConfiguration(config);
   filter->SetDistance({ "L2" });
   filter->SetLayersWeight({ 1.f });
@@ -1877,7 +1884,8 @@ TEST(ImpactTorchAdam, FeatureMapUpdateInterval)
   auto filter = TorchAdamFilterType::New();
   filter->SetFixedImage(fixed);
   filter->SetMovingImage(moving);
-  itk::ImpactModelConfiguration config(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 0, { true, false }, false);
+  itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
   filter->AddModelConfiguration(config);
   filter->SetDistance({ "L2" });
   filter->SetLayersWeight({ 1.f });
@@ -1914,7 +1922,8 @@ TEST(ImpactTorchAdam, DownsampledFeatureLayers)
   auto filter = TorchAdamFilterType::New();
   filter->SetFixedImage(fixed);
   filter->SetMovingImage(moving);
-  itk::ImpactModelConfiguration config(downModel, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 0, { true, true }, false);
+  itk::ImpactModelConfiguration config(
+    downModel, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false);
   filter->AddModelConfiguration(config);
   filter->SetDistance({ "L2", "L2" });
   filter->SetLayersWeight({ 1.f, 1.f });
@@ -2254,7 +2263,8 @@ TEST(ImpactConvexAdam, RealLungCTCoarseInitThenAdamRefines)
   fine->SetMovingImage(moving);
   fine->SetDevice(device);
   fine->SetInitialDisplacementField(coarse->GetDisplacementField());
-  itk::ImpactModelConfiguration cfg(modelPath, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 0, { true, false }, false);
+  itk::ImpactModelConfiguration cfg(
+    modelPath, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
   fine->AddModelConfiguration(cfg);
   fine->SetDistance({ "L2" });
   fine->SetLayersWeight({ 1.f });

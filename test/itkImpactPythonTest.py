@@ -50,7 +50,7 @@ def blob(n, cx):
 fixed, moving = blob(16, -2.0), blob(16, 2.0)
 
 # 1) The torch-free ImpactModelConfiguration loads a TorchScript model from a path string.
-cfg = itk.ImpactModelConfiguration(model_path, 3, 1, [0, 0, 0], [1.0, 1.0, 1.0], 2, [True, True], False)
+cfg = itk.ImpactModelConfiguration(model_path, 3, 1, [0, 0, 0], [1.0, 1.0, 1.0], [2, 2, 2], [True, True], False)
 assert cfg.GetModelPath() == model_path and cfg.GetDimension() == 3
 print("1) ImpactModelConfiguration:", cfg.GetModelPath(), "dim", cfg.GetDimension(),
       "channels", cfg.GetNumberOfChannels())

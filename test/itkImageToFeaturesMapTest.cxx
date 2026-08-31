@@ -62,7 +62,7 @@ itkImageToFeaturesMapTest(int argc, char * argv[])
 
   // Toy model: single-channel input, returns 2 layers (4-channel conv, 2-channel passthrough).
   itk::ImpactModelConfiguration modelConfiguration(
-    argv[1], 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, 2, { true, true }, false);
+    argv[1], 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, false);
 
   auto filter = ImageToFeaturesMapType::New();
   filter->SetModelConfiguration(modelConfiguration);

@@ -92,7 +92,7 @@ public:
                      unsigned int              numberOfChannels,
                      std::vector<unsigned int> patchSize,
                      std::vector<float>        voxelSize,
-                     unsigned int              overlap,
+                     std::vector<unsigned int> overlap,
                      std::vector<bool>         layersMask,
                      bool                      useMixedPrecision);
 
@@ -146,18 +146,12 @@ public:
   {
     return m_voxelSize;
   }
-  const unsigned int &
-  GetOverlap() const
-  {
-    return m_overlap;
-  }
-
   /** The patch overlap per axis, in voxels of the model's own grid, in ITK axis order (x, y, z)
    * like GetPatchSize() and GetVoxelSize().
    *
-   * Always Dimension entries long: the constructor broadcasts its scalar `overlap` across the
-   * axes, so this is the one the reassembly reads and the scalar above stays what it always
-   * was. A per-axis overlap is what an anisotropic patch needs -- a [96, 128, 160] network
+   * Always Dimension entries long: the constructor repeats the last entry it was given to fill
+   * the missing axes, so a single value still means "the same on every axis". A per-axis
+   * overlap is what an anisotropic patch needs -- a [96, 128, 160] network
    * asked for the same voxel overlap on all three axes blends its short axis over a much larger
    * fraction of the patch than its long one. */
   const std::vector<unsigned int> &
@@ -181,7 +175,6 @@ public:
     {
       m_overlaps[d] = overlaps[d];
     }
-    m_overlap = *std::max_element(m_overlaps.begin(), m_overlaps.end());
   }
 
   /** The window overlapping patches are blended with, by name: one of
@@ -237,7 +230,6 @@ private:
   unsigned int         m_numberOfChannels{ 0 };
   std::vector<int64_t> m_patchSize;
   std::vector<float>   m_voxelSize;
-  unsigned int         m_overlap{ 0 };
   // Per-axis overlap, and the window the overlapping patches are blended with. Both are
   // filled by the constructor from the scalar overlap, so a caller that knows nothing about
   // them (Elastix, which passes 0 and never blends) is unaffected.

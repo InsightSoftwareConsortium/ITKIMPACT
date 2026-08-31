@@ -102,7 +102,7 @@ moving = itk.imread(args.moving_image, itk.F)
 metric = itk.ImpactImageToImageMetricv4[ImageType, ImageType].New()
 for path in args.models:
     metric.AddModelConfiguration(
-        itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], [args.voxel] * Dimension, 0, [True], False)
+        itk.ImpactModelConfiguration(path, Dimension, 1, [0, 0, 0], [args.voxel] * Dimension, [0] * Dimension, [True], False)
     )
 metric.SetDistance(["L2"] * len(args.models))
 metric.SetLayersWeight([1.0] * len(args.models))

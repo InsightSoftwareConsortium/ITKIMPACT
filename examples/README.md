@@ -51,7 +51,7 @@ config = itk.ImpactModelConfiguration(
     1,                  # input channels
     [128, 128, 128],    # patch size
     [1.5, 1.5, 1.5],    # voxel size the model was trained at, per IMAGE axis
-    32,                 # overlap between patches, in voxels
+    [32, 32, 32],       # overlap between patches, in voxels, per axis
     mask,
     False,              # mixed precision
 )
@@ -88,8 +88,9 @@ whatever the overlap. Four windows are available through `SetPatchCombine`:
 
 A larger overlap costs patches and buys accuracy near the patch borders, where the model has
 least context. Against the official TotalSegmentator on an abdominal CT, macro Dice goes
-0.823 → 0.877 → 0.889 → 0.892 for overlaps 0 / 16 / 32 / 64. The overlap can also be set per
-axis, which is what an anisotropic patch needs:
+0.823 → 0.877 → 0.889 → 0.892 for overlaps 0 / 16 / 32 / 64. The overlap is per axis, which is
+what an anisotropic patch needs; a single value repeats across the axes, and `SetOverlaps`
+changes it after construction:
 
 ```python
 config.SetOverlaps([32, 32, 16])
@@ -140,7 +141,7 @@ Declare the patch size on the model's axes and the voxel size on the image's:
 
 ```python
 config = itk.ImpactModelConfiguration(
-    "SAM2.1/SAM2.1_Small.pt", 2, 3, [128, 128], [1.5, 1.5, 3.0], 32, [True], False
+    "SAM2.1/SAM2.1_Small.pt", 2, 3, [128, 128], [1.5, 1.5, 3.0], [32, 32], [True], False
 )
 ```
 

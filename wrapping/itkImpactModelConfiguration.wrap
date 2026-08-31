@@ -19,7 +19,8 @@
 # ImpactModelConfiguration is a plain (non-itk::Object) value type configuring a TorchScript
 # model. Its header is torch-free, so castxml can parse it; from Python a user builds
 # one with itk.ImpactModelConfiguration(path, dimension, channels, patchSize, voxelSize,
-# overlap, layersMask, mixedPrecision) and passes it to ImageToFeaturesMap / the metric.
+# overlaps, layersMask, mixedPrecision) and passes it to ImageToFeaturesMap / the metric.
+# patchSize, voxelSize and overlaps are per axis.
 itk_wrap_simple_class("itk::ImpactModelConfiguration")
 
 # The metric and registration filters take a std::vector<itk::ImpactModelConfiguration>
