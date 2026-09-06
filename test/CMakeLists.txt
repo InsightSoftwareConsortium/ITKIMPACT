@@ -84,10 +84,15 @@ itk_add_test(NAME itkInterpolateVectorImageFunctionTest
 # (pip) configures the tests too, so a missing target would fail the whole build over unit
 # tests nobody asked for. Skip this driver in that case; the CTest-driven tests above still
 # run, and CI builds against an ITK that provides it.
+# ITK 5 exports GTest::GTest, ITK 6 the upstream names GTest::gtest and GTest::gtest_main.
+if(NOT TARGET GTest::GTest AND TARGET GTest::gtest)
+  add_library(GTest::GTest INTERFACE IMPORTED)
+  target_link_libraries(GTest::GTest INTERFACE GTest::gtest)
+endif()
 if(NOT TARGET GTest::GTest)
   message(STATUS
-    "Impact: ITK provides no GTest::GTest target (built without Module_ITKGoogleTest); "
-    "skipping the GoogleTest driver.")
+    "Impact: ITK provides no GTest::GTest or GTest::gtest target (built without "
+    "Module_ITKGoogleTest); skipping the GoogleTest driver.")
   return()
 endif()
 
