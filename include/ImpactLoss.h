@@ -405,11 +405,15 @@ public:
     torch::Tensor cosine = dot_product / (v);
     torch::Tensor expL1 = torch::exp(-this->lambda * (fixedOutput - movingOutput).abs());
 
-    torch::Tensor dCossine = -(fixedOutput / v.unsqueeze(-1) -
-                               (dot_product.unsqueeze(-1) * movingOutput) / (v * norm_moving.pow(2)).unsqueeze(-1));
-    torch::Tensor dexpL1 = -torch::sign(diffOutput) * expL1 / fixedOutput.size(1);
+    // The value is -(1/N) sum_c cos * g_c with g = exp(-lambda |f - m|), so by the product rule
+    //   dV/dm_k = -(1/N) [ (dcos/dm_k) * sum_c g_c  +  cos * dg_k/dm_k ],   dg_k/dm_k = lambda * sign(f_k - m_k) * g_k.
+    // The cosine term is weighted by the SUM of g over channels, the exponential term by cos.
+    torch::Tensor minusDcos = -(fixedOutput / v.unsqueeze(-1) -
+                                (dot_product.unsqueeze(-1) * movingOutput) / (v * norm_moving.pow(2)).unsqueeze(-1));
+    torch::Tensor expSum = expL1.sum(1).unsqueeze(-1);
+    torch::Tensor dExpL1 = this->lambda * torch::sign(diffOutput) * expL1;
     this->m_value -= (cosine.unsqueeze(-1) * expL1).mean(1).sum().item<double>();
-    return dCossine * dexpL1 + cosine.unsqueeze(-1) * dexpL1;
+    return (minusDcos * expSum - cosine.unsqueeze(-1) * dExpL1) / fixedOutput.size(1);
   }
 
   torch::Tensor

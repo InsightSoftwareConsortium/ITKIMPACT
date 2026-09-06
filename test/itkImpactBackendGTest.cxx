@@ -450,6 +450,7 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
   auto moving = MakeRampImage(8, 1); // different => non-trivial gradient
 
   auto checkLoss = [&](const char * lossName) {
+    SCOPED_TRACE(std::string("loss ") + lossName);
     SCOPED_TRACE(lossName);
     auto                                 metric = MetricType::New();
     std::vector<itk::ImpactModelConfiguration> configs;
@@ -520,6 +521,10 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
   checkLoss("DotProduct"); // simple gradient: -f
   checkLoss("Cosine");     // d(-cosine)/dm with the full dot-product cross term
   checkLoss("NCC");        // cross-point statistics path (closed-form derivative)
+  checkLoss("L1");
+  checkLoss("L2");
+  checkLoss("L1Cosine");
+  checkLoss("Dice");
 }
 
 // --- C2: the derivative is correct for a local-support displacement field -----
@@ -629,6 +634,7 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
   auto moving = MakeRampImage(8, 1); // different => non-trivial gradient
 
   auto checkLoss = [&](const char * lossName) {
+    SCOPED_TRACE(std::string("loss ") + lossName);
     SCOPED_TRACE(lossName);
     auto                                 metric = MetricType::New();
     std::vector<itk::ImpactModelConfiguration> configs;
@@ -705,6 +711,10 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
   checkLoss("DotProduct"); // simplest: linear feature, modulator = -fixed
   checkLoss("Cosine");     // normalized cross term
   checkLoss("NCC");        // cross-point statistics path
+  checkLoss("L1");
+  checkLoss("L2");
+  checkLoss("L1Cosine");
+  checkLoss("Dice");
 }
 
 // Online mode runs the model on a batch of points at a time, so what a point contributes must not
