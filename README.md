@@ -188,7 +188,7 @@ coarse.Update()
 
 # Stage 2 — fast Adam refinement on IMPACT features
 cfg = itk.ImpactModelConfiguration("features_model.pt", 3, 1,
-                             [0, 0, 0], [1.0, 1.0, 1.0], 0, [True, False], False)
+                             [0, 0, 0], [1.0, 1.0, 1.0], [0, 0, 0], [True, False], False)
 fine = itk.ImpactFineRegistration[ImageType, ImageType].New()
 fine.SetFixedImage(fixed)
 fine.SetMovingImage(moving)
@@ -269,7 +269,7 @@ fine->SetFixedImage(fixed);
 fine->SetMovingImage(moving);
 fine->SetDevice("cuda:0");
 fine->SetInitialDisplacementField(coarse->GetDisplacementField());
-itk::ImpactModelConfiguration cfg("features_model.pt", 3, 1, {0,0,0}, {1,1,1}, 0, {true,false}, false);
+itk::ImpactModelConfiguration cfg("features_model.pt", 3, 1, {0,0,0}, {1,1,1}, {0,0,0}, {true,false}, false);
 fine->AddModelConfiguration(cfg);
 fine->SetDistance({"L2"});
 fine->SetNumberOfIterations(100);

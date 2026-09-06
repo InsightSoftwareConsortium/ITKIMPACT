@@ -153,7 +153,8 @@ public:
   itkSetMacro(LayersWeight, std::vector<float>);
   itkGetConstMacro(LayersWeight, std::vector<float>);
 
-  /** Set/Get the loss function per layer (e.g. "l1", "cosine", "ncc"); heterogeneous
+  /** Set/Get the loss function per layer, by registered name: "L1", "L2", "Cosine", "L1Cosine",
+   * "Dice", "DotProduct", "NCC" (the lookup is case sensitive); heterogeneous
    * losses adapt to the nature of each feature representation.
    */
   itkSetMacro(Distance, std::vector<std::string>);
