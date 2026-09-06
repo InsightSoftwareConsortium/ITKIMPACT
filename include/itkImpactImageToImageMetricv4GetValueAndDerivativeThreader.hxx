@@ -77,9 +77,13 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
 
   for (ThreadIdType i = 0; i < numWorkUnitsUsed; ++i)
   {
+    // The feature subset follows the same seed as the planes above: with Seed set it is that
+    // seed, with Seed zero it is the clock drawn once. Reseeding from the clock here on every
+    // evaluation made the subset change across a second boundary, so two evaluations of the
+    // same parameters did not return the same value.
     this->m_LossThreadStruct[i].init(this->m_ImpactAssociate->GetDistance(),
                                      this->m_ImpactAssociate->GetLayersWeight(),
-                                     this->m_ImpactAssociate->GetSeed(),
+                                     this->m_PlaneSeed,
                                      globalDerivativeSize);
   }
 }

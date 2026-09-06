@@ -18,6 +18,9 @@
 
 #include "gtest/gtest.h"
 
+#include <chrono>
+#include <thread>
+
 #include "itkImage.h"
 #include "itkImageRegionIteratorWithIndex.h"
 #include "itkBSplineInterpolateImageFunction.h"
@@ -525,6 +528,54 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
   checkLoss("L2");
   checkLoss("L1Cosine");
   checkLoss("Dice");
+}
+
+// With Seed left at zero the metric asks for run-to-run variation, not for variation between
+// two evaluations of the same parameters. The feature subset used to be drawn from a generator
+// reseeded with the clock on every evaluation, so crossing a second boundary between two calls
+// changed which channels were compared and moved the value; an optimizer's line search then
+// compared numbers that did not come from the same function. The subset follows the plane seed,
+// drawn once, so the value is a function of the parameters for the life of the metric.
+TEST(ImpactMetric, FeatureSubsetDoesNotFollowTheClock)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeBlobImage(12, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(12, 1.2, -0.8, 0.5, 2.0);
+
+  auto                                       metric = MetricType::New();
+  std::vector<itk::ImpactModelConfiguration> configs;
+  configs.emplace_back(ToyModelPath(),
+                       3,
+                       1,
+                       std::vector<unsigned int>{ 0, 0, 0 },
+                       std::vector<float>{ 1.f, 1.f, 1.f },
+                       std::vector<unsigned int>{ 2, 2, 2 },
+                       std::vector<bool>{ true, false }, // the 4-channel conv layer
+                       false);
+  metric->SetModelsConfiguration(configs);
+  metric->SetDistance({ "L2" });
+  metric->SetLayersWeight({ 1.f });
+  metric->SetSubsetFeatures({ 2 }); // a strict subset: the random draw actually happens
+  metric->SetPCA({ 0 });
+  metric->SetMode("Static");
+  metric->SetSeed(0); // the clock policy is what is under test
+  metric->SetDevice("cpu");
+  metric->SetFeaturesMapUpdateInterval(-1);
+  metric->SetFixedImage(fixed);
+  metric->SetMovingImage(moving);
+  metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+  metric->SetMovingTransform(itk::IdentityTransform<double, 3>::New());
+  metric->SetMaximumNumberOfWorkUnits(1);
+  metric->Initialize();
+
+  const double first = static_cast<double>(metric->GetValue());
+  // time(nullptr) has one-second resolution: make sure the second call sits in a later second.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  const double second = static_cast<double>(metric->GetValue());
+
+  EXPECT_DOUBLE_EQ(first, second) << "the feature subset must not change between two evaluations";
 }
 
 // --- C2: the derivative is correct for a local-support displacement field -----
