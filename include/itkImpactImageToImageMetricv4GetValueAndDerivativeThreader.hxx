@@ -506,6 +506,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
   const auto & fixedConfigs = this->m_ImpactAssociate->GetFixedModelsConfiguration();
   const auto & movingConfigs = this->m_ImpactAssociate->GetMovingModelsConfiguration();
+  // One configuration serves both images, so each image's metadata travels with its patches.
+  const ImpactImageMetadata & fixedMetadata = this->m_ImpactAssociate->m_Internals->m_FixedImageMetadata;
+  const ImpactImageMetadata & movingMetadata = this->m_ImpactAssociate->m_Internals->m_MovingImageMetadata;
 
   size_t comparison = 0; // flat index over (model, kept layer), the one the losses are read at
   for (size_t i = 0; i < fixedConfigs.size(); ++i)
@@ -559,7 +562,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     std::vector<torch::Tensor> fixedLayers;
     {
       torch::NoGradGuard noGrad;
-      auto outputs = Forward(fixedConfig, toModelPatch(fixedPatches, fixedConfig));
+      auto               outputs = Forward(fixedConfig, toModelPatch(fixedPatches, fixedConfig), fixedMetadata);
       fixedLayers = keptLayers(outputs, fixedConfig);
     }
     const auto layerCount = static_cast<size_t>(fixedLayers.size());
@@ -567,7 +570,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     if (!computeDerivative)
     {
       torch::NoGradGuard noGrad;
-      auto                             outputs = Forward(movingConfig, toModelPatch(movingPatches, movingConfig));
+      auto               outputs = Forward(movingConfig, toModelPatch(movingPatches, movingConfig), movingMetadata);
       const std::vector<torch::Tensor> movingLayers = keptLayers(outputs, movingConfig);
       for (size_t layer = 0; layer < layerCount; ++layer, ++comparison)
       {
@@ -584,7 +587,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     // gradients gives d(feature)/d(moving coordinate) for the whole batch at once. One forward
     // pass serves every kept layer, so the graph has to survive until the last of them is done.
     torch::Tensor movingPatch = toModelPatch(movingPatches, movingConfig).detach().set_requires_grad(true);
-    auto                             movingOutputs = Forward(movingConfig, movingPatch);
+    auto          movingOutputs = Forward(movingConfig, movingPatch, movingMetadata);
     const std::vector<torch::Tensor> movingLayers = keptLayers(movingOutputs, movingConfig);
     // d(patch value)/d(moving coordinate), tiled once per repeated channel so that it lines up
     // with the flattened gradient below: summing over the copies sums over the channel axis,

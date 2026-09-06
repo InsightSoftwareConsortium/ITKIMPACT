@@ -24,6 +24,7 @@
 #include "itkImageToFeaturesMap.h"
 #include "itkImageToFeaturesMapInternals.h"
 #include "itkImpactTorchRegistrationHelpers.h" // Impact::PythonGilReleaseGuard
+#include "itkImpactModelConfigurationDetail.h" // ComputeImageMetadata
 #include <itkImageFileWriter.h>
 
 namespace itk
@@ -67,6 +68,10 @@ struct ImpactImageToImageMetricv4<TFixedImage,
   // The transform the moving map was last rebuilt through, null while the map is the one built
   // at Initialize(). The threader reads a rebuilt map at x + (T(x) - T_k(x)) rather than at T(x).
   typename MovingTransformType::ConstPointer m_RefreshTransform;
+  // What a metadata-aware model takes for each image in the online mode, kept per side because
+  // one configuration serves both.
+  ImpactImageMetadata m_FixedImageMetadata;
+  ImpactImageMetadata m_MovingImageMetadata;
 };
 
 template <typename TFixedImage,
@@ -410,11 +415,19 @@ ImpactImageToImageMetricv4<TFixedImage,
     }
 
     const torch::Device device(this->m_Device);
+    // A metadata-aware model (Forward with four arguments) takes the image's intensity range,
+    // mean and sigma and its direction, and normalises with them; without them it falls back to
+    // each patch's own range. The feature map and the two registration filters store them in the
+    // configuration, one image at a time. Here the same configuration serves both images in
+    // every batch, so each image's tensors are kept apart and handed to Forward by the threader.
+    this->m_Internals->m_FixedImageMetadata = ComputeImageMetadata<TFixedImage>(this->m_FixedImage);
+    this->m_Internals->m_MovingImageMetadata = ComputeImageMetadata<TMovingImage>(this->m_MovingImage);
     // Channel count of every KEPT layer, in mask order, from one dummy forward -- the online
     // counterpart of Static reading GetNumberOfComponentsPerPixel() off each feature map.
     // Empty if the patch size is not strictly positive (required online), if no layer is kept,
     // or if the model returns fewer outputs than the mask claims.
-    auto featureChannels = [&device](const ImpactModelConfiguration & config) -> std::vector<int64_t> {
+    auto featureChannels = [&device](const ImpactModelConfiguration & config,
+                                     const ImpactImageMetadata &      metadata) -> std::vector<int64_t> {
       ModelTo(config, device);
       const std::vector<int64_t> & patchSize = config.GetPatchSize();
       std::vector<int64_t>         shape = { 1, static_cast<int64_t>(config.GetNumberOfChannels()) };
@@ -430,7 +443,9 @@ ImpactImageToImageMetricv4<TFixedImage,
       torch::NoGradGuard ng;
       torch::Tensor      dummy =
         torch::zeros(shape, torch::TensorOptions().dtype(GetModelDtype(config)).device(device));
-      auto         outputs = GetModel(config).forward({ dummy }).toList().vec();
+      // The call the inference makes, metadata included, so a metadata-aware model is probed
+      // with the arguments it will actually receive.
+      auto         outputs = Forward(config, dummy, metadata);
       const auto & mask = config.GetLayersMask();
       if (outputs.size() < mask.size())
       {
@@ -449,8 +464,10 @@ ImpactImageToImageMetricv4<TFixedImage,
 
     for (unsigned int i = 0; i < m_FixedModelsConfiguration.size(); ++i)
     {
-      const std::vector<int64_t> fixedChannels = featureChannels(m_FixedModelsConfiguration[i]);
-      const std::vector<int64_t> movingChannels = featureChannels(m_MovingModelsConfiguration[i]);
+      const std::vector<int64_t> fixedChannels =
+        featureChannels(m_FixedModelsConfiguration[i], this->m_Internals->m_FixedImageMetadata);
+      const std::vector<int64_t> movingChannels =
+        featureChannels(m_MovingModelsConfiguration[i], this->m_Internals->m_MovingImageMetadata);
       if (fixedChannels.empty())
       {
         itkExceptionMacro("Jacobian mode requires a strictly positive patch size in every dimension, at least one "

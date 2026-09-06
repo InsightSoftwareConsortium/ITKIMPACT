@@ -70,6 +70,30 @@ class ImpactToyModel2D(torch.nn.Module):
         return [features, passthrough]
 
 
+class ImpactToyModelMetadata(torch.nn.Module):
+    """A metadata-aware model, in the shape ImpactLoss builds them (forward with four arguments).
+
+    Layer 0 is the intensity passthrough, normalized by the image range when the caller hands
+    over stats and by its input's own range otherwise, as the real models do. Layer 1 carries
+    the image sigma from stats, or zero when none were given, so a metric comparing two images
+    through it reads (sigma_fixed - sigma_moving)^2 exactly when both sides received their own
+    stats. Written as sigma + 0 * x, the layer stays on the autograd graph the online mode
+    differentiates through; its derivative is zero.
+    """
+
+    def forward(self,
+                x: torch.Tensor,
+                nb_layers: torch.Tensor = torch.tensor([2]),
+                stats: torch.Tensor = torch.tensor([]),
+                direction: torch.Tensor = torch.tensor([])) -> List[torch.Tensor]:
+        if stats.numel() == 4:
+            lo, hi, sigma = stats[0], stats[1], stats[3]
+        else:
+            lo, hi, sigma = x.min(), x.max(), torch.zeros((), dtype=x.dtype, device=x.device)
+        normalized = (x - lo) / (hi - lo + 1e-6)
+        return [normalized, sigma + 0 * x]
+
+
 def main() -> None:
     torch.manual_seed(20240601)
     model = ImpactToyModel().eval()
@@ -85,6 +109,11 @@ def main() -> None:
     down = ImpactToyModelDown().eval()
     torch.jit.script(down).save("ImpactToyModelDown.pt")
     print("wrote ImpactToyModelDown.pt")
+
+    metadata = ImpactToyModelMetadata().eval()
+    torch.jit.script(metadata).save("ImpactToyModelMetadata.pt")
+    print("wrote ImpactToyModelMetadata.pt")
+
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@
 #include "itkMetaImageIO.h"
 #include "itkShrinkImageFilter.h"
 #include "itkResampleImageFilter.h"
+#include "itkStatisticsImageFilter.h"
 #include <torch/torch.h>
 #include "itkAffineTransform.h"
 #include "itkIdentityTransform.h"
@@ -1198,6 +1199,74 @@ TEST(ImpactMetric, TwoDimensionalModelJacobianDerivativeMatchesFiniteDifferences
   EXPECT_NE(otherSeed, static_cast<double>(value)) << "a different seed must draw different planes";
   EXPECT_NEAR(otherSeed, static_cast<double>(value), 0.05 * std::abs(static_cast<double>(value)))
     << "different planes over the same images must still agree on roughly the same value";
+}
+
+// A metadata-aware model (Forward with four arguments) takes the image's intensity range, mean
+// and sigma from the caller and normalizes with them; without them it falls back to its input's
+// own range, as ImpactLoss builds its models. The toy below puts the sigma it received into its
+// second layer, and zero when it received none, so an L2 distance between two images read through
+// that layer is (sigmaF - sigmaM)^2 exactly when each side was handed its own stats: 0 when
+// neither was, and one image's sigma^2 when only one was. The Static path stores the stats in
+// the configuration through ImageToFeaturesMap; the online path did not hand any over, and a
+// model that normalizes by its stats then saw every patch scaled by its own range.
+TEST(ImpactMetric, OnlineModeHandsTheModelEachImagesMetadata)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeBlobImage(12, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(12, 1.2, -0.8, 0.5, 3.0); // a wider blob, so the two sigmas differ
+
+  // The sigma each side's stats carry, from the filter ComputeImageMetadata runs, as float32.
+  auto sigmaOf = [](const ImageType::Pointer & image) {
+    auto statistics = itk::StatisticsImageFilter<ImageType>::New();
+    statistics->SetInput(image);
+    statistics->Update();
+    return static_cast<double>(static_cast<float>(statistics->GetSigma()));
+  };
+  const double sigmaFixed = sigmaOf(fixed);
+  const double sigmaMoving = sigmaOf(moving);
+  const double expected = (sigmaFixed - sigmaMoving) * (sigmaFixed - sigmaMoving);
+  // Each wrong wiring reads a value of its own, so the assertion below tells them apart.
+  ASSERT_GT(expected, 1e-6);
+  ASSERT_GT(std::abs(expected - sigmaFixed * sigmaFixed), 1e-6);
+  ASSERT_GT(std::abs(expected - sigmaMoving * sigmaMoving), 1e-6);
+
+  auto                                       metric = MetricType::New();
+  std::vector<itk::ImpactModelConfiguration> configs;
+  configs.emplace_back(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModelMetadata.pt",
+                       3,
+                       1,
+                       std::vector<unsigned int>{ 3, 3, 3 },
+                       std::vector<float>{ 1.f, 1.f, 1.f },
+                       std::vector<unsigned int>{ 0, 0, 0 },
+                       std::vector<bool>{ false, true }, // the sigma layer only
+                       false);
+  metric->SetModelsConfiguration(configs);
+  metric->SetDistance({ "L2" });
+  metric->SetLayersWeight({ 1.f });
+  metric->SetSubsetFeatures({ 1 });
+  metric->SetPCA({ 0 });
+  metric->SetMode("Jacobian");
+  metric->SetSeed(1);
+  metric->SetDevice("cpu");
+  metric->SetFixedImage(fixed);
+  metric->SetMovingImage(moving);
+  metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+  metric->SetMovingTransform(itk::TranslationTransform<double, 3>::New());
+  metric->SetMaximumNumberOfWorkUnits(1);
+  metric->Initialize();
+
+  const double tolerance = 1e-4 * expected;
+  EXPECT_NEAR(static_cast<double>(metric->GetValue()), expected, tolerance)
+    << "sigma " << sigmaFixed << " on the fixed side and " << sigmaMoving << " on the moving side";
+
+  // The derivative runs the moving model through autograd, a call of its own.
+  MetricType::MeasureType    value;
+  MetricType::DerivativeType derivative;
+  metric->GetValueAndDerivative(value, derivative);
+  EXPECT_NEAR(static_cast<double>(value), expected, tolerance);
+  EXPECT_EQ(derivative.two_norm(), 0.0) << "a layer read off the stats does not move with the patch";
 }
 
 // --- End-to-end: a real ITK optimizer reduces the metric and recovers a shift -
