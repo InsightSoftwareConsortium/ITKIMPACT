@@ -316,8 +316,10 @@ TEST(ImpactMetric, StaticFeaturesMapRefreshFollowsTheTransform)
   using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
   using TransformType = itk::TranslationTransform<double, 3>;
 
-  auto fixed = MakeBlobImage(12, 0.0, 0.0, 0.0, 2.0);
-  auto moving = MakeBlobImage(12, 1.2, -0.8, 0.5, 2.0);
+  // 24 voxels: the 3-voxel shift below keeps the blob and its tails inside the rebuilt map,
+  // so what the round trip reads back is the blob and not the map's edge.
+  auto fixed = MakeBlobImage(24, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(24, 1.2, -0.8, 0.5, 2.0);
 
   // The passthrough layer is the one to watch: its "features" ARE the intensities, so a map
   // that followed the transform is directly readable as the resampled image.
@@ -368,8 +370,10 @@ TEST(ImpactMetric, StaticFeaturesMapRefreshFollowsTheTransform)
   EXPECT_DOUBLE_EQ(static_cast<double>(off->GetValue()), offBefore)
     << "with the refresh disabled the moving map must be exactly the one built at Initialize()";
 
-  // Refresh every evaluation: the same round trip must NOT come back to the same value, because
-  // the map was rebuilt while the transform was displaced.
+  // Refresh every evaluation: the map is rebuilt while the transform is displaced, and read at
+  // the residual point afterwards. For a translation the model is equivariant, so the round trip
+  // comes back to the same value up to one extra resampling; only the refresh test below can
+  // tell a rebuilt map from a stale one, at the moment of the refresh.
   auto transformOn = TransformType::New();
   transformOn->SetIdentity();
   auto on = build(1, transformOn);
@@ -380,8 +384,8 @@ TEST(ImpactMetric, StaticFeaturesMapRefreshFollowsTheTransform)
   transformOn->SetParameters(shiftedOn);
   on->GetValueAndDerivative(value, derivative); // rebuilds the map at the displaced transform
   transformOn->SetParameters(MetricType::ParametersType(shiftedOn.GetSize(), 0.0));
-  EXPECT_NE(static_cast<double>(on->GetValue()), onBefore)
-    << "the refresh must have rebuilt the moving map from the displaced transform";
+  EXPECT_NEAR(static_cast<double>(on->GetValue()), onBefore, 0.02 * onBefore)
+    << "a translation round trip through a refresh must come back to the same value";
 
   // And the refresh must not cost the derivative: the moving features are still read at the
   // transformed point, which is the only parameter-dependent point there is.
@@ -389,6 +393,80 @@ TEST(ImpactMetric, StaticFeaturesMapRefreshFollowsTheTransform)
   for (unsigned int j = 0; j < derivative.GetSize(); ++j)
     norm += derivative[j] * derivative[j];
   EXPECT_GT(norm, 1e-12) << "a refreshed map must still produce a gradient";
+}
+
+// A refreshed map is built by resampling the moving image through the transform of the moment,
+// so its value at p is M(T_k(p)). The header promises the approximation is exact at the moment
+// of the refresh. Reading that map at the transformed point T(x) gives M(T_k(T(x))): with T == T_k
+// the transform is applied twice, and the value at the aligning parameters is the value of the
+// unrefreshed metric at twice the shift. Blob images and the passthrough layer make the metric
+// steep enough in the translation for the two readings to be an order of magnitude apart.
+TEST(ImpactMetric, StaticRefreshIsExactAtTheMomentOfTheRefresh)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeBlobImage(12, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(12, 3.0, 0.0, 0.0, 2.0); // the same blob, 3 voxels further along x
+
+  auto build = [&](int interval, TransformType * transform) {
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 2, 2, 2 },
+                         std::vector<bool>{ false, true }, // passthrough: the features ARE the intensities
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ "L2" });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Static");
+    metric->SetSeed(1);
+    metric->SetDevice("cpu");
+    metric->SetFeaturesMapUpdateInterval(interval);
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+    return metric;
+  };
+  auto shift = [](double x) {
+    MetricType::ParametersType p(3);
+    p.Fill(0.0);
+    p[0] = x;
+    return p;
+  };
+
+  // The unrefreshed metric, at the aligning shift and at twice that shift.
+  auto reference = TransformType::New();
+  auto plain = build(-1, reference);
+  reference->SetParameters(shift(3.0));
+  const double atAligned = static_cast<double>(plain->GetValue());
+  reference->SetParameters(shift(6.0));
+  const double atTwice = static_cast<double>(plain->GetValue());
+  ASSERT_GT(atTwice, 3.0 * atAligned) << "the fixture must make the two readings distinguishable";
+
+  // Refresh every evaluation: one GetValueAndDerivative at the aligning shift rebuilds the map
+  // there, and the value read right after must still be the aligned one.
+  auto candidate = TransformType::New();
+  auto refreshing = build(1, candidate);
+  candidate->SetParameters(shift(3.0));
+  MetricType::MeasureType    value;
+  MetricType::DerivativeType derivative;
+  refreshing->GetValueAndDerivative(value, derivative);
+  const double afterRefresh = static_cast<double>(refreshing->GetValue());
+
+  EXPECT_NEAR(afterRefresh, atAligned, 0.05 * (atTwice - atAligned))
+    << "after a refresh at the aligning shift the metric reads " << afterRefresh << ", the unrefreshed metric reads "
+    << atAligned << " there and " << atTwice << " at twice the shift";
 }
 
 // --- B: the Static-mode metric value is ~0 for identical images, > 0 otherwise

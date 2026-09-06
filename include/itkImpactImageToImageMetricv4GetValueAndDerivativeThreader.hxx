@@ -719,6 +719,19 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
       (torch::arange(static_cast<int64_t>(numberOfLocalParameters), torch::kInt64) + parameterOffset).unsqueeze(0);
   }
 
+  // A map rebuilt through T_k holds the features of M(T_k(p)): read it at x + (T(x) - T_k(x)),
+  // which is x at the moment of the refresh and moves with the parameters exactly as T(x) does.
+  // The map built at Initialize() holds the features of M itself and is read at T(x).
+  MovingImagePointType movingReadPoint = mappedMovingPoint;
+  if (const auto & refresh = this->m_ImpactAssociate->m_Internals->m_RefreshTransform; refresh.IsNotNull())
+  {
+    const auto anchored = refresh->TransformPoint(virtualPoint);
+    for (unsigned int d = 0; d < MovingImagePointType::PointDimension; ++d)
+    {
+      movingReadPoint[d] = virtualPoint[d] + (mappedMovingPoint[d] - anchored[d]);
+    }
+  }
+
   for (size_t i = 0; i < this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps.size(); ++i)
   {
     const std::vector<unsigned int> subsetOfFeatures =
@@ -730,7 +743,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
       this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps[i].m_FeaturesMapInterpolator->Evaluate(mappedFixedPoint, subsetOfFeatures)
         .unsqueeze(0);
     torch::Tensor movingFeatures =
-      this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i].m_FeaturesMapInterpolator->Evaluate(mappedMovingPoint, subsetOfFeatures)
+      this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i].m_FeaturesMapInterpolator->Evaluate(movingReadPoint, subsetOfFeatures)
         .unsqueeze(0);
 
     if (computeDerivative)
@@ -738,7 +751,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
       // d(feature)/d(moving coordinate) : [1, C, MovingDim]
       torch::Tensor movingFeatureDerivative =
         this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i].m_FeaturesMapInterpolator
-          ->EvaluateDerivative(mappedMovingPoint, subsetOfFeatures)
+          ->EvaluateDerivative(movingReadPoint, subsetOfFeatures)
           .unsqueeze(0);
       // chain with d(moving coordinate)/d(parameter) : [1, C, P]
       torch::Tensor featureParameterJacobian = torch::bmm(movingFeatureDerivative, transformJacobian);

@@ -63,6 +63,9 @@ struct ImpactImageToImageMetricv4<TFixedImage,
   std::vector<FeaturesMap>                m_FixedFeaturesMaps;
   std::vector<FeaturesMap>                m_MovingFeaturesMaps;
   std::vector<std::vector<torch::Tensor>> m_Principal_components;
+  // The transform the moving map was last rebuilt through, null while the map is the one built
+  // at Initialize(). The threader reads a rebuilt map at x + (T(x) - T_k(x)) rather than at T(x).
+  typename MovingTransformType::ConstPointer m_RefreshTransform;
 };
 
 template <typename TFixedImage,
@@ -268,6 +271,13 @@ ImpactImageToImageMetricv4<TFixedImage,
         [this](const typename TMovingImage::PointType & point) {
           return this->GetTransform()->TransformPoint(point);
         }));
+  // Keep the transform this map was built through. The map holds the features of M(T_k(p)), so
+  // the threader reads it at the residual point x + (T(x) - T_k(x)): x itself at the moment of
+  // the refresh, which makes that moment exact, and a point that moves with the parameters
+  // exactly as T(x) does, which keeps the derivative. Clone() copies the parameters, so the
+  // snapshot does not follow the optimizer afterwards.
+  this->m_Internals->m_RefreshTransform =
+    dynamic_cast<const MovingTransformType *>(this->GetMovingTransform()->Clone().GetPointer());
 }
 
 template <typename TFixedImage,
@@ -307,6 +317,7 @@ ImpactImageToImageMetricv4<TFixedImage,
                                 TMetricTraits>::Initialize(){
   Superclass::Initialize();
   this->m_features_indexes.clear();
+  this->m_Internals->m_RefreshTransform = nullptr; // the maps built below are read at T(x)
 
   // Every per-layer vector is indexed by the loop over compared layers, with no bound check in
   // the hot path: too short and it reads past the end, too long and the value sums losses that

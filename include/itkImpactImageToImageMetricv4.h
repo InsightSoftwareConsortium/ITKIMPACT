@@ -219,14 +219,14 @@ public:
    * gradient optimizer -- the metric has no other notion of an iteration. A value-only
    * GetValue(), as a line search issues, does not count.
    *
-   * The refreshed map keeps the moving image's grid and is still sampled at the transformed
-   * point, matching the elastix component. That is what preserves the derivative: the moving
-   * features have to be read at a parameter-dependent point for a gradient to exist at all,
-   * and the only such point is the transformed one. It also means the transform is applied
-   * once when building the map and once when reading it, so the refreshed features answer for
-   * a point further along than the one being scored. The approximation is exact at the moment
-   * of the refresh, when the map is fresh, and degrades as the transform moves away from it --
-   * shorter intervals keep it closer.
+   * The refreshed map keeps the moving image's grid and holds the features of the moving image
+   * resampled through the transform of the moment, T_k. It is read at the residual point
+   * x + (T(x) - T_k(x)), which is x itself at the moment of the refresh, so that moment is exact,
+   * and which moves with the parameters exactly as T(x) does, so the derivative is preserved.
+   * Between refreshes the read is a first-order account of the change in T since T_k; shorter
+   * intervals keep it closer. For a transform the model is equivariant to, a translation, a
+   * refresh changes nothing but the frame; it earns its cost where the model is not, a
+   * deformation, since the network then sees the anatomy as it currently aligns.
    */
   itkSetMacro(FeaturesMapUpdateInterval, int);
   itkGetConstMacro(FeaturesMapUpdateInterval, int);
