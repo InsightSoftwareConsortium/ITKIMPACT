@@ -23,6 +23,7 @@
 #include "itkInterpolateVectorImageFunction.h"
 #include "itkImageToFeaturesMap.h"
 #include "itkImageToFeaturesMapInternals.h"
+#include "itkImpactTorchRegistrationHelpers.h" // Impact::PythonGilReleaseGuard
 #include <itkImageFileWriter.h>
 
 namespace itk
@@ -293,6 +294,11 @@ ImpactImageToImageMetricv4<TFixedImage,
                                 TMetricTraits>::GetValueAndDerivative(typename Superclass::MeasureType &    value,
                                                                       typename Superclass::DerivativeType & derivative) const
 {
+  // Under a Python interpreter libtorch's autograd engine refuses to run on a thread holding the
+  // GIL, and the SWIG-wrapped optimizer holds it across this call; the Jacobian mode backpropagates
+  // through the model from the work units. Release it here, as ImpactFineRegistration does around
+  // its Adam loop. A no-op outside Python.
+  const Impact::PythonGilReleaseGuard gilRelease;
   Superclass::GetValueAndDerivative(value, derivative);
   // After the evaluation, so the refresh lands between two iterations rather than in the middle
   // of one -- the value and the derivative just returned belong to the same feature map.
