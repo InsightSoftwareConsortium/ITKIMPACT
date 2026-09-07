@@ -21,6 +21,7 @@
 
 #include <itkImageToImageMetricv4GetValueAndDerivativeThreader.h>
 #include "ImpactLoss.h"
+#include <algorithm>
 #include <random>
 
 namespace itk
@@ -167,11 +168,20 @@ protected:
       derivative.Fill(DerivativeValueType{});
       for (int l = 0; l < this->m_layersWeight.size(); ++l)
       {
-        torch::Tensor d = this->m_layersWeight[l] *
-                          this->m_losses[l]->GetDerivative(static_cast<double>(this->m_numberOfPixelsCounted));
-        for (int i = 0; i < d.size(0); ++i)
+        // Read the whole layer through one contiguous float buffer. Element by element,
+        // d[i].item<float>() builds a view and synchronises for every one of the transform's
+        // parameters, which a B-spline counts in the tens of thousands. The cast to float is
+        // the one item<float>() applied anyway, so the values are unchanged (the loss allocates
+        // its derivative in the model's dtype, half included).
+        const torch::Tensor d = (this->m_layersWeight[l] *
+                                 this->m_losses[l]->GetDerivative(static_cast<double>(this->m_numberOfPixelsCounted)))
+                                  .to(torch::kFloat32)
+                                  .contiguous();
+        const float * layerDerivative = d.data_ptr<float>();
+        const int64_t layerSize = std::min<int64_t>(d.size(0), static_cast<int64_t>(derivative.Size()));
+        for (int64_t i = 0; i < layerSize; ++i)
         {
-          derivative[i] += d[i].item<float>();
+          derivative[i] += layerDerivative[i];
         }
       }
       return derivative;
