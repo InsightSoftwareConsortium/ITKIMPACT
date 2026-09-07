@@ -1269,6 +1269,59 @@ TEST(ImpactMetric, OnlineModeHandsTheModelEachImagesMetadata)
   EXPECT_EQ(derivative.two_norm(), 0.0) << "a layer read off the stats does not move with the patch";
 }
 
+// Only one voxel of a patch ever reaches the loss: centerFeatures() reads index size/2 of the
+// model output. The patch must therefore be spanned around that same voxel, so a passthrough
+// layer returns the intensity AT the sample point whatever the patch extent. Centring on the
+// geometric middle, (n - 1) / 2, agrees for an odd extent and lands half a voxel away for an
+// even one, which handed the loss a feature taken beside its own point.
+TEST(ImpactMetric, AnEvenPatchIsCentredOnTheVoxelThatIsReadBack)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeBlobImage(16, 0.0, 0.0, 0.0, 2.0);
+  auto moving = MakeBlobImage(16, 1.3, -0.7, 0.4, 2.0);
+
+  // The toy's second layer is the intensity passthrough, so the compared feature is the image
+  // value at whatever point the patch centre resolves to.
+  auto valueForPatchExtent = [&](unsigned int extent) {
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ extent, extent, extent },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<bool>{ false, true }, // the passthrough layer only
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ "L2" });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(1);
+    metric->SetDevice("cpu");
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    auto transform = itk::TranslationTransform<double, 3>::New();
+    transform->SetIdentity();
+    metric->SetMovingTransform(transform);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+    return static_cast<double>(metric->GetValue());
+  };
+
+  // A single-voxel patch IS the sample point, so it pins what every other extent must return.
+  const double atOneVoxel = valueForPatchExtent(1);
+  ASSERT_GT(atOneVoxel, 1e-6) << "the two blobs must differ for this to test anything";
+  EXPECT_NEAR(valueForPatchExtent(3), atOneVoxel, 1e-9 * atOneVoxel) << "odd extent";
+  EXPECT_NEAR(valueForPatchExtent(4), atOneVoxel, 1e-9 * atOneVoxel) << "even extent";
+  EXPECT_NEAR(valueForPatchExtent(5), atOneVoxel, 1e-9 * atOneVoxel) << "odd extent";
+}
+
 // --- End-to-end: a real ITK optimizer reduces the metric and recovers a shift -
 // Every distance must drive the optimizer downhill, not just the one the test happened to pick.
 // L1 and L2 used to be rescaled by the inverse of their own first value, which made their reported

@@ -359,7 +359,11 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     {
       const int64_t index = remainder % patchSize[d];
       remainder /= patchSize[d];
-      const double offset = (static_cast<double>(index) - (patchSize[d] - 1) / 2.0) * voxelSize[d];
+      // The centre is the voxel centerFeatures() reads back, patchSize[d] / 2, not the
+      // geometric middle: those agree for an odd extent and differ by half a voxel for an even
+      // one, where (n - 1) / 2 would hand the loss a feature half a voxel off its sample point.
+      // The shared online inference spans its patch the same way.
+      const double offset = (static_cast<double>(index) - static_cast<double>(patchSize[d] / 2)) * voxelSize[d];
       // Patch axis d points along the plane's d-th COLUMN, expressed in the image's own frame:
       // elastix spans its patch with matrix * (x, y, 0), whose basis vectors are the columns,
       // and the rows would span the transposed rotation's plane instead. With the identity
