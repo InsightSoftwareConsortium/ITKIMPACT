@@ -136,11 +136,65 @@ jobs:
           name: wheel-windows-cp3${{ matrix.python3-minor-version }}
           path: dist/*.whl
 
+  # The wheel is what users actually install, and nothing else in CI exercises the Python
+  # wrapping: the C++ workflow builds against an ITK without ITK_WRAP_PYTHON, so a wrapping that
+  # no longer matches the C++ API still passes it. These jobs install each built wheel with a CPU
+  # torch and run the facade smoke test, and publishing waits on them.
+  test-linux-wheel:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python3-minor-version: ["10", "11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.${{ matrix.python3-minor-version }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-cp3${{ matrix.python3-minor-version }}
+          path: dist
+      - name: Install the wheel against a CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+          python -m pip install dist/*.whl --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Smoke-test the Python facade
+        run: python test/itkImpactPythonTest.py test/Data/ImpactToyModel.pt
+
+  test-windows-wheel:
+    needs: build-windows
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        python3-minor-version: ["10", "11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.${{ matrix.python3-minor-version }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-windows-cp3${{ matrix.python3-minor-version }}
+          path: dist
+      - name: Install the wheel against a CPU torch
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+          python -m pip install dist/*.whl --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Smoke-test the Python facade
+        shell: bash
+        run: python test/itkImpactPythonTest.py test/Data/ImpactToyModel.pt
+
   publish-testpypi:
     # Manual runs go to TestPyPI so the recipe can be validated without touching PyPI.
-    # Coupled: publishes only when every build (Linux and Windows) succeeded.
+    # Coupled: publishes only when every build AND every wheel smoke test succeeded.
     if: github.event_name == 'workflow_dispatch'
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, test-linux-wheel, test-windows-wheel]
     runs-on: ubuntu-22.04
     environment: testpypi
     permissions:
@@ -162,7 +216,7 @@ jobs:
   publish-pypi:
     # A pushed v* tag releases to the real PyPI.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, test-linux-wheel, test-windows-wheel]
     runs-on: ubuntu-22.04
     environment: pypi
     permissions:
