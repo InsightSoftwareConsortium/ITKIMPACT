@@ -30,6 +30,7 @@
 #include "itkImageToFeaturesMap.h"
 #include "itkImageToFeaturesMapInternals.h"
 #include "itkImpactOnlineInference.h"
+#include "itkImpactBatchBudget.h"
 #include "ImpactLoss.h"
 #include "itkImpactImageToImageMetricv4.h"
 #include "itkImpactFineRegistration.h"
@@ -1605,6 +1606,166 @@ TEST(ImpactBackend, AnisotropicPatchIsTiledInItkAxisOrder)
   // consumed in the tensor's order the 8 would tile z instead, and this voxel would be clean
   // while z = 8 carried the seam.
   EXPECT_LT(diffAt(4, 8, 8), 1e-3) << "x = 4 is interior to its patch: no seam may appear";
+}
+
+// Online mode runs its samples through the model in batches bounded by the device budget
+// (itkImpactBatchBudget.h); nothing may depend on where the batches are cut.
+namespace
+{
+struct OnlineFixture
+{
+  std::vector<itk::ImpactModelConfiguration>                configs;
+  std::vector<itk::Point<double, 3>>                        points;
+  std::vector<std::vector<std::vector<std::vector<float>>>> patchIndex{ 1 };
+  std::vector<torch::Tensor>                                subset{ torch::arange(4, torch::kInt64),
+                                                                    torch::arange(1, torch::kInt64) };
+  torch::Device                                             device{ torch::kCPU };
+
+  explicit OnlineFixture(size_t samples)
+  {
+    configs.emplace_back(ToyModelPath(), 3, 1, std::vector<unsigned int>{ 3, 3, 3 }, std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 0, 0, 0 }, std::vector<bool>{ true, true }, false);
+    itk::Impact::GetModelOutputsExample(configs, "fixed", device);
+    for (size_t s = 0; s < samples; ++s)
+    {
+      points.emplace_back(itk::MakePoint(static_cast<double>(s), 0.0, 0.0)); // the sample rides on x
+      patchIndex[0].push_back(configs[0].GetPatchIndex());
+    }
+  }
+  // Intensities that depend on the sample, so batches cannot be confused by accident.
+  static torch::Tensor
+  patch(const itk::Point<double, 3> & point, const std::vector<int64_t> & shape, double offset)
+  {
+    torch::Tensor values = torch::zeros({ torch::IntArrayRef(shape) }, torch::kFloat32);
+    return (values + torch::arange(values.numel(), torch::kFloat32).reshape(values.sizes()) * 0.1f +
+            static_cast<float>(point[0] + offset))
+      .sin()
+      .unsqueeze(0);
+  }
+};
+} // namespace
+
+TEST(ImpactBackend, OnlineInferenceIsIndependentOfTheBatchBound)
+{
+  constexpr size_t samples = 7;
+  OnlineFixture    fx(samples);
+  auto             values = [](const itk::Point<double, 3> & point,
+                   const std::vector<std::vector<float>> &,
+                   const std::vector<int64_t> & shape) { return OnlineFixture::patch(point, shape, 0.0); };
+  auto             valuesAndJacobians = [](const itk::Point<double, 3> &           point,
+                               torch::Tensor &                         jacobians,
+                               const std::vector<std::vector<float>> & index,
+                               const std::vector<int64_t> &            shape,
+                               int                                     s) {
+    jacobians[s] = torch::arange(static_cast<int64_t>(index.size()), torch::kFloat32).unsqueeze(1).repeat({ 1, 3 }) *
+                     0.01f * static_cast<float>(s + 1) +
+                   0.5f;
+    return OnlineFixture::patch(point, shape, 1.0);
+  };
+  auto run = [&](int64_t bound) {
+    itk::SetBatchSize(fx.configs[0], bound);
+    std::vector<torch::Tensor> fixedOutputs = itk::Impact::GenerateOutputs<itk::Point<double, 3>>(
+      fx.configs, fx.points, fx.patchIndex, fx.subset, fx.device, values);
+    std::vector<std::unique_ptr<itk::Impact::Loss>> losses;
+    for (size_t i = 0; i < fixedOutputs.size(); ++i)
+    {
+      losses.push_back(itk::Impact::LossFactory::Instance().Create("L2"));
+      losses.back()->SetNumberOfParameters(1);
+    }
+    std::vector<torch::Tensor> jacobians = itk::Impact::GenerateOutputsAndJacobian<itk::Point<double, 3>>(
+      fx.configs, fx.points, fx.patchIndex, fx.subset, fixedOutputs, fx.device, losses, valuesAndJacobians);
+    std::vector<double> lossValues;
+    for (const auto & loss : losses)
+    {
+      lossValues.push_back(loss->GetValue(samples));
+    }
+    return std::make_tuple(fixedOutputs, jacobians, lossValues);
+  };
+
+  const auto [outputsAll, jacobiansAll, valuesAll] = run(0);
+  ASSERT_EQ(outputsAll.size(), 2u);
+  ASSERT_EQ(outputsAll[0].sizes(), (std::vector<int64_t>{ samples, 4 }));
+  EXPECT_GT(valuesAll[0], 0.0);
+  for (const int64_t bound : { 3, 1, 100 })
+  {
+    const auto [outputs, jacobians, lossValues] = run(bound);
+    for (size_t k = 0; k < 2; ++k)
+    {
+      EXPECT_TRUE(torch::allclose(outputs[k], outputsAll[k], 1e-6, 1e-6)) << "layer " << k << " bound " << bound;
+      EXPECT_TRUE(torch::allclose(jacobians[k], jacobiansAll[k], 1e-5, 1e-6)) << "layer " << k << " bound " << bound;
+      EXPECT_NEAR(lossValues[k], valuesAll[k], 1e-6 * std::abs(valuesAll[k]) + 1e-9) << "layer " << k;
+    }
+  }
+}
+
+// The budget is measured on CUDA and left unbounded on the CPU; a batch the device cannot
+// allocate is halved and replayed after the rollback, whether the failure is the allocator's
+// own c10::OutOfMemoryError or the std::runtime_error the TorchScript interpreter wraps it in.
+TEST(ImpactBackend, BatchBudgetIsMeasuredAndABatchOutOfMemoryIsHalved)
+{
+  OnlineFixture fx(1);
+  EXPECT_EQ(itk::Impact::MeasureBatchBudget(fx.configs[0], torch::Device(torch::kCPU)), 0);
+  itk::Impact::ConfigureBatchSize(fx.configs, torch::Device(torch::kCPU), 5);
+  EXPECT_EQ(itk::GetBatchSize(fx.configs[0]), 5);
+  if (torch::cuda::is_available() && ITK_IMPACT_HAS_CUDA_MEMORY_STATS)
+  {
+    EXPECT_GT(itk::Impact::MeasureBatchBudget(fx.configs[0], torch::Device(torch::kCUDA, 0)), 1);
+    itk::ModelTo(fx.configs[0], torch::Device(torch::kCPU));
+  }
+
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+  int                                      rollbacks = 0;
+  itk::SetBatchSize(fx.configs[0], 16);
+  itk::Impact::ForEachBatch(
+    fx.configs[0],
+    fx.device,
+    16,
+    [&](int64_t begin, int64_t end) {
+      if (end - begin > 8)
+      {
+        TORCH_CHECK_WITH(OutOfMemoryError, false, "simulated");
+      }
+      if (end - begin > 4)
+      {
+        throw std::runtime_error("The following operation failed in the TorchScript interpreter.\n"
+                                 "RuntimeError: CUDA out of memory. Tried to allocate 432.00 MiB.");
+      }
+      ranges.emplace_back(begin, end);
+    },
+    [&] { ++rollbacks; });
+  EXPECT_EQ(rollbacks, 2) << "16 -> 8 -> 4";
+  EXPECT_EQ(itk::GetBatchSize(fx.configs[0]), 4);
+  ASSERT_EQ(ranges.size(), 4u);
+  EXPECT_EQ(ranges.back().second, 16);
+  for (size_t i = 1; i < ranges.size(); ++i)
+  {
+    EXPECT_EQ(ranges[i].first, ranges[i - 1].second);
+  }
+
+  // Anything else, and a batch of one that still fails, must surface untouched.
+  auto other = [](int64_t, int64_t) { throw std::runtime_error("shape mismatch"); };
+  EXPECT_THROW(itk::Impact::ForEachBatch(fx.configs[0], fx.device, 4, other, [] {}), std::runtime_error);
+  EXPECT_EQ(itk::GetBatchSize(fx.configs[0]), 4);
+  auto oom = [](int64_t, int64_t) { TORCH_CHECK_WITH(OutOfMemoryError, false, "simulated"); };
+  EXPECT_THROW(itk::Impact::ForEachBatch(fx.configs[0], fx.device, 1, oom, [] {}), c10::OutOfMemoryError);
+}
+
+// A whole-image (0) axis that does not fit on the device is halved, largest first, until the
+// model fits; declared axes are never touched (itkImpactPatchTiling.h RunTiledModel).
+TEST(ImpactBackend, WholeImagePatchShrinksLargestZeroAxisFirst)
+{
+  const std::vector<int64_t> configured{ 0, 64, 0 };
+  std::vector<int64_t>       current{ 300, 64, 212 };
+  ASSERT_TRUE(itk::Impact::ShrinkWholeImagePatch(configured, current));
+  EXPECT_EQ(current, (std::vector<int64_t>{ 150, 64, 212 }));
+  ASSERT_TRUE(itk::Impact::ShrinkWholeImagePatch(configured, current));
+  EXPECT_EQ(current, (std::vector<int64_t>{ 150, 64, 106 }));
+  while (itk::Impact::ShrinkWholeImagePatch(configured, current))
+  {
+  }
+  EXPECT_EQ(current, (std::vector<int64_t>{ 1, 64, 1 })) << "declared axes stay; zero axes stop at one voxel";
+  std::vector<int64_t> declared{ 32, 32, 32 };
+  EXPECT_FALSE(itk::Impact::ShrinkWholeImagePatch(declared, declared)) << "nothing to shrink without a zero axis";
 }
 
 // A model of lower dimension than the image is swept over the axes it does not span: a 2D model

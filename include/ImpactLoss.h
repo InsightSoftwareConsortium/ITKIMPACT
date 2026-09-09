@@ -74,6 +74,27 @@ public:
     this->m_initialized = false;
   }
 
+  /** Snapshot of the accumulators, so a batch replayed after a device out-of-memory (see
+   * itkImpactBatchBudget.h) is not counted twice. */
+  struct State
+  {
+    double        value{ 0 };
+    torch::Tensor derivative;
+    bool          initialized{ false };
+  };
+  State
+  SaveState() const
+  {
+    return { m_value, m_derivative.defined() ? m_derivative.clone() : torch::Tensor(), m_initialized };
+  }
+  void
+  RestoreState(const State & state)
+  {
+    m_value = state.value;
+    m_derivative = state.derivative;
+    m_initialized = state.initialized;
+  }
+
   virtual void
   initialize(torch::Tensor & output)
   {

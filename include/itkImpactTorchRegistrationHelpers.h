@@ -230,10 +230,8 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
     // blend are shared with itk::ImageToFeaturesMap (itkImpactPatchTiling.h) rather than written
     // twice. Not available with a live autograd graph: a tiled pass would hold every patch's
     // graph until the blend, so the differentiable-feature mode keeps the whole-volume forward.
-    const std::vector<int64_t> & declaredPatch = config.GetPatchSize();
-    const bool                   tiled =
-      !withGrad && std::any_of(declaredPatch.begin(), declaredPatch.end(), [](int64_t p) { return p > 0; });
-    if (tiled)
+    // With no patch declared the tiler runs the volume whole, and cuts it down if that does not fit.
+    if (!withGrad)
     {
       for (torch::Tensor & map : RunTiledModel(config,
                                                imageTensor.squeeze(0), // {1,C,spatial...} -> {C,spatial...}

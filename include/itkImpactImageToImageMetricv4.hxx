@@ -25,6 +25,7 @@
 #include "itkImageToFeaturesMapInternals.h"
 #include "itkImpactTorchRegistrationHelpers.h" // Impact::PythonGilReleaseGuard
 #include "itkImpactModelConfigurationDetail.h" // ComputeImageMetadata
+#include "itkImpactBatchBudget.h"                // ConfigureBatchSize
 #include <itkImageFileWriter.h>
 
 namespace itk
@@ -489,6 +490,11 @@ ImpactImageToImageMetricv4<TFixedImage,
         std::iota(this->m_features_indexes[comparison].begin(), this->m_features_indexes[comparison].end(), 0);
       }
     }
+
+    // Device budget per model (itkImpactBatchBudget.h); its backward pass refuses the GIL.
+    Impact::PythonGilReleaseGuard noGil;
+    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
+    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
   }
   else
   {

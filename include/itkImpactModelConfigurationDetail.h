@@ -64,6 +64,8 @@ struct ImpactModelConfigurationImpl
   ImpactImageMetadata imageMetadata;
   /** Per-layer center-extraction indices for the online inference (set by the caller). */
   std::vector<std::vector<torch::indexing::TensorIndex>> centersIndexLayers;
+  /** Most patches one online forward may take at once; 0 = no bound (itkImpactBatchBudget.h). */
+  int64_t batchSize{ 0 };
 };
 } // namespace detail
 
@@ -161,6 +163,18 @@ void
 SetupImageMetadata(const ImpactModelConfiguration & configuration, typename TImage::ConstPointer image)
 {
   configuration.GetImpl()->imageMetadata = ComputeImageMetadata<TImage>(image);
+}
+
+/** Most patches one online forward may take at once (0 = unbounded); see itkImpactBatchBudget.h. */
+inline int64_t
+GetBatchSize(const ImpactModelConfiguration & configuration)
+{
+  return configuration.GetImpl()->batchSize;
+}
+inline void
+SetBatchSize(const ImpactModelConfiguration & configuration, int64_t batchSize)
+{
+  configuration.GetImpl()->batchSize = batchSize < 0 ? 0 : batchSize;
 }
 
 /** Per-layer center-extraction indices used by the online inference (read/write). */

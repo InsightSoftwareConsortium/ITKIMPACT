@@ -38,6 +38,7 @@
 // Include only from translation units that already depend on torch.
 
 #include "itkImpactModelConfigurationDetail.h"
+#include "itkImpactBatchBudget.h"
 
 #include <itkMacro.h>
 #include <itkMath.h>
@@ -724,12 +725,13 @@ private:
  * the blend. A caller that needs the graph must run the model whole.
  */
 inline std::vector<torch::Tensor>
-RunTiledModel(const ImpactModelConfiguration &                                                config,
-              const torch::Tensor &                                                           input,
-              const torch::Device &                                                           device,
-              const torch::Device &                                                           accumulateOn,
-              PatchCombineMode                                                                combine,
-              const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination = {})
+RunTiledModelOnce(const ImpactModelConfiguration &                                                config,
+                  const torch::Tensor &                                                           input,
+                  const torch::Device &                                                           device,
+                  const torch::Device &                                                           accumulateOn,
+                  PatchCombineMode                                                                combine,
+                  const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination,
+                  const std::vector<int64_t> & patchOverride) // ITK order; a whole-extent axis cut down by RunTiledModel
 {
   torch::NoGradGuard noGrad;
 
@@ -768,6 +770,12 @@ RunTiledModel(const ImpactModelConfiguration &                                  
     {
       patchSize[d] = configuredPatchSize[itkAxis];
       overlaps[d] = itkAxis < configuredOverlaps.size() ? static_cast<int64_t>(configuredOverlaps[itkAxis]) : 0;
+    }
+    else if (itkAxis < patchOverride.size() && patchOverride[itkAxis] > 0 && patchOverride[itkAxis] < inputShape[d])
+    {
+      // A whole-extent axis that did not fit on the device, cut down by RunTiledModel.
+      patchSize[d] = patchOverride[itkAxis];
+      overlaps[d] = patchSize[d] / 4;
     }
     else
     {
@@ -935,6 +943,66 @@ RunTiledModel(const ImpactModelConfiguration &                                  
   return assembled;
 }
 
+
+/** Halve the largest whole-extent (configured 0) axis of `current`, so the largest patch that
+ * fits on the device is found by trying. Returns false when no such axis can shrink further. */
+inline bool
+ShrinkWholeImagePatch(const std::vector<int64_t> & configured, std::vector<int64_t> & current)
+{
+  int64_t largest = -1;
+  for (size_t d = 0; d < configured.size(); ++d)
+  {
+    if (configured[d] == 0 && current[d] > 1 && (largest < 0 || current[d] > current[largest]))
+    {
+      largest = static_cast<int64_t>(d);
+    }
+  }
+  if (largest < 0)
+  {
+    return false;
+  }
+  current[largest] = (current[largest] + 1) / 2;
+  return true;
+}
+
+/** RunTiledModelOnce, with the whole-extent axes cut down until the model fits on the device:
+ * a patch size of 0 asks for the whole image, and a whole image that runs out of memory is
+ * retried with its largest axis halved (overlap a quarter of the patch), as many times as needed. */
+inline std::vector<torch::Tensor>
+RunTiledModel(const ImpactModelConfiguration &                                                config,
+              const torch::Tensor &                                                           input,
+              const torch::Device &                                                           device,
+              const torch::Device &                                                           accumulateOn,
+              PatchCombineMode                                                                combine,
+              const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination = {})
+{
+  const std::vector<int64_t> & configured = config.GetPatchSize();
+  const unsigned int           dimension = config.GetDimension();
+  const auto                   sweptAxes = static_cast<unsigned int>(input.dim()) - 1 - dimension;
+  std::vector<int64_t>         current(dimension);
+  for (unsigned int a = 0; a < dimension; ++a)
+  {
+    // ITK axis a is tensor axis sweptAxes + dimension - a.
+    current[a] = configured[a] > 0 ? configured[a] : input.size(sweptAxes + dimension - a);
+  }
+  for (;;)
+  {
+    try
+    {
+      return RunTiledModelOnce(config, input, device, accumulateOn, combine, makeDestination, current);
+    }
+    catch (const std::exception & error)
+    {
+      if (!Impact::IsDeviceOutOfMemory(error) || !ShrinkWholeImagePatch(configured, current))
+      {
+        throw;
+      }
+      Impact::ReleaseCachedDeviceMemory(device);
+      itkGenericOutputMacro("IMPACT: the model ran out of device memory on the whole image; retrying with a patch of "
+                            << GetStringFromVector<int64_t>(current) << ".");
+    }
+  }
+}
 
 /** Fit a PCA basis on a feature tensor {C, spatial...} (no batch): channel-covariance
  * eigendecomposition, keep the top `newC` principal components. Returns the {C, newC} basis.

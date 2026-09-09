@@ -27,6 +27,7 @@
 
 #include "itkImpactModelConfiguration.h"
 #include "itkImpactModelConfigurationDetail.h"
+#include "itkImpactBatchBudget.h"
 #include "ImpactLoss.h"
 
 #include <itkMacro.h>
@@ -35,6 +36,7 @@
 
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <numeric>
@@ -156,6 +158,9 @@ GetModelOutputsExample(std::vector<itk::ImpactModelConfiguration> & modelsConfig
       itk::SetCentersIndexLayers(config, centersIndexLayers);
     }
   }
+  // How many patches one online forward may hold on the device (itkImpactBatchBudget.h). Done
+  // here, outside the no-grad scope, so every host of the online mode gets it from this call.
+  ConfigureBatchSize(modelsConfig, device);
   return outputsTensor;
 } // end GetModelOutputsExample
 
@@ -237,10 +242,10 @@ GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &              
   std::vector<torch::Tensor> outputsTensor;
   {
     torch::NoGradGuard noGrad;
-    unsigned int       nbSample = fixedPoints.size();
+    const auto         nbSample = static_cast<int64_t>(fixedPoints.size());
 
-    int a = 0;
-    for (int i = 0; i < modelConfig.size(); ++i)
+    size_t a = 0;
+    for (size_t i = 0; i < modelConfig.size(); ++i)
     {
       const auto & config = modelConfig[i];
 
@@ -254,7 +259,7 @@ GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &              
                                          .unsqueeze(1)
                                          .clone();
 
-      for (unsigned int s = 0; s < nbSample; ++s)
+      for (int64_t s = 0; s < nbSample; ++s)
       {
         patchValueTensor[s] =
           imagesPatchValuesEvaluator(fixedPoints[s], patchIndex[i][s], tensorShape).to(itk::GetModelDtype(config));
@@ -262,21 +267,44 @@ GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &              
 
       std::vector<int64_t> resizeVector(patchValueTensor.dim(), 1);
       resizeVector[1] = config.GetNumberOfChannels();
-      std::vector<torch::jit::IValue> outputsList =
-        itk::Forward(config, patchValueTensor.to(device).repeat({ torch::IntArrayRef(resizeVector) }).clone());
 
-      for (int it = 0; it < outputsList.size(); ++it)
-      {
-        if (config.GetLayersMask()[it])
+      // Batched by the device budget (itkImpactBatchBudget.h); kept layers joined at the end.
+      const std::vector<bool> &               mask = config.GetLayersMask();
+      const auto                              kept = static_cast<size_t>(std::count(mask.begin(), mask.end(), true));
+      std::vector<std::vector<torch::Tensor>> batches(kept);
+      ForEachBatch(
+        config,
+        device,
+        nbSample,
+        [&](int64_t begin, int64_t end) {
+        torch::Tensor input =
+          patchValueTensor.narrow(0, begin, end - begin).to(device).repeat({ torch::IntArrayRef(resizeVector) }).clone();
+        std::vector<torch::jit::IValue> outputsList = itk::Forward(config, input);
+        std::vector<torch::Tensor>      layers;
+        layers.reserve(kept);
+        for (size_t it = 0; it < outputsList.size(); ++it)
         {
-          outputsTensor.push_back(outputsList[it]
-                                    .toTensor()
-                                    .index(itk::GetCentersIndexLayers(config)[a])
-                                    .index_select(1, subsetsOfFeatures[a])
-                                    .to(torch::kFloat32));
-          a++;
+          if (mask[it])
+          {
+            const size_t k = layers.size();
+            layers.push_back(outputsList[it]
+                               .toTensor()
+                               .index(itk::GetCentersIndexLayers(config)[a + k])
+                               .index_select(1, subsetsOfFeatures[a + k])
+                               .to(torch::kFloat32));
+          }
         }
+        for (size_t k = 0; k < layers.size(); ++k)
+        {
+          batches[k].push_back(layers[k]);
+        }
+        },
+        [] {});
+      for (size_t k = 0; k < kept; ++k)
+      {
+        outputsTensor.push_back(torch::cat(batches[k], 0));
       }
+      a += kept;
     }
   }
   return outputsTensor;
@@ -296,11 +324,11 @@ GenerateOutputsAndJacobian(
 {
   std::vector<torch::Tensor> layersJacobian;
 
-  unsigned int nbSample = fixedPoints.size();
+  const auto   nbSample = static_cast<int64_t>(fixedPoints.size());
   unsigned int dimension = fixedPoints[0].size();
 
-  int a = 0;
-  for (int i = 0; i < modelConfig.size(); ++i)
+  size_t a = 0;
+  for (size_t i = 0; i < modelConfig.size(); ++i)
   {
     const auto & config = modelConfig[i];
 
@@ -316,45 +344,81 @@ GenerateOutputsAndJacobian(
     torch::Tensor imagesPatchesJacobians =
       torch::zeros({ nbSample, static_cast<int64_t>(patchIndex[i][0].size()), dimension }, torch::kFloat32);
 
-    for (unsigned int s = 0; s < nbSample; ++s)
+    for (int64_t s = 0; s < nbSample; ++s)
     {
       patchValueTensor[s] = imagesPatchValuesAndJacobiansEvaluator(
                               fixedPoints[s], imagesPatchesJacobians, patchIndex[i][s], tensorShape, s)
                               .to(itk::GetModelDtype(config));
     }
 
-
     std::vector<int64_t> resizeVector(patchValueTensor.dim(), 1);
     resizeVector[1] = config.GetNumberOfChannels();
-    patchValueTensor =
-      patchValueTensor.to(device).repeat({ torch::IntArrayRef(resizeVector) }).clone().set_requires_grad(true);
-    imagesPatchesJacobians = imagesPatchesJacobians.to(device).repeat({ 1, config.GetNumberOfChannels(), 1 }).clone();
+    const auto channels = static_cast<int64_t>(config.GetNumberOfChannels());
 
-    std::vector<torch::jit::IValue> outputsList = itk::Forward(config, patchValueTensor);
-    torch::Tensor                   layer, diffLayer, modelJacobian;
-    for (int it = 0; it < outputsList.size(); ++it)
-    {
-      if (config.GetLayersMask()[it])
+    const std::vector<bool> & mask = config.GetLayersMask();
+    const auto                kept = static_cast<size_t>(std::count(mask.begin(), mask.end(), true));
+    // The losses accumulate inside a batch; a replayed batch is rewound to what they held before.
+    std::vector<std::vector<torch::Tensor>> batches(kept);
+    std::vector<itk::Impact::Loss::State>   before(kept);
+    auto                                    rewind = [&]() {
+      for (size_t k = 0; k < kept; ++k)
       {
-        int nb = std::accumulate(config.GetLayersMask().begin(), config.GetLayersMask().end(), 0);
-
-        layer = outputsList[it]
-                  .toTensor()
-                  .index(itk::GetCentersIndexLayers(config)[a])
-                  .index_select(1, subsetsOfFeatures[a])
-                  .to(torch::kFloat32);
-        torch::Tensor gradientModulator = losses[a]->updateValueAndGetGradientModulator(fixedOutputsTensor[a], layer);
-        std::vector<torch::Tensor> modelJacobians;
-        layersJacobian.push_back(
-          torch::bmm(torch::autograd::grad({ layer }, { patchValueTensor }, { gradientModulator }, nb > 1, false)[0]
-                       .flatten(1)
-                       .unsqueeze(1)
-                       .to(torch::kFloat32),
-                     imagesPatchesJacobians));
-
-        a++;
+        losses[a + k]->RestoreState(before[k]);
       }
+    };
+    ForEachBatch(
+      config,
+      device,
+      nbSample,
+      [&](int64_t begin, int64_t end) {
+        for (size_t k = 0; k < kept; ++k)
+        {
+          before[k] = losses[a + k]->SaveState();
+        }
+        const int64_t n = end - begin;
+        torch::Tensor input = patchValueTensor.narrow(0, begin, n)
+                                .to(device)
+                                .repeat({ torch::IntArrayRef(resizeVector) })
+                                .clone()
+                                .set_requires_grad(true);
+        torch::Tensor patchJacobians =
+          imagesPatchesJacobians.narrow(0, begin, n).to(device).repeat({ 1, channels, 1 }).clone();
+
+        std::vector<torch::jit::IValue> outputsList = itk::Forward(config, input);
+        std::vector<torch::Tensor>      jacobians;
+        jacobians.reserve(kept);
+        for (size_t it = 0; it < outputsList.size(); ++it)
+        {
+          if (!mask[it])
+          {
+            continue;
+          }
+          const size_t  k = jacobians.size();
+          torch::Tensor layer = outputsList[it]
+                                  .toTensor()
+                                  .index(itk::GetCentersIndexLayers(config)[a + k])
+                                  .index_select(1, subsetsOfFeatures[a + k])
+                                  .to(torch::kFloat32);
+          torch::Tensor fixedLayer = fixedOutputsTensor[a + k].narrow(0, begin, n);
+          torch::Tensor gradientModulator = losses[a + k]->updateValueAndGetGradientModulator(fixedLayer, layer);
+          jacobians.push_back(
+            torch::bmm(torch::autograd::grad({ layer }, { input }, { gradientModulator }, kept > 1, false)[0]
+                         .flatten(1)
+                         .unsqueeze(1)
+                         .to(torch::kFloat32),
+                       patchJacobians));
+        }
+        for (size_t k = 0; k < jacobians.size(); ++k)
+        {
+          batches[k].push_back(jacobians[k]);
+        }
+      },
+      rewind);
+    for (size_t k = 0; k < kept; ++k)
+    {
+      layersJacobian.push_back(torch::cat(batches[k], 0));
     }
+    a += kept;
   }
   return layersJacobian;
 } // end GenerateOutputsAndJacobian

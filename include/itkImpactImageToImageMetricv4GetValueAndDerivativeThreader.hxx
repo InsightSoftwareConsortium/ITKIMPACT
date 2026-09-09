@@ -27,6 +27,9 @@
 // PatchTensorShape(): the single place that knows a patch reaches the model with its extents
 // reversed, shared with the elastix metric so both cut the same patch.
 #include "itkImpactOnlineInference.h"
+#include "itkImpactBatchBudget.h"
+
+#include <mutex>
 
 namespace itk
 {
@@ -164,12 +167,44 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   const std::vector<Sample> samples = this->CollectSamples(domain);
   LossPerThreadStruct &     loss = this->m_LossThreadStruct[threadId];
 
-  const auto batchSize = static_cast<std::ptrdiff_t>(std::max(1u, this->m_ImpactAssociate->GetBatchSize()));
+  // BatchSize capped by the device budget (itkImpactBatchBudget.h); 0 = the budget alone, or
+  // the whole work unit on the CPU. A batch that runs out of memory is halved and replayed
+  // after the losses have been rewound.
+  const auto &        movingConfigs = this->m_ImpactAssociate->GetMovingModelsConfiguration();
+  const torch::Device device(this->m_ImpactAssociate->GetDevice());
+  const auto          requested = static_cast<int64_t>(this->m_ImpactAssociate->GetBatchSize());
   for (auto first = samples.begin(); first != samples.end();)
   {
-    const auto last = first + std::min(batchSize, samples.end() - first);
-    this->EvaluateJacobianBatch(first, last, threadId, loss);
-    first = last;
+    const int64_t bound = Impact::EffectiveBatchSize(movingConfigs);
+    int64_t       batch = requested > 0 ? requested : static_cast<int64_t>(samples.size());
+    batch = std::max<int64_t>(bound > 0 ? std::min(batch, bound) : batch, 1);
+    const auto last = first + std::min<std::ptrdiff_t>(batch, samples.end() - first);
+
+    std::vector<Impact::Loss::State> before;
+    for (const auto & l : loss.m_losses)
+    {
+      before.push_back(l->SaveState());
+    }
+    try
+    {
+      this->EvaluateJacobianBatch(first, last, threadId, loss);
+      first = last;
+    }
+    catch (const std::exception & error)
+    {
+      if (!Impact::IsDeviceOutOfMemory(error) || last - first <= 1)
+      {
+        throw;
+      }
+      for (size_t l = 0; l < loss.m_losses.size(); ++l)
+      {
+        loss.m_losses[l]->RestoreState(before[l]);
+      }
+      for (const ImpactModelConfiguration & config : movingConfigs)
+      {
+        Impact::ShrinkBatchSize(config, last - first, device);
+      }
+    }
   }
 
   // ProcessVirtualPoint() would have kept these counts and we bypassed it: the first is what
@@ -436,6 +471,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   const auto          batchSize = static_cast<int64_t>(std::distance(first, last));
   const bool          computeDerivative = this->GetComputeDerivative();
   const torch::Device device(this->m_ImpactAssociate->GetDevice());
+  std::unique_lock<std::mutex> deviceLock(Impact::DeviceForwardMutex(), std::defer_lock);
 
   // d(moving coordinate)/d(parameter) at every point of the batch, and the global parameter
   // index each of its columns belongs to.
@@ -561,6 +597,12 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       return torch::tensor(std::vector<int64_t>(subsetOfFeatures.begin(), subsetOfFeatures.end()), torch::kInt64)
         .to(device);
     };
+
+    // One work unit at a time on the device, so the budget holds whatever the thread count.
+    if (device.is_cuda() && !deviceLock.owns_lock())
+    {
+      deviceLock.lock();
+    }
 
     // No gradient ever flows through the fixed image.
     std::vector<torch::Tensor> fixedLayers;
