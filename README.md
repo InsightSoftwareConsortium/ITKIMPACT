@@ -305,12 +305,11 @@ lives behind opaque handles), so the Python bindings build without exposing `tor
 ## Notes
 
 - Devices: `"cpu"`, `"cuda"`, `"cuda:0"`, … via `SetDevice`.
-- Device memory is managed for you. In Jacobian mode the memory one patch costs, forward and
-  backward, is measured when the metric is initialised, and the samples go through the model in
-  batches of as many patches as fit (a batch that still fails to allocate is halved and
-  replayed); `BatchSize` on the v4 metric only caps that. In Static mode a patch size of `0`
-  runs the whole image, and a whole image that does not fit is cut down, largest axis first,
-  until it does. See `itkImpactBatchBudget.h`.
+- GPU memory takes care of itself. In Jacobian mode the metric measures what one patch costs
+  at initialisation and runs the samples in batches of as many patches as fit; a batch that
+  still fails is halved and replayed. `BatchSize` on the v4 metric is only a cap. In Static
+  mode a patch size of `0` runs the whole image, and an image that does not fit is split along
+  its largest axis until it does. See `itkImpactBatchBudget.h`.
 - Displacement fields are `itk::Image<itk::Vector<float, N>, N>`.
 - The feature path runs each model once on the whole volume and warps the resulting feature
   maps; layers may be coarser than the input and are handled at their native (possibly

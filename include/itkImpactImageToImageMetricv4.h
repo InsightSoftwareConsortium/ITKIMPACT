@@ -203,9 +203,9 @@ public:
    * of magnitude slower than either a batch of one or a batch past a few dozen. Values well
    * below the default are best avoided whatever the memory.
    *
-   * On a CUDA device the batch is also capped by what the device can hold, measured at
-   * Initialize() (itkImpactBatchBudget.h); a batch that still fails to allocate is halved and
-   * replayed. Zero means the measured cap alone (the whole work unit on the CPU). */
+   * On a CUDA device the batch never exceeds what the device can hold, which Initialize()
+   * measures (itkImpactBatchBudget.h); a batch that still fails to allocate is halved and
+   * replayed. Zero means that measured bound alone, or the whole work unit on the CPU. */
   itkSetMacro(BatchSize, unsigned int);
   itkGetConstMacro(BatchSize, unsigned int);
 

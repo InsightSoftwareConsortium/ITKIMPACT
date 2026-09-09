@@ -18,11 +18,11 @@
 #ifndef itkImpactBatchBudget_h
 #define itkImpactBatchBudget_h
 
-// How many patches one online (Jacobian-mode) forward + backward may hold on the device.
-// Measured, not configured: the marginal memory of a patch from two probe passes, the free
-// memory from the driver. ForEachBatch runs a sample set in batches of that size under one
-// process-wide lock, and halves the batch when an allocation still fails.
-// Pulls in LibTorch; never part of the castxml-parsed public surface.
+// How many patches one online (Jacobian mode) forward and backward can hold on the device.
+// The number is measured rather than configured: two probe passes give the memory one patch
+// costs, and the driver gives the memory available. ForEachBatch then runs a sample set in
+// batches of that size, one work unit at a time on the device, and halves the batch when an
+// allocation still fails. Pulls in LibTorch; never part of the castxml-parsed public surface.
 
 #include "itkImpactModelConfigurationDetail.h"
 #include "ImpactLoss.h"
