@@ -48,7 +48,13 @@ function(impact_link_python_embed target)
     set(_impact_pylib ${IMPACT_PYTHON_EMBED_LIBRARY})
   endif()
   if(_impact_pylib)
-    target_link_libraries(${target} -Wl,--no-as-needed ${_impact_pylib} -Wl,--as-needed)
+    # --no-as-needed is GNU-ld only; Apple's linker rejects it outright and
+    # never drops a needed library anyway.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT MSVC)
+      target_link_libraries(${target} PRIVATE -Wl,--no-as-needed ${_impact_pylib} -Wl,--as-needed)
+    else()
+      target_link_libraries(${target} PRIVATE ${_impact_pylib})
+    endif()
   endif()
 endfunction()
 
@@ -97,7 +103,7 @@ if(NOT TARGET GTest::GTest)
 endif()
 
 add_executable(ImpactGTestDriver itkImpactBackendGTest.cxx)
-target_link_libraries(ImpactGTestDriver ${Impact-Test_LIBRARIES} Impact GTest::GTest)
+target_link_libraries(ImpactGTestDriver PRIVATE ${Impact-Test_LIBRARIES} Impact GTest::GTest)
 impact_link_python_embed(ImpactGTestDriver)
 # The ImpactConvexAdam.RealLungCT* gtest runs on a real lung-CT pair (and the M258 model)
 # kept out of git. Fetch them via ITK ExternalData from the committed .sha512 content links
