@@ -48,7 +48,13 @@ function(impact_link_python_embed target)
     set(_impact_pylib ${IMPACT_PYTHON_EMBED_LIBRARY})
   endif()
   if(_impact_pylib)
-    target_link_libraries(${target} PRIVATE -Wl,--no-as-needed ${_impact_pylib} -Wl,--as-needed)
+    # --no-as-needed is GNU-ld only; Apple's linker rejects it outright and
+    # never drops a needed library anyway.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT MSVC)
+      target_link_libraries(${target} PRIVATE -Wl,--no-as-needed ${_impact_pylib} -Wl,--as-needed)
+    else()
+      target_link_libraries(${target} PRIVATE ${_impact_pylib})
+    endif()
   endif()
 endfunction()
 
