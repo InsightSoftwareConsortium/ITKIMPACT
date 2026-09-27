@@ -26,6 +26,7 @@
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
 #include <itkImpactModelConfiguration.h>
+#include <itkImpactLossNormalization.h>
 
 #include <string>
 #include <vector>
@@ -114,8 +115,14 @@ public:
     m_MovingModelsConfiguration.push_back(configuration);
     this->Modified();
   }
+  /** Per kept layer, the number of its channels the cost compares, drawn at random once from the seeded
+   * generator (0 or a missing entry = all), as ImpactFineRegistration draws them at every iteration. */
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
+  /** Per kept layer, the number of principal components its channels are reduced to, fitted on the fixed
+   * features (0 or a missing entry = all), as ImpactFineRegistration::SetPCA. */
+  itkSetMacro(PCA, std::vector<unsigned int>);
+  itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
   /** Weight of each kept feature layer in the cost volume, one entry per layer kept across the
    * models, as ImpactFineRegistration::SetLayersWeight (a missing entry weighs 1). The cost sums
    * the squared differences over every channel of every layer, so without a weight a layer with
@@ -123,6 +130,11 @@ public:
    * coefficients are absolute, regularises it too little. Non-negative; unused on intensities. */
   itkSetMacro(LayersWeight, std::vector<float>);
   itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
+  /** Divide each layer's cost by its value at zero displacement, so every layer starts at 1 and
+   * LayersWeight weighs comparable quantities (see Impact::LossNormalization). Default on. */
+  itkSetMacro(NormalizeLosses, bool);
+  itkGetConstMacro(NormalizeLosses, bool);
+  itkBooleanMacro(NormalizeLosses);
   /** @} */
 
   /** Set/Get the torch device ("cpu", "cuda", "cuda:0", ...). */
@@ -179,7 +191,9 @@ private:
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
   std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
   std::vector<unsigned int>             m_SubsetFeatures;
+  std::vector<unsigned int>             m_PCA;
   std::vector<float>                    m_LayersWeight;
+  bool                                  m_NormalizeLosses{ true };
 
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };

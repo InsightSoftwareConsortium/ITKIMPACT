@@ -21,6 +21,7 @@
 
 #include "itkImpactModelConfigurationDetail.h"
 #include "itkImageToFeaturesMapInternals.h"
+#include "ImpactLoss.h" // NormalizeFeatureChannels
 
 #include <algorithm>
 #include <cmath>
@@ -169,9 +170,17 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
                   Impact::PatchCombineModeFromString(m_ModelConfiguration.GetPatchCombine()),
                   makeDestination);
 
+  const std::string & normalization = m_ModelConfiguration.GetFeatureNormalization();
   if (blendInPlace)
   {
-    // The output images already hold the maps -- `maps` are views of their pixels.
+    // The output images already hold the maps -- `maps` are views of their pixels, normalized where they lie.
+    for (const torch::Tensor & map : maps)
+    {
+      if (normalization != "none")
+      {
+        map.copy_(Impact::NormalizeFeatureChannels(map, normalization, 0));
+      }
+    }
     return;
   }
 
@@ -192,11 +201,13 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
     tensorToImageFilter->SetReferenceImage(this->GetInput(0));
     // Fit the PCA basis once (e.g. on the fixed image); reuse it when one was injected (e.g. on
     // the moving image) so both share the same basis.
+    // Normalized before the PCA, as every IMPACT consumer orders them.
+    const torch::Tensor map = Impact::NormalizeFeatureChannels(maps[i], normalization, 0);
     if (!m_Internals->principalComponents[i].defined())
     {
-      m_Internals->principalComponents[i] = Impact::PcaFit(maps[i], m_PCA);
+      m_Internals->principalComponents[i] = Impact::PcaFit(map, m_PCA);
     }
-    tensorToImageFilter->SetTensor(Impact::PcaTransform(maps[i], m_Internals->principalComponents[i]));
+    tensorToImageFilter->SetTensor(Impact::PcaTransform(map, m_Internals->principalComponents[i]));
     tensorToImageFilter->Update();
     this->ProcessObject::GetOutput(i)->Graft(tensorToImageFilter->GetOutput());
   }

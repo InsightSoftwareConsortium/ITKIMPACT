@@ -111,7 +111,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
 
   if (this->m_ImpactAssociate->GetNumberOfValidPoints() > 0)
   {
-    this->m_ImpactAssociate->m_Value = this->m_LossThreadStruct[0].GetValue();
+    itk::Impact::LossNormalization * normalization =
+      this->m_ImpactAssociate->m_NormalizeLosses ? &this->m_ImpactAssociate->m_LossNormalization : nullptr;
+    this->m_ImpactAssociate->m_Value = this->m_LossThreadStruct[0].GetValue(normalization);
     if (this->GetComputeDerivative())
     {
       // The losses accumulate the true gradient d(value)/dp. ITKv4 optimizers *add* the
@@ -119,7 +121,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
       // the descent direction -d(value)/dp. This matches the built-in v4 metrics: e.g.
       // MeanSquares accumulates +2*(fixed-moving)*dMoving/dp, which is -d(MSE)/dp. Hence
       // we write the negated IMPACT loss gradient here.
-      const DerivativeType gradient = this->m_LossThreadStruct[0].GetDerivative();
+      const DerivativeType gradient = this->m_LossThreadStruct[0].GetDerivative(normalization);
       DerivativeType &     result = *(this->m_ImpactAssociate->m_DerivativeResult);
       for (SizeValueType parameter = 0; parameter < gradient.GetSize(); ++parameter)
       {

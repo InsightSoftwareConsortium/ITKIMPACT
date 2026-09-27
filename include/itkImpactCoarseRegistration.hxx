@@ -169,16 +169,43 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       // member for the next image does not touch the tensor the completed forward already captured.
       for (const auto & cfg : m_FixedModelsConfiguration)
         SetupImageMetadata<FixedImageType>(cfg, m_FixedImage);
+      // Both tensors are on the fixed grid: each model sees them resampled from its spacing to its voxel size.
+      std::vector<double> fixedSpacing(ImageDimension);
+      for (unsigned int d = 0; d < ImageDimension; ++d)
+      {
+        fixedSpacing[d] = m_FixedImage->GetSpacing()[d];
+      }
       fixedLayers =
-        Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, m_SubsetFeatures);
+        Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing);
       for (const auto & cfg : movingConfigs)
         SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
-      movingLayers =
-        Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, m_SubsetFeatures);
+      movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, {}, false, fixedSpacing);
       if (fixedLayers.empty() || fixedLayers.size() != movingLayers.size())
       {
         itkExceptionMacro("ImpactCoarseRegistration: fixed/moving produced "
                           << fixedLayers.size() << " and " << movingLayers.size() << " feature layers.");
+      }
+      for (size_t l = 0; l < fixedLayers.size(); ++l)
+      {
+        // PCA as the fine stage does it: the basis fitted on the fixed features, both projected onto it, so the
+        // two stages compare the same channels.
+        const int64_t components = l < m_PCA.size() ? static_cast<int64_t>(m_PCA[l]) : 0;
+        if (components > 0 && components < fixedLayers[l].size(1))
+        {
+          const torch::Tensor basis = Impact::PcaFit(fixedLayers[l].squeeze(0), components);
+          fixedLayers[l] = Impact::PcaTransform(fixedLayers[l].squeeze(0), basis).unsqueeze(0).contiguous();
+          movingLayers[l] = Impact::PcaTransform(movingLayers[l].squeeze(0), basis).unsqueeze(0).contiguous();
+        }
+        // SubsetFeatures: that many of the layer's channels, drawn at random (from the seeded generator) once,
+        // since the coarse search runs once.
+        const int64_t kept = l < m_SubsetFeatures.size() ? static_cast<int64_t>(m_SubsetFeatures[l]) : 0;
+        if (kept > 0 && kept < fixedLayers[l].size(1))
+        {
+          const torch::Tensor channels =
+            torch::randperm(fixedLayers[l].size(1), torch::TensorOptions().dtype(torch::kLong)).narrow(0, 0, kept).to(device);
+          fixedLayers[l] = fixedLayers[l].index_select(1, channels).contiguous();
+          movingLayers[l] = movingLayers[l].index_select(1, channels).contiguous();
+        }
       }
     }
 
@@ -232,15 +259,21 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     if (featureMode)
     {
       std::vector<torch::Tensor> fixedCoarse, movingCoarse;
+      Impact::LossNormalization  normalization;
       for (size_t l = 0; l < fixedLayers.size(); ++l)
       {
         torch::Tensor fixedLayer = toCoarseGrid(fixedLayers[l]);
         torch::Tensor movingLayer = toCoarseGrid(movingLayers[l]);
-        // The cost is the SSD over the concatenated channels: a layer scaled by sqrt(w) weighs w in it.
-        const float weight = l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0f;
-        if (weight != 1.0f)
+        // The cost is the SSD over the concatenated channels: a layer scaled by sqrt(w) weighs w in it. With the
+        // normalization, w also divides the layer by its cost at zero displacement, so every layer starts at 1.
+        double weight = l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0;
+        if (m_NormalizeLosses)
         {
-          const double scale = std::sqrt(static_cast<double>(weight));
+          weight *= normalization.Latch(l, (fixedLayer - movingLayer).pow(2).sum(1).mean().template item<double>());
+        }
+        if (weight != 1.0)
+        {
+          const double scale = std::sqrt(weight);
           fixedLayer = fixedLayer * scale;
           movingLayer = movingLayer * scale;
         }
@@ -479,6 +512,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os
   os << indent << "GridSpacing: " << m_GridSpacing << std::endl;
   os << indent << "DisplacementHalfWidth: " << m_DisplacementHalfWidth << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;
+  os << indent << "NormalizeLosses: " << (m_NormalizeLosses ? "on" : "off") << std::endl;
   os << indent << "LayersWeight:";
   for (const float weight : m_LayersWeight)
   {

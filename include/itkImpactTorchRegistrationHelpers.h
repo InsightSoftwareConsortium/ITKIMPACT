@@ -31,6 +31,7 @@
 
 #include "itkImpactPatchTiling.h"
 #include "itkImpactModelConfigurationDetail.h"
+#include "ImpactLoss.h"
 
 #include <itkImage.h>
 #include <itkVector.h>
@@ -168,20 +169,60 @@ ImageToBatchTensor(const TImage * image)
   return torch::from_blob(buffer.data(), shape, torch::kFloat32).clone().unsqueeze(0).unsqueeze(0);
 }
 
+/** `image` ({1, C, spatial...}, spatial in tensor order, on a grid of `spacing` in ITK order) resampled to a model's
+ * `voxelSize` (ITK order) before the model sees it, by linear interpolation and without smoothing: a Gaussian before
+ * the downsampling was measured (elastix Static on MR/CT) to leave the Dice unchanged and fold more. Unchanged when no
+ * voxel size is set (fewer than Dim entries, or one not positive) or when it gives the image's own size. The corners
+ * stay aligned, which is how the registration filters place a feature layer of any size over the image. */
+template <unsigned int Dim>
+torch::Tensor
+ResampleToVoxelSize(const torch::Tensor & image, const std::vector<double> & spacing, const std::vector<float> & voxelSize)
+{
+  namespace F = torch::nn::functional;
+  if (spacing.size() != Dim || voxelSize.size() != Dim)
+  {
+    return image;
+  }
+  std::vector<int64_t> size(Dim);
+  bool                 same = true;
+  for (unsigned int i = 0; i < Dim; ++i) // tensor axis 2 + i holds ITK axis Dim - 1 - i
+  {
+    const double voxel = voxelSize[Dim - 1 - i];
+    if (!(voxel > 0.0))
+    {
+      return image;
+    }
+    const int64_t extent = image.size(2 + static_cast<int64_t>(i));
+    size[i] = std::max<int64_t>(1, std::llround(static_cast<double>(extent - 1) * spacing[Dim - 1 - i] / voxel) + 1);
+    same = same && size[i] == extent;
+  }
+  if (same)
+  {
+    return image;
+  }
+  if constexpr (Dim == 3)
+    return F::interpolate(image, F::InterpolateFuncOptions().size(size).mode(torch::kTrilinear).align_corners(true));
+  else
+    return F::interpolate(image, F::InterpolateFuncOptions().size(size).mode(torch::kBilinear).align_corners(true));
+}
+
 /** Run the configured TorchScript models on a whole-volume image tensor and return the
  * selected (layersMask) feature-map layers, each {1, C, spatial...} float32 on `device`,
  * detached (the model is not differentiated through; only the warp is). Optionally selects a
  * channel subset. Layers are returned at their NATIVE model resolution -- a segmentation-style
  * backbone may emit downsampled deeper layers -- and the caller brings each to the grid it needs
  * (the fine filter resamples its sampling grid to the layer; the coarse stage pools each layer to
- * the common coarse grid), so features are never upsampled to full res here. */
+ * the common coarse grid), so features are never upsampled to full res here. Given the image's
+ * `imageSpacing` (ITK order), each model sees the image resampled to its configured voxel size
+ * (ResampleToVoxelSize); without it, or with no voxel size set, it sees the image as it is. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
 ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
                      const torch::Tensor &                   imageTensor, // {1,1,spatial...} on device
                      const torch::Device &                   device,
                      const std::vector<unsigned int> &       subset,
-                     bool                                    withGrad = false)
+                     bool                                    withGrad = false,
+                     const std::vector<double> &             imageSpacing = {})
 {
   // withGrad=false (default): inference, features are constants (coarse stage, frozen-feature fine).
   // withGrad=true: keep the autograd graph so a caller can backpropagate a loss THROUGH the network to
@@ -224,6 +265,7 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
   for (const auto & config : configs)
   {
     ModelTo(config, device);
+    const torch::Tensor modelInput = ResampleToVoxelSize<Dim>(imageTensor, imageSpacing, config.GetVoxelSize());
 
     // A declared patch size means the model is meant to see the volume in pieces -- its trained
     // field of view, and bounded memory on a volume that does not fit whole. The tiling and its
@@ -234,19 +276,20 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
     if (!withGrad)
     {
       for (torch::Tensor & map : RunTiledModel(config,
-                                               imageTensor.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
+                                               modelInput.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
                                                device,
                                                device, // stays on the device; no host round-trip
                                                PatchCombineModeFromString(config.GetPatchCombine())))
       {
-        layers.push_back(keepSubset(map.unsqueeze(0)).contiguous());
+        layers.push_back(
+          keepSubset(Impact::NormalizeFeatureChannels(map.unsqueeze(0), config.GetFeatureNormalization(), 1)).contiguous());
       }
       continue;
     }
 
     const int64_t numberOfChannels = static_cast<int64_t>(config.GetNumberOfChannels());
 
-    torch::Tensor input = imageTensor.to(GetModelDtype(config));
+    torch::Tensor input = modelInput.to(GetModelDtype(config));
     if (numberOfChannels > 1)
     {
       std::vector<int64_t> repeats(Dim + 2, 1);
@@ -299,7 +342,8 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
       {
         continue;
       }
-      torch::Tensor layer = keepSubset(outputs[i].toTensor().to(torch::kFloat32));
+      torch::Tensor layer = keepSubset(
+        Impact::NormalizeFeatureChannels(outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1));
       // Keep the layer at its NATIVE resolution (see the function doc); the consumer resamples it.
       // Detach only in the no-grad path -- withGrad must preserve the graph back to `imageTensor`.
       layers.push_back(withGrad ? layer.contiguous() : layer.detach().contiguous());

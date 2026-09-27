@@ -353,6 +353,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       return F::adaptive_avg_pool2d(layer, F::AdaptiveAvgPool2dFuncOptions({ target[0], target[1] }));
   };
   const bool jacobianMode = featureMode && (m_Mode == "Jacobian");
+  if (m_LNCCKernel < 1 || m_LNCCKernel % 2 == 0)
+  {
+    // An even window has no centre voxel: the correlation would sit half a voxel off the point it is read at.
+    itkExceptionMacro("ImpactFineRegistration: LNCCKernel must be odd, got " << m_LNCCKernel << ".");
+  }
   // A "sliced" model has lower dimension than the image (a 2D backbone run slice-by-slice over z):
   // its feature map preserves the leading (z) axis 1:1 with the image, so the online loss can be taken
   // in z-chunks that line up by index (memory-bounded). A full-dimension model may downsample every
@@ -369,12 +374,55 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   std::vector<torch::Tensor>                    pcaBasis;          // per kept layer; undefined entry = no PCA
   std::vector<std::unique_ptr<Impact::Loss>>    losses;
   std::vector<float>                            layerWeights;
+  // SubsetFeatures: per kept layer, that many of its channels drawn at random at every iteration (0 = all).
+  std::vector<torch::Tensor> subsets; // per layer; an undefined entry keeps every channel
+  auto drawSubsets = [&](const std::vector<torch::Tensor> & layers) {
+    subsets.assign(layers.size(), torch::Tensor());
+    for (size_t l = 0; l < layers.size(); ++l)
+    {
+      const int64_t kept = l < m_SubsetFeatures.size() ? static_cast<int64_t>(m_SubsetFeatures[l]) : 0;
+      if (kept > 0 && kept < layers[l].size(1))
+      {
+        subsets[l] =
+          torch::randperm(layers[l].size(1), torch::TensorOptions().dtype(torch::kLong)).narrow(0, 0, kept).to(device);
+      }
+    }
+  };
+  auto pick = [&](size_t l, const torch::Tensor & layer) -> torch::Tensor {
+    return (l < subsets.size() && subsets[l].defined()) ? layer.index_select(1, subsets[l]) : layer;
+  };
+  // Layer l's loss between two feature maps on one grid ({1, C, spatial...}): a spatial distance (LNCC) reads the
+  // maps whole, the others compare their feature vectors voxel by voxel.
+  auto layerLoss = [&](size_t l, const torch::Tensor & fixedMap, const torch::Tensor & movingMap) -> torch::Tensor {
+    if (losses[l]->IsSpatial())
+    {
+      return losses[l]->forwardSpatial(fixedMap, movingMap, static_cast<int64_t>(m_LNCCKernel));
+    }
+    const int64_t channels = fixedMap.size(1);
+    return losses[l]->forwardValue(fixedMap.permute(toChannelLast).reshape({ -1, channels }),
+                                   movingMap.permute(toChannelLast).reshape({ -1, channels }));
+  };
   const std::vector<ImpactModelConfiguration> & movingConfigs =
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
+  // Every tensor here is on the fixed grid: each model sees it resampled from that spacing to its voxel size.
+  std::vector<double> fixedSpacing(ImageDimension);
+  bool                resamples = false;
+  for (unsigned int d = 0; d < ImageDimension; ++d)
+  {
+    fixedSpacing[d] = m_FixedImage->GetSpacing()[d];
+  }
+  for (const auto & config : m_FixedModelsConfiguration)
+  {
+    const std::vector<float> & voxel = config.GetVoxelSize();
+    for (unsigned int d = 0; d < ImageDimension && voxel.size() == ImageDimension; ++d)
+    {
+      resamples = resamples || (voxel[d] > 0.0f && std::abs(voxel[d] - fixedSpacing[d]) > 1e-6 * fixedSpacing[d]);
+    }
+  }
   // Extract the moving feature layers from an image tensor and project them onto the stored PCA
   // bases (used for the initial extraction and for the FeatureMapUpdateInterval re-extraction).
   auto extractMovingFeatures = [&](const torch::Tensor & imageTensor) -> std::vector<torch::Tensor> {
-    auto layers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, imageTensor, device, m_SubsetFeatures);
+    auto layers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, imageTensor, device, {}, false, fixedSpacing);
     for (size_t l = 0; l < layers.size() && l < pcaBasis.size(); ++l)
     {
       if (pcaBasis[l].defined())
@@ -393,10 +441,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     // member for the next image does not touch the tensor the completed forward already captured.
     for (const auto & cfg : m_FixedModelsConfiguration)
       SetupImageMetadata<FixedImageType>(cfg, m_FixedImage);
-    fixedLayers = Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, m_SubsetFeatures);
+    fixedLayers =
+      Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing);
     for (const auto & cfg : movingConfigs)
       SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
-    movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, m_SubsetFeatures);
+    movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, {}, false, fixedSpacing);
     if (fixedLayers.size() != movingLayers.size() || fixedLayers.empty())
     {
       itkExceptionMacro("ImpactFineRegistration: fixed and moving produced "
@@ -432,14 +481,23 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       // returning a wrong value/gradient; FeatureChunkSize=0 (whole volume) lifts the restriction.
       if (jacSliced && m_FeatureChunkSize != 0 && static_cast<int64_t>(m_FeatureChunkSize) < spatial[0])
       {
+        if (resamples)
+        {
+          // The chunks are z-slabs of the fixed grid, matched 1:1 with the fixed features: a model resampling
+          // the image to its voxel size would hand back slabs of another grid.
+          itkExceptionMacro("ImpactFineRegistration Jacobian mode: a model resampling the image to its voxel "
+                            "size cannot be taken in z-chunks. Set FeatureChunkSize=0 (whole volume), or give the "
+                            "model the image's own spacing.");
+        }
         for (size_t l = 0; l < losses.size(); ++l)
         {
           if (!losses[l]->IsPerPointMean())
           {
             itkExceptionMacro("ImpactFineRegistration Jacobian mode: distance '"
                               << (l < m_Distance.size() ? m_Distance[l] : std::string("L2"))
-                              << "' is a global statistic that does not decompose over the z-chunks used "
-                                 "to bound memory. Set FeatureChunkSize=0 (whole volume) to use it.");
+                              << "' does not decompose over the z-chunks used to bound memory (a global "
+                                 "statistic, or a window crossing the chunks). Set FeatureChunkSize=0 (whole "
+                                 "volume) to use it.");
           }
         }
       }
@@ -531,10 +589,29 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   m_MetricValuesPerIteration.clear();
   m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
 
+  // Every layer's loss divided by its value at the stage's first iteration, so each starts at 1 and
+  // LayersWeight weighs comparable quantities (see Impact::LossNormalization).
+  Impact::LossNormalization normalization;
+  auto normalized = [&](size_t l, const torch::Tensor & value) -> torch::Tensor {
+    if (!m_NormalizeLosses)
+    {
+      return value;
+    }
+    if (!normalization.IsLatched(l))
+    {
+      normalization.Latch(l, value.detach().template item<double>());
+    }
+    return value * normalization.Factor(l);
+  };
+
   torch::Tensor warped;
   for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
   {
     optimizer.zero_grad();
+    if (featureMode)
+    {
+      drawSubsets(jacobianMode ? fixedLayersOnline : fixedLayers);
+    }
 
     // Diffusion regularizer: sum over spatial axes of mean( forward-difference(field)^2 ).
     // As in ConvexAdam, the penalty is measured on the SMOOTHED control field (the same field that
@@ -579,15 +656,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         gridLeaf.set_requires_grad(true);
         const int64_t nLead = gridLeaf.size(1);
         const int64_t chunk = (m_FeatureChunkSize == 0) ? nLead : std::min<int64_t>(m_FeatureChunkSize, nLead);
-        double simValue = 0.0;
-        for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
-        {
-          const int64_t di = std::min(chunk, nLead - i0);
-          torch::Tensor gz = gridLeaf.narrow(1, i0, di);
+        // Each layer's loss over the z-chunk [i0, i0 + di) of the field.
+        auto chunkLosses = [&](int64_t i0, int64_t di, const torch::Tensor & gz, bool withGrad) {
           torch::Tensor movingChunk = F::grid_sample(movingT, gz, sampleOpts); // {1,1,di,...}, grad -> gridLeaf
           std::vector<torch::Tensor> ml =
-            Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingChunk, device, m_SubsetFeatures, true);
-          torch::Tensor simChunk = torch::zeros({}, theta.options());
+            Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingChunk, device, {}, withGrad);
+          std::vector<torch::Tensor> values;
           for (size_t l = 0; l < ml.size(); ++l)
           {
             torch::Tensor mll = ml[l];
@@ -596,11 +670,42 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
               mll = Impact::PcaTransform(mll.squeeze(0), pcaBasis[l]).unsqueeze(0);
             }
             mll = poolInPlane(mll); // features preserve z here, so only the trailing axes are resampled
-            const int64_t channels = mll.size(1);
-            torch::Tensor fixedChunk = fixedLayersOnline[l].narrow(2, i0, di);
-            torch::Tensor fFlat = fixedChunk.permute(toChannelLast).reshape({ -1, channels });
-            torch::Tensor mFlat = mll.permute(toChannelLast).reshape({ -1, channels });
-            simChunk = simChunk + layerWeights[l] * losses[l]->forwardValue(fFlat, mFlat);
+            values.push_back(layerLoss(l, pick(l, fixedLayersOnline[l].narrow(2, i0, di)), pick(l, mll)));
+          }
+          return values;
+        };
+        if (m_NormalizeLosses && !normalization.IsLatched(0))
+        {
+          // The factors take each layer's value over the whole volume, which the chunks only give piece by
+          // piece: one pass without the graph at the stage's starting field, the means recombined by the
+          // chunks' voxel fractions (exact for these per-point means).
+          torch::NoGradGuard  noGradPrepass;
+          std::vector<double> whole;
+          for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
+          {
+            const int64_t              di = std::min(chunk, nLead - i0);
+            std::vector<torch::Tensor> values = chunkLosses(i0, di, gridLeaf.detach().narrow(1, i0, di), false);
+            whole.resize(values.size(), 0.0);
+            for (size_t l = 0; l < values.size(); ++l)
+            {
+              whole[l] += values[l].template item<double>() * static_cast<double>(di) / static_cast<double>(nLead);
+            }
+          }
+          for (size_t l = 0; l < whole.size(); ++l)
+          {
+            normalization.Latch(l, whole[l]);
+          }
+        }
+        double simValue = 0.0;
+        for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
+        {
+          const int64_t              di = std::min(chunk, nLead - i0);
+          torch::Tensor              gz = gridLeaf.narrow(1, i0, di);
+          std::vector<torch::Tensor> values = chunkLosses(i0, di, gz, true);
+          torch::Tensor              simChunk = torch::zeros({}, theta.options());
+          for (size_t l = 0; l < values.size(); ++l)
+          {
+            simChunk = simChunk + layerWeights[l] * normalized(l, values[l]);
           }
           torch::Tensor weighted = simChunk * (static_cast<double>(di) / static_cast<double>(nLead));
           weighted.backward(); // accumulates into gridLeaf.grad; this chunk's network graph is freed
@@ -615,7 +720,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         // layer to the fixed layer's loss-grid resolution before comparing (a single backward pass).
         torch::Tensor              movingWarped = F::grid_sample(movingT, gridFromControl(theta), sampleOpts);
         std::vector<torch::Tensor> ml =
-          Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingWarped, device, m_SubsetFeatures, true);
+          Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingWarped, device, {}, true, fixedSpacing);
         torch::Tensor sim = torch::zeros({}, theta.options());
         for (size_t l = 0; l < ml.size(); ++l)
         {
@@ -633,10 +738,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             else
               mll = F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kBilinear).align_corners(true));
           }
-          const int64_t channels = mll.size(1);
-          torch::Tensor fFlat = fixedLayersOnline[l].permute(toChannelLast).reshape({ -1, channels });
-          torch::Tensor mFlat = mll.permute(toChannelLast).reshape({ -1, channels });
-          sim = sim + layerWeights[l] * losses[l]->forwardValue(fFlat, mFlat);
+          sim = sim + layerWeights[l] * normalized(l, layerLoss(l, pick(l, fixedLayersOnline[l]), pick(l, mll)));
         }
         torch::Tensor loss = sim + reg;
         loss.backward();
@@ -656,12 +758,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         similarity = torch::zeros({}, theta.options());
         for (size_t l = 0; l < movingLayers.size(); ++l)
         {
+          // Only the drawn channels are warped.
           torch::Tensor warpedLayer =
-            F::grid_sample(movingLayers[l], gridForLayerControl(smoothedResidual, l), sampleOpts);
-          const int64_t channels = movingLayers[l].size(1);
-          torch::Tensor fixedFlat = fixedLayers[l].permute(toChannelLast).reshape({ -1, channels });
-          torch::Tensor warpedFlat = warpedLayer.permute(toChannelLast).reshape({ -1, channels });
-          similarity = similarity + layerWeights[l] * losses[l]->forwardValue(fixedFlat, warpedFlat);
+            F::grid_sample(pick(l, movingLayers[l]), gridForLayerControl(smoothedResidual, l), sampleOpts);
+          similarity = similarity + layerWeights[l] * normalized(l, layerLoss(l, pick(l, fixedLayers[l]), warpedLayer));
         }
       }
       else
@@ -753,6 +853,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os, 
   os << indent << "NumberOfIterations: " << m_NumberOfIterations << std::endl;
   os << indent << "LearningRate: " << m_LearningRate << std::endl;
   os << indent << "RegularizationWeight: " << m_RegularizationWeight << std::endl;
+  os << indent << "NormalizeLosses: " << (m_NormalizeLosses ? "on" : "off") << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;
 }
 

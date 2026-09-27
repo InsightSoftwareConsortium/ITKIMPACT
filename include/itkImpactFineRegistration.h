@@ -29,6 +29,7 @@
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
 #include <itkImpactModelConfiguration.h>
+#include <itkImpactLossNormalization.h>
 
 #include <string>
 #include <vector>
@@ -129,10 +130,21 @@ public:
 
   itkSetMacro(Distance, std::vector<std::string>);
   itkGetConstReferenceMacro(Distance, std::vector<std::string>);
+  /** Divide each layer's loss by its value at the stage's first iteration, so every layer starts at 1
+   * and LayersWeight weighs comparable quantities (see Impact::LossNormalization). Default on. */
+  itkSetMacro(NormalizeLosses, bool);
+  itkGetConstMacro(NormalizeLosses, bool);
+  itkBooleanMacro(NormalizeLosses);
   itkSetMacro(LayersWeight, std::vector<float>);
   itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
+  /** Per kept layer, the number of its channels the loss compares, drawn at random at every iteration from
+   * the seeded generator (0 or a missing entry = all), as the metric's SubsetFeatures. */
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
+  /** Side, in voxels of the compared feature map, of the window the "LNCC" distance correlates each channel
+   * over. Odd; default 5. */
+  itkSetMacro(LNCCKernel, unsigned int);
+  itkGetConstMacro(LNCCKernel, unsigned int);
   itkSetMacro(PCA, std::vector<unsigned int>);
   itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
   /** @} */
@@ -257,6 +269,8 @@ private:
   unsigned int m_GridShrinkFactor{ 1 };
   unsigned int m_ControlGridSmoothingIterations{ 0 };
   int          m_FeatureMapUpdateInterval{ -1 };
+  bool         m_NormalizeLosses{ true };
+  unsigned int m_LNCCKernel{ 5 };
   std::string  m_Mode{ "Static" };
   unsigned int m_FeatureChunkSize{ 32 };
 

@@ -29,6 +29,7 @@
 #include <itkBSplineInterpolateImageFunction.h>
 #include <itkVectorImage.h>
 #include <itkImpactModelConfiguration.h>
+#include <itkImpactLossNormalization.h>
 #include <functional>
 #include <memory>
 
@@ -154,10 +155,17 @@ public:
   itkGetConstMacro(LayersWeight, std::vector<float>);
 
   /** Set/Get the loss function per layer, by registered name: "L1", "L2", "Cosine", "L1Cosine",
-   * "Dice", "DotProduct", "NCC" (the lookup is case sensitive); heterogeneous
-   * losses adapt to the nature of each feature representation.
+   * "Dice", "NCC" (the lookup is case sensitive); heterogeneous losses adapt to the nature of
+   * each feature representation. Every one is positive and 0 at a perfect match.
    */
   itkSetMacro(Distance, std::vector<std::string>);
+
+  /** Divide each layer's loss by its value at the first evaluation after Initialize(), so every
+   * layer starts at 1 and LayersWeight weighs comparable quantities (see Impact::LossNormalization).
+   * Default on. */
+  itkSetMacro(NormalizeLosses, bool);
+  itkGetConstMacro(NormalizeLosses, bool);
+  itkBooleanMacro(NormalizeLosses);
   itkGetConstMacro(Distance, std::vector<std::string>);
 
   /** Set/Get the number of principal components to keep per layer (PCA on the feature
@@ -298,6 +306,9 @@ private:
   mutable unsigned long     m_CurrentIteration{ 0 };
   std::string               m_Mode;
   std::string               m_FeatureMapsPath;
+  bool                      m_NormalizeLosses{ true };
+  /** Latched at the first evaluation after Initialize(); mutable because the evaluation is const. */
+  mutable Impact::LossNormalization m_LossNormalization;
   std::string               m_Device = "cpu";
   // Zero means "seed from the clock", which is what the per-work-unit generator does with it.
   // It must have a value even when the user never calls SetSeed(): it is read on every

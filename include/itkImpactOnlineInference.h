@@ -287,11 +287,14 @@ GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &              
           if (mask[it])
           {
             const size_t k = layers.size();
-            layers.push_back(outputsList[it]
-                               .toTensor()
-                               .index(itk::GetCentersIndexLayers(config)[a + k])
-                               .index_select(1, subsetsOfFeatures[a + k])
-                               .to(torch::kFloat32));
+            // The point's feature vector normalized over all its channels, before the subset keeps a few.
+            layers.push_back(Impact::NormalizeFeatureChannels(outputsList[it]
+                                                                .toTensor()
+                                                                .index(itk::GetCentersIndexLayers(config)[a + k])
+                                                                .to(torch::kFloat32),
+                                                              config.GetFeatureNormalization(),
+                                                              1)
+                               .index_select(1, subsetsOfFeatures[a + k]));
           }
         }
         for (size_t k = 0; k < layers.size(); ++k)
@@ -394,11 +397,14 @@ GenerateOutputsAndJacobian(
             continue;
           }
           const size_t  k = jacobians.size();
-          torch::Tensor layer = outputsList[it]
-                                  .toTensor()
-                                  .index(itk::GetCentersIndexLayers(config)[a + k])
-                                  .index_select(1, subsetsOfFeatures[a + k])
-                                  .to(torch::kFloat32);
+          // Normalized inside the graph, so the Jacobian below carries the normalization too.
+          torch::Tensor layer = Impact::NormalizeFeatureChannels(outputsList[it]
+                                                                   .toTensor()
+                                                                   .index(itk::GetCentersIndexLayers(config)[a + k])
+                                                                   .to(torch::kFloat32),
+                                                                 config.GetFeatureNormalization(),
+                                                                 1)
+                                  .index_select(1, subsetsOfFeatures[a + k]);
           torch::Tensor fixedLayer = fixedOutputsTensor[a + k].narrow(0, begin, n);
           torch::Tensor gradientModulator = losses[a + k]->updateValueAndGetGradientModulator(fixedLayer, layer);
           jacobians.push_back(

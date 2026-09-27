@@ -285,7 +285,7 @@ auto * transform = fine->GetDisplacementFieldTransform();
 | Core | `itk::ImpactModelConfiguration` | Configures and loads a TorchScript feature model. |
 | Core | `itk::ImageToFeaturesMap` | Patch-based TorchScript inference engine (tiling, overlap blending, PCA): dense feature maps — or any model output (segmentation, synthesis, denoising…). |
 | Core | `itk::ImageToTensorFilter` / `itk::TensorToImageFilter` | ITK image ↔ `torch::Tensor` bridge. |
-| Core | `ImpactLoss.h` (`itk::Impact`) | Differentiable feature losses: L1, L2, NCC, Cosine, L1Cosine, DotProduct, Dice. |
+| Core | `ImpactLoss.h` (`itk::Impact`) | Differentiable feature losses: L1, L2, NCC, Cosine, L1Cosine, Dice, all positive and 0 at a perfect match. |
 | Metric | `itk::ImpactImageToImageMetricv4` | Semantic similarity metric for the ITK v4 framework. |
 | Registration | `itk::ImpactCoarseRegistration` | ConvexAdam-style coarse discrete initializer (stage 1). |
 | Registration | `itk::ImpactFineRegistration` | Torch-backed Adam dense registration (fine stage). |
