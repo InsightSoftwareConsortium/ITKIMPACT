@@ -2532,6 +2532,49 @@ TEST(ImpactConvexAdam, CoarseInverseConsistency)
     EXPECT_LT(err[d], 1.5) << "inverse-consistent coarse axis " << d << " off";
 }
 
+// A layer's weight scales its share of the coarse SSD cost. A zero weight must give exactly the
+// field of the other layer alone (the cost then adds exact zeros for it), and a negative one is
+// refused. The toy model's layer 0 is a 4-channel convolution, its layer 1 the image twice.
+TEST(ImpactConvexAdam, CoarseLayerWeightScalesItsCost)
+{
+  using CoarseType = itk::ImpactCoarseRegistration<ImageType>;
+  using FieldType = CoarseType::DisplacementFieldType;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto moving = MakeTorchAdamPattern(24, 3.0, -2.5, 1.5, spacing, identity);
+
+  auto run = [&](const std::vector<bool> & mask, const std::vector<float> & weights) {
+    auto coarse = CoarseType::New();
+    coarse->SetFixedImage(fixed);
+    coarse->SetMovingImage(moving);
+    coarse->AddModelConfiguration(
+      itk::ImpactModelConfiguration(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, mask, false));
+    coarse->SetLayersWeight(weights);
+    coarse->SetGridSpacing(2);
+    coarse->SetDisplacementHalfWidth(3);
+    coarse->Update();
+    return FieldType::Pointer(coarse->GetDisplacementField());
+  };
+  auto maxDifference = [](const FieldType * a, const FieldType * b) {
+    double                                            worst = 0;
+    itk::ImageRegionConstIteratorWithIndex<FieldType> it(a, a->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+      for (unsigned int d = 0; d < 3; ++d)
+        worst = std::max(worst, std::abs(static_cast<double>(it.Get()[d]) - b->GetPixel(it.GetIndex())[d]));
+    return worst;
+  };
+
+  const auto convolutionOnly = run({ true, false }, {});
+  const auto imageOnly = run({ false, true }, {});
+  ASSERT_GT(maxDifference(convolutionOnly, imageOnly), 0.0) << "the layers must disagree for a weight to show";
+  EXPECT_EQ(maxDifference(run({ true, true }, { 0.f, 1.f }), imageOnly), 0.0) << "weight 0 must drop layer 0";
+  EXPECT_EQ(maxDifference(run({ true, true }, { 1.f, 0.f }), convolutionOnly), 0.0) << "weight 0 must drop layer 1";
+  EXPECT_THROW(run({ true, true }, { -1.f, 1.f }), itk::ExceptionObject);
+}
+
 namespace
 {
 // NCC of two same-grid images over the interior (margin away from borders).

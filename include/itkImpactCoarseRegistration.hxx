@@ -29,6 +29,7 @@
 
 #include <torch/torch.h>
 
+#include <cmath>
 #include <vector>
 
 namespace itk
@@ -108,6 +109,14 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
   else
   {
     const bool featureMode = !m_FixedModelsConfiguration.empty();
+    for (size_t l = 0; l < m_LayersWeight.size(); ++l)
+    {
+      if (!(m_LayersWeight[l] >= 0.0f)) // also rejects NaN
+      {
+        itkExceptionMacro("ImpactCoarseRegistration: LayersWeight[" << l << "] is " << m_LayersWeight[l]
+                                                                    << "; layer weights must be non-negative.");
+      }
+    }
 
     const torch::Device device(m_Device);
     torch::manual_seed(m_Seed);
@@ -225,8 +234,18 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       std::vector<torch::Tensor> fixedCoarse, movingCoarse;
       for (size_t l = 0; l < fixedLayers.size(); ++l)
       {
-        fixedCoarse.push_back(toCoarseGrid(fixedLayers[l]));
-        movingCoarse.push_back(toCoarseGrid(movingLayers[l]));
+        torch::Tensor fixedLayer = toCoarseGrid(fixedLayers[l]);
+        torch::Tensor movingLayer = toCoarseGrid(movingLayers[l]);
+        // The cost is the SSD over the concatenated channels: a layer scaled by sqrt(w) weighs w in it.
+        const float weight = l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0f;
+        if (weight != 1.0f)
+        {
+          const double scale = std::sqrt(static_cast<double>(weight));
+          fixedLayer = fixedLayer * scale;
+          movingLayer = movingLayer * scale;
+        }
+        fixedCoarse.push_back(fixedLayer);
+        movingCoarse.push_back(movingLayer);
       }
       FcFix = torch::cat(fixedCoarse, 1);
       FcMov = torch::cat(movingCoarse, 1);
@@ -460,6 +479,12 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os
   os << indent << "GridSpacing: " << m_GridSpacing << std::endl;
   os << indent << "DisplacementHalfWidth: " << m_DisplacementHalfWidth << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;
+  os << indent << "LayersWeight:";
+  for (const float weight : m_LayersWeight)
+  {
+    os << ' ' << weight;
+  }
+  os << std::endl;
 }
 
 } // end namespace itk

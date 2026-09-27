@@ -116,6 +116,13 @@ public:
   }
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
+  /** Weight of each kept feature layer in the cost volume, one entry per layer kept across the
+   * models, as ImpactFineRegistration::SetLayersWeight (a missing entry weighs 1). The cost sums
+   * the squared differences over every channel of every layer, so without a weight a layer with
+   * larger features or more channels outweighs the others, and the coupling schedule, whose
+   * coefficients are absolute, regularises it too little. Non-negative; unused on intensities. */
+  itkSetMacro(LayersWeight, std::vector<float>);
+  itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
   /** @} */
 
   /** Set/Get the torch device ("cpu", "cuda", "cuda:0", ...). */
@@ -171,7 +178,8 @@ private:
 
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
   std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
-  std::vector<unsigned int>       m_SubsetFeatures;
+  std::vector<unsigned int>             m_SubsetFeatures;
+  std::vector<float>                    m_LayersWeight;
 
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };
