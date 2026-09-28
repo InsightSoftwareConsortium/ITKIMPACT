@@ -383,7 +383,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
         distances.push_back(Impact::LossFactory::Instance().Create(
           m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)]));
         double weight = l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0;
-        if (m_NormalizeLosses)
+        if (m_NormalizeLosses && !m_BalanceLosses)
         {
           // At zero displacement: a point-wise distance latches the mean of its terms before the window averages
           // them (for L2 the value latched so far), NCC and LNCC the mean of their windowed cost.
@@ -469,15 +469,56 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
 
     // Solve the coarse problem for one (reference, to-shift) pair of cost sources: discrete cost volume over the dense
     // window (each layer's distance, weighed) + coupled-convex regularization -> {1, Dim, coarse...}.
-    auto solveCoarse = [&](const std::vector<torch::Tensor> & reference,
+    // BalanceLosses measures each layer's spread on the first volume (fixed onto moving): its own volume is built
+    // apart, S_l read off it, and it is added weighed by 1 / S_l; the common factor sum_k S_k / L follows once every
+    // layer is in. The backward problem reuses the weights.
+    m_LayerSpreads.clear();
+    const bool balance = featureMode && m_BalanceLosses;
+    auto       solveCoarse = [&](const std::vector<torch::Tensor> & reference,
                            const std::vector<torch::Tensor> & toShift) -> torch::Tensor {
       torch::Tensor ssd = torch::zeros(ssdShape, reference[0].options());
-      for (size_t l = 0; l < reference.size(); ++l)
+      if (balance && m_LayerSpreads.empty())
       {
-        if (weights[l] != 0.0) // a layer weighed 0 drops out exactly
+        torch::Tensor layerCost = torch::empty_like(ssd);
+        double        total = 0.0;
+        size_t        count = 0;
+        m_LayerSpreads.assign(reference.size(), 0.0);
+        for (size_t l = 0; l < reference.size(); ++l)
         {
+          if (weights[l] == 0.0)
+          {
+            continue;
+          }
+          layerCost.zero_();
           Impact::AccumulateCoarseCost<ImageDimension>(
-            ssd, *distances[l], reference[l], toShift[l], halfWidths, weights[l]);
+            layerCost, *distances[l], reference[l], toShift[l], halfWidths, 1.0);
+          const double spread =
+            (std::get<0>(layerCost.max(0)) - std::get<0>(layerCost.min(0))).mean().template item<double>();
+          m_LayerSpreads[l] = spread;
+          if (spread > 0.0 && std::isfinite(spread))
+          {
+            ssd.add_(layerCost, weights[l] / spread);
+            total += spread;
+            ++count;
+          }
+        }
+        const double common = count > 0 ? total / static_cast<double>(count) : 1.0;
+        ssd.mul_(common);
+        for (size_t l = 0; l < reference.size(); ++l) // the weights the backward problem reuses
+        {
+          const double spread = m_LayerSpreads[l];
+          weights[l] *= spread > 0.0 && std::isfinite(spread) ? common / spread : 0.0;
+        }
+      }
+      else
+      {
+        for (size_t l = 0; l < reference.size(); ++l)
+        {
+          if (weights[l] != 0.0) // a layer weighed 0 drops out exactly
+          {
+            Impact::AccumulateCoarseCost<ImageDimension>(
+              ssd, *distances[l], reference[l], toShift[l], halfWidths, weights[l]);
+          }
         }
       }
       torch::Tensor disp = smoothBox(gather(torch::argmin(ssd, 0)));
@@ -634,6 +675,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os
   os << indent << "DisplacementHalfWidth: " << m_DisplacementHalfWidth << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;
   os << indent << "NormalizeLosses: " << (m_NormalizeLosses ? "on" : "off") << std::endl;
+  os << indent << "BalanceLosses: " << (m_BalanceLosses ? "on" : "off") << std::endl;
   os << indent << "LayersWeight:";
   for (const float weight : m_LayersWeight)
   {

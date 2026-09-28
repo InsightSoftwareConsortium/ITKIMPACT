@@ -3815,6 +3815,64 @@ TEST(ImpactConvexAdam, AnisotropicSpacingRecoversADisplacementAlongEveryAxis)
   }
 }
 
+// Balanced on their spreads, the coarse layers move the argmin alike and keep the raw total: each layer's spread S_l
+// (the mean over the cells of its cost's range over the candidates) is measured on the first cost volume and the layer
+// weighed by mean_k S_k / S_l, so every weighed spread equals the mean and they sum to the raw total. The balanced run
+// is the raw run with those weights, and a layer's spread does not depend on the others.
+TEST(ImpactConvexAdam, BalancedCoarseLayersSpreadAlikeAndKeepTheRawTotal)
+{
+  using CoarseType = itk::ImpactCoarseRegistration<ImageType>;
+  using FieldType = CoarseType::DisplacementFieldType;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto moving = MakeTorchAdamPattern(24, 3.0, -2.5, 1.5, spacing, identity);
+  auto run = [&](bool balance, const std::vector<bool> & mask, const std::vector<float> & weights) {
+    auto coarse = CoarseType::New();
+    coarse->SetFixedImage(fixed);
+    coarse->SetMovingImage(moving);
+    coarse->AddModelConfiguration(
+      itk::ImpactModelConfiguration(ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, mask, false));
+    coarse->SetDistance({ "L2", "NCC" });
+    coarse->SetBalanceLosses(balance);
+    coarse->SetNormalizeLosses(false);
+    coarse->SetLayersWeight(weights);
+    coarse->SetGridSpacing(2);
+    coarse->SetDisplacementHalfWidth(3);
+    coarse->Update();
+    return coarse;
+  };
+  auto                      balanced = run(true, { true, true }, {});
+  const std::vector<double> spread = balanced->GetLayerSpreads();
+  ASSERT_EQ(spread.size(), 2u);
+  ASSERT_GT(spread[0], 0.0);
+  ASSERT_GT(spread[1], 0.0);
+  ASSERT_GT(std::abs(spread[0] - spread[1]), 0.1 * std::max(spread[0], spread[1])) << "the layers must differ";
+  const double              mean = (spread[0] + spread[1]) / 2.0;
+  const std::vector<double> factors{ mean / spread[0], mean / spread[1] };
+  EXPECT_NEAR(factors[0] * spread[0], factors[1] * spread[1], 1e-9 * mean) << "every layer spreads alike";
+  EXPECT_NEAR(factors[0] * spread[0] + factors[1] * spread[1], spread[0] + spread[1], 1e-9 * mean)
+    << "and the total spread is the raw one";
+  EXPECT_DOUBLE_EQ(run(true, { true, false }, {})->GetLayerSpreads()[0], spread[0]) << "a layer's own spread";
+  auto   weighted = run(false, { true, true }, { static_cast<float>(factors[0]), static_cast<float>(factors[1]) });
+  auto   raw = run(false, { true, true }, {});
+  double differenceWeighted = 0, differenceRaw = 0;
+  long   n = 0;
+  itk::ImageRegionConstIteratorWithIndex<FieldType> it(balanced->GetDisplacementField(),
+                                                       fixed->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it, ++n)
+    for (unsigned int d = 0; d < 3; ++d)
+    {
+      differenceWeighted += std::abs(it.Get()[d] - weighted->GetDisplacementField()->GetPixel(it.GetIndex())[d]);
+      differenceRaw += std::abs(it.Get()[d] - raw->GetDisplacementField()->GetPixel(it.GetIndex())[d]);
+    }
+  EXPECT_LT(differenceWeighted / n, 1e-3) << "the balanced run is the raw run weighed by the factors";
+  EXPECT_GT(differenceRaw / n, 1e-3) << "and not the raw run";
+  EXPECT_TRUE(raw->GetLayerSpreads().empty());
+}
+
 // PCA and the channel subset reach the coarse stage too: a subset drawn from the seeded generator gives the same
 // field twice, a subset of every channel changes nothing, and a PCA as wide as the layer changes nothing either.
 TEST(ImpactConvexAdam, CoarseTakesPCAAndASeededChannelSubset)

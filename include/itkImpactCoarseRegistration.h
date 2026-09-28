@@ -140,10 +140,29 @@ public:
   itkSetMacro(LayersWeight, std::vector<float>);
   itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
   /** Divide each layer's cost by its value at zero displacement, so every layer starts at 1 and
-   * LayersWeight weighs comparable quantities (see Impact::LossNormalization). Default on. */
+   * LayersWeight weighs comparable quantities (see Impact::LossNormalization). Default on; unused
+   * while BalanceLosses is on. */
   itkSetMacro(NormalizeLosses, bool);
   itkGetConstMacro(NormalizeLosses, bool);
   itkBooleanMacro(NormalizeLosses);
+  /** Balance the layers on how much each moves the argmin: layer l's spread S_l, the mean over the
+   * coarse cells of max_d C_l(x, d) - min_d C_l(x, d) over the candidate box, is measured on the first
+   * cost volume (fixed onto moving), and the layer is weighed by (sum_k S_k / L) / S_l times its
+   * LayersWeight, the sum and L running over the layers LayersWeight keeps with a spread above 0 (a
+   * layer of spread 0 moves nothing and adds nothing). Every layer then spreads alike, and their total
+   * spread is the raw one, the scale the coupling schedule's absolute coefficients are calibrated on --
+   * where NormalizeLosses divides a layer with a small cost at zero displacement into a spread that
+   * swamps the coupling. Takes the place of NormalizeLosses. Default off. */
+  itkSetMacro(BalanceLosses, bool);
+  itkGetConstMacro(BalanceLosses, bool);
+  itkBooleanMacro(BalanceLosses);
+  /** Per kept layer, the spread S_l the last run measured (see BalanceLosses), before any weight; empty
+   * while BalanceLosses is off. */
+  const std::vector<double> &
+  GetLayerSpreads() const
+  {
+    return m_LayerSpreads;
+  }
   /** @} */
 
   /** Set/Get the torch device ("cpu", "cuda", "cuda:0", ...). */
@@ -211,6 +230,8 @@ private:
   std::vector<std::string>              m_Distance;
   std::vector<float>                    m_LayersWeight;
   bool                                  m_NormalizeLosses{ true };
+  bool                                  m_BalanceLosses{ false };
+  std::vector<double>                   m_LayerSpreads;
 
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };
