@@ -145,6 +145,12 @@ public:
    * over. Odd; default 5. */
   itkSetMacro(LNCCKernel, unsigned int);
   itkGetConstMacro(LNCCKernel, unsigned int);
+  /** Share of each feature layer's voxels the Static similarity reads at every iteration, drawn anew at random
+   * from the seeded generator, as the metric draws its points (1 = every voxel, the default). Only the drawn
+   * points are warped, so an iteration costs that share of a full one. In (0, 1]; point-wise distances only
+   * (LNCC reads whole maps), Static mode only. */
+  itkSetMacro(SamplingPercentage, double);
+  itkGetConstMacro(SamplingPercentage, double);
   itkSetMacro(PCA, std::vector<unsigned int>);
   itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
   /** @} */
@@ -271,6 +277,7 @@ private:
   int          m_FeatureMapUpdateInterval{ -1 };
   bool         m_NormalizeLosses{ true };
   unsigned int m_LNCCKernel{ 5 };
+  double       m_SamplingPercentage{ 1.0 };
   std::string  m_Mode{ "Static" };
   unsigned int m_FeatureChunkSize{ 32 };
 

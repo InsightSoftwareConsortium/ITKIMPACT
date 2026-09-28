@@ -358,6 +358,18 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     // An even window has no centre voxel: the correlation would sit half a voxel off the point it is read at.
     itkExceptionMacro("ImpactFineRegistration: LNCCKernel must be odd, got " << m_LNCCKernel << ".");
   }
+  if (!(m_SamplingPercentage > 0.0 && m_SamplingPercentage <= 1.0))
+  {
+    itkExceptionMacro("ImpactFineRegistration: SamplingPercentage must lie in (0, 1], got " << m_SamplingPercentage
+                                                                                            << ".");
+  }
+  const bool sampled = m_SamplingPercentage < 1.0;
+  if (sampled && (!featureMode || jacobianMode))
+  {
+    // Refused rather than ignored: the intensity path and Jacobian mode compare whole images.
+    itkExceptionMacro("ImpactFineRegistration: SamplingPercentage samples the Static feature similarity; set a "
+                      "model in Static mode, or leave it at 1.");
+  }
   // A "sliced" model has lower dimension than the image (a 2D backbone run slice-by-slice over z):
   // its feature map preserves the leading (z) axis 1:1 with the image, so the online loss can be taken
   // in z-chunks that line up by index (memory-bounded). A full-dimension model may downsample every
@@ -401,6 +413,27 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     const int64_t channels = fixedMap.size(1);
     return losses[l]->forwardValue(fixedMap.permute(toChannelLast).reshape({ -1, channels }),
                                    movingMap.permute(toChannelLast).reshape({ -1, channels }));
+  };
+  // SamplingPercentage < 1: layer l's loss on that share of its voxels, drawn anew at every iteration. Only those
+  // points are warped: the fixed features are read at the drawn voxels, the moving ones at the same voxels displaced
+  // by the residual field, interpolated there as gridForLayerControl's resizeField would (align_corners both).
+  auto sampledLayerLoss = [&](size_t l, const torch::Tensor & smoothedResidual) -> torch::Tensor {
+    const int64_t       voxels = layerBaseGrid[l].numel() / ImageDimension;
+    const int64_t       count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(voxels)));
+    const torch::Tensor drawn =
+      torch::randint(voxels, { count }, torch::TensorOptions().dtype(torch::kLong).device(device));
+    const torch::Tensor  points = layerBaseGrid[l].reshape({ voxels, ImageDimension }).index_select(0, drawn);
+    std::vector<int64_t> pointShape(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, n, N}
+    pointShape[ImageDimension] = count;
+    pointShape[ImageDimension + 1] = ImageDimension;
+    const torch::Tensor displacement = F::grid_sample(smoothedResidual, points.reshape(pointShape), sampleOpts)
+                                         .reshape({ static_cast<int64_t>(ImageDimension), count })
+                                         .t(); // {n, N}, (z, y, x) in full-res voxels
+    const torch::Tensor warpedPoints = (points + (displacement / scale).flip(-1)).reshape(pointShape);
+    const torch::Tensor moving = F::grid_sample(pick(l, movingLayers[l]), warpedPoints, sampleOpts);
+    const int64_t       channels = moving.size(1);
+    const torch::Tensor fixed = pick(l, fixedLayers[l]).reshape({ channels, voxels }).index_select(1, drawn);
+    return losses[l]->forwardValue(fixed.t(), moving.reshape({ channels, count }).t());
   };
   const std::vector<ImpactModelConfiguration> & movingConfigs =
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
@@ -472,6 +505,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
       losses.push_back(Impact::LossFactory::Instance().Create(name));
       layerWeights.push_back(l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0f);
+      if (sampled && losses.back()->IsSpatial())
+      {
+        itkExceptionMacro("ImpactFineRegistration: distance '"
+                          << name
+                          << "' correlates windows of whole maps, "
+                             "which a random share of their voxels does not have; leave SamplingPercentage at 1.");
+      }
     }
     if (jacobianMode)
     {
@@ -758,6 +798,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         similarity = torch::zeros({}, theta.options());
         for (size_t l = 0; l < movingLayers.size(); ++l)
         {
+          if (sampled)
+          {
+            similarity = similarity + layerWeights[l] * normalized(l, sampledLayerLoss(l, smoothedResidual));
+            continue;
+          }
           // Only the drawn channels are warped.
           torch::Tensor warpedLayer =
             F::grid_sample(pick(l, movingLayers[l]), gridForLayerControl(smoothedResidual, l), sampleOpts);

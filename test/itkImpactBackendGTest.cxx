@@ -2470,6 +2470,70 @@ TEST(ImpactTorchAdam, SharedFeatureSettingsStillRecoverATranslation)
   }
 }
 
+// SamplingPercentage reads a random share of each layer's voxels at every iteration, warping only those points:
+// the stochastic estimate still recovers a known translation. (A 20-voxel cube has 8000 of them: at 5 %, 400 points
+// an iteration, Adam's constant step left the end 0.6 voxel off; a real image has far more at any share.)
+TEST(ImpactTorchAdam, SampledVoxelsStillRecoverATranslation)
+{
+  const double           tx = 1.5, ty = -2.0, tz = 1.0;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  for (const double share : { 0.25, 0.1 })
+  {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(MakeTorchAdamPattern(20, 0, 0, 0, spacing, identity));
+    filter->SetMovingImage(MakeTorchAdamPattern(20, tx, ty, tz, spacing, identity));
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false));
+    filter->SetDistance({ "L2" });
+    filter->SetSamplingPercentage(share);
+    filter->SetNumberOfIterations(300);
+    filter->SetLearningRate(0.2);
+    filter->SetRegularizationWeight(0.02);
+    filter->Update();
+    itk::Vector<double, 3> expected;
+    expected[0] = tx;
+    expected[1] = ty;
+    expected[2] = tz;
+    const itk::Vector<double, 3> error = InteriorMeanError(filter->GetDisplacementField(), expected, 5);
+    for (unsigned int d = 0; d < 3; ++d)
+      EXPECT_LT(error[d], 0.5) << share << " of the voxels: axis " << d << " off";
+  }
+}
+
+// A share of the voxels only means something to a point-wise distance of the Static feature similarity: outside
+// (0, 1], with LNCC (windows of whole maps), in Jacobian mode or without a model, it is refused.
+TEST(ImpactTorchAdam, SamplingRefusesWhatReadsWholeImages)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto attempt = [&](double share, const std::string & distance, const std::string & mode, bool model) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(MakeTorchAdamPattern(12, 0, 0, 0, spacing, identity));
+    filter->SetMovingImage(MakeTorchAdamPattern(12, 1, 0, 0, spacing, identity));
+    if (model)
+    {
+      filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+        ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false));
+      filter->SetDistance({ distance });
+      filter->SetMode(mode);
+    }
+    filter->SetSamplingPercentage(share);
+    filter->SetNumberOfIterations(2);
+    filter->Update();
+  };
+  EXPECT_NO_THROW(attempt(0.5, "L2", "Static", true));
+  EXPECT_THROW(attempt(0.0, "L2", "Static", true), itk::ExceptionObject);
+  EXPECT_THROW(attempt(1.5, "L2", "Static", true), itk::ExceptionObject);
+  EXPECT_THROW(attempt(0.5, "LNCC", "Static", true), itk::ExceptionObject);
+  EXPECT_THROW(attempt(0.5, "L2", "Jacobian", true), itk::ExceptionObject);
+  EXPECT_THROW(attempt(0.5, "L2", "Static", false), itk::ExceptionObject);
+}
+
 // A model of lower dimension is swept slice by slice and, in Jacobian mode, taken in z-chunks matched with the
 // fixed features: a voxel size that resamples the image would hand back chunks of another grid, so it is refused.
 TEST(ImpactTorchAdam, ChunkedJacobianRefusesAResamplingModel)
