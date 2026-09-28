@@ -93,9 +93,12 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration, const torch::
   std::vector<int64_t>   shape{ 1, static_cast<int64_t>(configuration.GetNumberOfChannels()) };
   shape.insert(shape.end(), patchSize.rbegin(), patchSize.rend());
 
+  // What the probe itself allocates at its peak: the memory already held on the device (a registration's images and
+  // grids) is not the patches', and counting it as theirs shrank the batch to a few patches.
   auto peakOf = [&](int64_t batch) {
     shape[0] = batch;
     c10::cuda::CUDACachingAllocator::resetPeakStats(index);
+    const int64_t held = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
     {
       torch::Tensor patch =
         torch::rand(shape, torch::TensorOptions().dtype(GetModelDtype(configuration)).device(device))
@@ -108,7 +111,7 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration, const torch::
       }
       torch::autograd::grad({ total }, { patch });
     }
-    return c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak;
+    return c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - held;
   };
   const int64_t peakOne = peakOf(1);
   const int64_t perPatch = std::max<int64_t>(peakOf(2) - peakOne, std::max<int64_t>(peakOne / 2, 1));

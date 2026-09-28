@@ -1802,7 +1802,14 @@ TEST(ImpactBackend, BatchBudgetIsMeasuredAndABatchOutOfMemoryIsHalved)
   EXPECT_EQ(itk::GetBatchSize(fx.configs[0]), 5);
   if (torch::cuda::is_available() && ITK_IMPACT_HAS_CUDA_MEMORY_STATS)
   {
-    EXPECT_GT(itk::Impact::MeasureBatchBudget(fx.configs[0], torch::Device(torch::kCUDA, 0)), 1);
+    const int64_t budget = itk::Impact::MeasureBatchBudget(fx.configs[0], torch::Device(torch::kCUDA, 0));
+    EXPECT_GT(budget, 1);
+    {
+      // What the device already holds (a registration's images) is not the patches': it takes its share of the free
+      // memory, not a share of every patch. Counted per patch, 256 MB held made the budget a few patches.
+      const torch::Tensor held = torch::empty({ 64 << 20 }, torch::TensorOptions().device(torch::kCUDA, 0));
+      EXPECT_GT(itk::Impact::MeasureBatchBudget(fx.configs[0], torch::Device(torch::kCUDA, 0)), budget / 4);
+    }
     itk::ModelTo(fx.configs[0], torch::Device(torch::kCPU));
   }
 
