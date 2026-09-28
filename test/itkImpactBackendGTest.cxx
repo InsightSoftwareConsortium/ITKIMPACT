@@ -2767,6 +2767,97 @@ TEST(ImpactTorchAdam, ChunkedJacobianRefusesAResamplingModel)
   EXPECT_THROW(filter->Update(), itk::ExceptionObject);
 }
 
+// Jacobian mode with a 2D model sweeps ONE axis of the image per iteration, drawn at random from the seed, chunked
+// along it: with the field held at zero (learning rate 0), every iteration's value is the images' features swept
+// along one of the three axes and compared whole, PCA-reduced on slices along that axis when asked; the three axes
+// all come up, and the same seed draws them in the same order.
+TEST(ImpactTorchAdam, TwoDimensionalJacobianSweepsARandomAxisEachIteration)
+{
+  const ImageType::SizeType size = { { 10, 9, 8 } };
+  ImageType::DirectionType  identity;
+  identity.SetIdentity();
+  auto                                             fixed = MakeNoiseImage(size, identity, 11);
+  auto                                             moving = MakeNoiseImage(size, identity, 12);
+  itk::ImpactModelConfiguration                    config(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt",
+                                       2,
+                                       1,
+                                                          { 0, 0 },
+                                                          { 0.f, 0.f, 0.f },
+                                                          { 0, 0 },
+                                                          { true, false },
+                                       false);
+  const std::vector<itk::ImpactModelConfiguration> configs{ config };
+  auto                                             run = [&](unsigned int pca, unsigned int seed) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->AddModelConfiguration(config);
+    filter->SetDistance({ "L2" });
+    filter->SetMode("Jacobian");
+    filter->SetFeatureChunkSize(3);
+    filter->SetPCA({ pca });
+    filter->NormalizeLossesOff();
+    filter->SetLearningRate(0.0);
+    filter->SetRegularizationWeight(0.0);
+    filter->SetNumberOfIterations(20);
+    filter->SetSeed(seed);
+    filter->Update();
+    return filter->GetMetricValuesPerIteration();
+  };
+  for (const unsigned int pca : { 0u, 2u })
+  {
+    std::array<double, 3> expected{};
+    for (unsigned int axis = 0; axis < 3; ++axis)
+    {
+      auto layerOf = [&](ImageType::Pointer image) {
+        return itk::Impact::ExtractFeatureLayers<3>(configs,
+                                                    itk::Impact::ImageToBatchTensor(image.GetPointer()),
+                                                    torch::kCPU,
+                                                    {},
+                                                    false,
+                                                    {},
+                                                    static_cast<int>(axis))[0]
+          .squeeze(0);
+      };
+      torch::Tensor f = layerOf(fixed);
+      torch::Tensor m = layerOf(moving);
+      if (pca > 0)
+      {
+        torch::Tensor basis;
+        f = itk::Impact::PcaReduce(f, basis, pca, 3 - axis);
+        m = itk::Impact::PcaReduce(m, basis, pca, 3 - axis);
+      }
+      expected[axis] = (f - m).pow(2).sum(0).mean().item<double>();
+    }
+    const std::vector<double> values = run(pca, 5);
+    ASSERT_EQ(values.size(), 20u);
+    std::array<int, 3> drawn{ 0, 0, 0 };
+    for (const double value : values)
+    {
+      int axis = -1;
+      for (int a = 0; a < 3; ++a)
+      {
+        if (std::abs(value - expected[a]) <= 1e-4 * expected[a])
+        {
+          axis = a;
+        }
+      }
+      ASSERT_GE(axis, 0) << "PCA " << pca << ": an iteration's value " << value << " is no axis' sweep (" << expected[0]
+                         << ", " << expected[1] << ", " << expected[2] << ")";
+      ++drawn[axis];
+    }
+    for (unsigned int a = 0; a < 3; ++a)
+    {
+      EXPECT_GT(drawn[a], 0) << "PCA " << pca << ": axis " << a << " never drawn in 20 iterations";
+    }
+    if (pca == 0)
+    {
+      EXPECT_EQ(run(pca, 5), values) << "the same seed must draw the same axes";
+      EXPECT_NE(run(pca, 6), values) << "another seed must draw other axes";
+    }
+  }
+}
+
 TEST(ImpactTorchAdam, FeaturePCA)
 {
   const double             tx = 1.5, ty = -2.0, tz = 1.0;

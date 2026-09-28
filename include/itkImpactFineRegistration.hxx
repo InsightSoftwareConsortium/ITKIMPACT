@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -327,21 +328,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       return F::adaptive_avg_pool2d(layer, F::AdaptiveAvgPool2dFuncOptions({ target[0], target[1] }));
   };
 
-  // "Jacobian" (online) mode: pool ONLY the trailing spatial axes to the loss resolution and keep the
-  // leading axis (z, the chunked axis) native, so a per-z-chunk of re-extracted moving features lines
-  // up with the same slice range of the fixed features.
-  auto poolInPlane = [&](const torch::Tensor & layer) -> torch::Tensor {
+  // "Jacobian" (online) mode with a swept model: pool every axis but the swept one (tensor spatial index `keep`) to
+  // the loss resolution and keep that one native, so a chunk of re-extracted moving slices lines up with the same
+  // slice range of the fixed features.
+  auto poolExcept = [&](const torch::Tensor & layer, int64_t keep) -> torch::Tensor {
     std::vector<int64_t> target(ImageDimension);
-    target[0] = layer.size(2); // leading axis kept native
-    bool needs = false;
-    for (unsigned int d = 1; d < ImageDimension; ++d)
+    bool                 needs = false;
+    for (unsigned int d = 0; d < ImageDimension; ++d)
     {
       const int64_t nat = layer.size(2 + static_cast<int64_t>(d));
-      target[d] = std::min(nat, coarseSpatial[d]);
-      if (target[d] != nat)
-      {
-        needs = true;
-      }
+      target[d] = static_cast<int64_t>(d) == keep ? nat : std::min(nat, coarseSpatial[d]);
+      needs = needs || target[d] != nat;
     }
     if (!needs)
     {
@@ -370,10 +367,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     itkExceptionMacro("ImpactFineRegistration: SamplingPercentage samples the Static feature similarity; set a "
                       "model in Static mode, or leave it at 1.");
   }
-  // A "sliced" model has lower dimension than the image (a 2D backbone run slice-by-slice over z):
-  // its feature map preserves the leading (z) axis 1:1 with the image, so the online loss can be taken
-  // in z-chunks that line up by index (memory-bounded). A full-dimension model may downsample every
-  // axis, so its features are compared whole and aligned by resampling, like the itkv4 metric.
+  // A "sliced" model has lower dimension than the image (a 2D backbone run slice by slice): its feature map keeps the
+  // swept axis 1:1 with the image, so the online loss can be taken in chunks of slices that line up by index
+  // (memory-bounded). Each iteration sweeps ONE image axis drawn at random (seeded): a dense engine draws no points,
+  // so it cannot give each point a random plane of its own as the metric does; turning the volume by a random rotation
+  // spent 22 to 57 % of the network's work on corners brought in from outside the image (measured in FireANTs),
+  // while one axis of the image costs one sweep and shows the network the anatomy in every orientation over the
+  // iterations. A full-dimension model may downsample every axis, so its features are compared whole and aligned by
+  // resampling, like the itkv4 metric.
   const bool jacSliced = jacobianMode && !m_FixedModelsConfiguration.empty() &&
                          m_FixedModelsConfiguration[0].GetDimension() < ImageDimension;
 
@@ -382,7 +383,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // Intensity mode skips this and compares raw voxels.
   std::vector<torch::Tensor>                    fixedLayers;
   std::vector<torch::Tensor>                    movingLayers;
-  std::vector<torch::Tensor>                    fixedLayersOnline; // "Jacobian" mode: fixed features, in-plane pooled
+  std::vector<torch::Tensor>                    fixedLayersOnline; // "Jacobian" mode: fixed features, pooled
   std::vector<torch::Tensor>                    pcaBasis;          // per kept layer; undefined entry = no PCA
   std::vector<std::unique_ptr<Impact::Loss>>    losses;
   std::vector<float>                            layerWeights;
@@ -452,18 +453,34 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       resamples = resamples || (voxel[d] > 0.0f && std::abs(voxel[d] - fixedSpacing[d]) > 1e-6 * fixedSpacing[d]);
     }
   }
-  // A 2D model sweeps the axis closest to head-feet (every tensor here is on the fixed grid); the dense Jacobian
-  // mode chunks the leading one.
-  const int                  sweepAxis = jacSliced
-                                           ? static_cast<int>(ImageDimension) - 1
-                                           : static_cast<int>(Impact::HeadFeetAxis(m_FixedImage->GetDirection(), ImageDimension));
+  // Outside the dense Jacobian mode, a 2D model sweeps the axis closest to head-feet; every tensor here is on the
+  // fixed grid.
+  const unsigned int         headFeetAxis = Impact::HeadFeetAxis(m_FixedImage->GetDirection(), ImageDimension);
   const std::vector<int64_t> pcaSweep =
-    Impact::PcaSweepDimensions<ImageDimension>(m_FixedModelsConfiguration, static_cast<unsigned int>(sweepAxis));
+    Impact::PcaSweepDimensions<ImageDimension>(m_FixedModelsConfiguration, headFeetAxis);
+  // Layer l's number of principal components, 0 for none (unset, or not fewer than its channels).
+  auto pcaComponents = [&](size_t l, int64_t channels) -> int64_t {
+    const int64_t components = l < m_PCA.size() ? static_cast<int64_t>(m_PCA[l]) : 0;
+    return components > 0 && components < channels ? components : 0;
+  };
+  // Each image's metadata, for the metadata-aware models (nArgs >= 4, e.g. SAM): their own normalisation stats, not
+  // the undefined default. Fixed and moving configurations added through AddModelConfiguration share one impl, so the
+  // image a model runs on is set right before it runs; a forward already run keeps the tensors it was handed.
+  const ImpactImageMetadata fixedMetadata =
+    featureMode ? ComputeImageMetadata<FixedImageType>(m_FixedImage) : ImpactImageMetadata{};
+  const ImpactImageMetadata movingMetadata =
+    featureMode ? ComputeImageMetadata<MovingImageType>(movingOnFixed) : ImpactImageMetadata{};
+  auto useMetadata = [](const std::vector<ImpactModelConfiguration> & configs, const ImpactImageMetadata & metadata) {
+    for (const auto & config : configs)
+    {
+      config.GetImpl()->imageMetadata = metadata;
+    }
+  };
   // Extract the moving feature layers from an image tensor and project them onto the stored PCA
   // bases (used for the initial extraction and for the FeatureMapUpdateInterval re-extraction).
   auto extractMovingFeatures = [&](const torch::Tensor & imageTensor) -> std::vector<torch::Tensor> {
     auto layers = Impact::ExtractFeatureLayers<ImageDimension>(
-      movingConfigs, imageTensor, device, {}, false, fixedSpacing, sweepAxis);
+      movingConfigs, imageTensor, device, {}, false, fixedSpacing, static_cast<int>(headFeetAxis));
     for (size_t l = 0; l < layers.size() && l < pcaBasis.size(); ++l)
     {
       if (pcaBasis[l].defined())
@@ -473,43 +490,48 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     }
     return layers;
   };
+  // Dense Jacobian mode with a swept model: per ITK axis, the fixed layers swept along it -- PCA-reduced on their own
+  // slices along it, pooled to the loss grid but along it -- and each layer's PCA basis. Built the first time the axis
+  // is drawn: at most one set per axis.
+  struct SweptFixedLayers
+  {
+    std::vector<torch::Tensor> layers;
+    std::vector<torch::Tensor> basis;
+  };
+  std::vector<SweptFixedLayers> sweptFixed(ImageDimension);
+  auto                          fixedSweptAlong = [&](unsigned int axis) -> const SweptFixedLayers & {
+    SweptFixedLayers & entry = sweptFixed[axis];
+    if (entry.layers.empty())
+    {
+      useMetadata(m_FixedModelsConfiguration, fixedMetadata);
+      entry.layers = Impact::ExtractFeatureLayers<ImageDimension>(
+        m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing, static_cast<int>(axis));
+      useMetadata(movingConfigs, movingMetadata);
+      const std::vector<int64_t> sweep = Impact::PcaSweepDimensions<ImageDimension>(m_FixedModelsConfiguration, axis);
+      const auto                 keep = static_cast<int64_t>(ImageDimension - 1 - axis); // its tensor spatial index
+      entry.basis.resize(entry.layers.size());
+      for (size_t l = 0; l < entry.layers.size(); ++l)
+      {
+        torch::Tensor layer = entry.layers[l];
+        if (const int64_t components = pcaComponents(l, layer.size(1)); components > 0)
+        {
+          layer = Impact::PcaReduce(layer.squeeze(0), entry.basis[l], components, sweep[l]).unsqueeze(0);
+        }
+        entry.layers[l] = poolExcept(layer, keep).contiguous();
+      }
+    }
+    return entry;
+  };
+  std::mt19937                                axisGenerator(m_Seed);
+  std::uniform_int_distribution<unsigned int> axisDistribution(0, ImageDimension - 1);
   if (featureMode)
   {
-    // Give metadata-aware models (nArgs>=4, e.g. SAM) each image's OWN normalisation stats
-    // (min/max/mean/sigma), not the undefined default. Fixed and moving configs added via
-    // AddModelConfiguration share one impl, so set each image's stats immediately BEFORE extracting
-    // that image: the extraction reads the stats there (serialized on the stream), and reassigning the
-    // member for the next image does not touch the tensor the completed forward already captured.
-    for (const auto & cfg : m_FixedModelsConfiguration)
-      SetupImageMetadata<FixedImageType>(cfg, m_FixedImage);
-    fixedLayers = Impact::ExtractFeatureLayers<ImageDimension>(
-      m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing, sweepAxis);
-    for (const auto & cfg : movingConfigs)
-      SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
-    movingLayers =
-      Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, {}, false, fixedSpacing, sweepAxis);
-    if (fixedLayers.size() != movingLayers.size() || fixedLayers.empty())
+    size_t layerCount = 0;
+    for (const auto & config : m_FixedModelsConfiguration)
     {
-      itkExceptionMacro("ImpactFineRegistration: fixed and moving produced "
-                        << fixedLayers.size() << " and " << movingLayers.size()
-                        << " feature layers; they must match and be non-empty.");
+      layerCount += NumberOfKeptLayers(config);
     }
-    // Optional per-layer PCA: fit the basis on the fixed features and project BOTH onto it so
-    // they live in a consistent reduced space (PCA[l] components; 0 or >= channels = no-op).
-    pcaBasis.resize(fixedLayers.size());
-    for (size_t l = 0; l < fixedLayers.size(); ++l)
-    {
-      const int64_t components = (l < m_PCA.size()) ? static_cast<int64_t>(m_PCA[l]) : 0;
-      if (components <= 0 || components >= fixedLayers[l].size(1))
-      {
-        continue;
-      }
-      fixedLayers[l] =
-        Impact::PcaReduce(fixedLayers[l].squeeze(0), pcaBasis[l], components, pcaSweep[l]).unsqueeze(0).contiguous();
-      movingLayers[l] =
-        Impact::PcaReduce(movingLayers[l].squeeze(0), pcaBasis[l], components, pcaSweep[l]).unsqueeze(0).contiguous();
-    }
-    for (size_t l = 0; l < fixedLayers.size(); ++l)
+    for (size_t l = 0; l < layerCount; ++l)
     {
       const std::string name =
         m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
@@ -523,46 +545,90 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
                              "which a random share of their voxels does not have; leave SamplingPercentage at 1.");
       }
     }
+    if (!jacSliced)
+    {
+      // The moving features are extracted here for Static mode only: the Jacobian mode re-extracts them from the
+      // warped image at every iteration.
+      useMetadata(m_FixedModelsConfiguration, fixedMetadata);
+      fixedLayers = Impact::ExtractFeatureLayers<ImageDimension>(
+        m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing, static_cast<int>(headFeetAxis));
+      if (!jacobianMode)
+      {
+        useMetadata(movingConfigs, movingMetadata);
+        movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(
+          movingConfigs, movingT, device, {}, false, fixedSpacing, static_cast<int>(headFeetAxis));
+      }
+      if (layerCount == 0 || fixedLayers.size() != layerCount || (!jacobianMode && movingLayers.size() != layerCount))
+      {
+        itkExceptionMacro("ImpactFineRegistration: fixed and moving produced "
+                          << fixedLayers.size() << " and " << movingLayers.size() << " feature layers where "
+                          << layerCount << " are kept; they must match and be non-empty.");
+      }
+      // Optional per-layer PCA: fit the basis on the fixed features and project BOTH onto it so
+      // they live in a consistent reduced space (PCA[l] components; 0 or >= channels = no-op).
+      pcaBasis.resize(fixedLayers.size());
+      for (size_t l = 0; l < fixedLayers.size(); ++l)
+      {
+        const int64_t components = pcaComponents(l, fixedLayers[l].size(1));
+        if (components == 0)
+        {
+          continue;
+        }
+        fixedLayers[l] =
+          Impact::PcaReduce(fixedLayers[l].squeeze(0), pcaBasis[l], components, pcaSweep[l]).unsqueeze(0).contiguous();
+        if (!jacobianMode)
+        {
+          movingLayers[l] = Impact::PcaReduce(movingLayers[l].squeeze(0), pcaBasis[l], components, pcaSweep[l])
+                              .unsqueeze(0)
+                              .contiguous();
+        }
+      }
+    }
+    // Every later extraction runs on the moving image.
+    useMetadata(movingConfigs, movingMetadata);
     if (jacobianMode)
     {
-      // Chunked z-evaluation (a sliced model split to bound memory) recombines per-chunk means by their
-      // point-count weights, which equals the whole-volume loss ONLY for a per-point-mean distance.
-      // Reject a global distance (e.g. NCC) when chunking is actually active, rather than silently
-      // returning a wrong value/gradient; FeatureChunkSize=0 (whole volume) lifts the restriction.
-      if (jacSliced && m_FeatureChunkSize != 0 && static_cast<int64_t>(m_FeatureChunkSize) < spatial[0])
+      if (jacSliced)
       {
         if (resamples)
         {
-          // The chunks are z-slabs of the fixed grid, matched 1:1 with the fixed features: a model resampling
-          // the image to its voxel size would hand back slabs of another grid.
-          itkExceptionMacro("ImpactFineRegistration Jacobian mode: a model resampling the image to its voxel "
-                            "size cannot be taken in z-chunks. Set FeatureChunkSize=0 (whole volume), or give the "
-                            "model the image's own spacing.");
+          // The moving slices are compared index by index with the fixed features of the same slices: a model
+          // resampling the image to its voxel size would hand back slices of another grid.
+          itkExceptionMacro("ImpactFineRegistration Jacobian mode: a model of lower dimension than the image is "
+                            "compared slice by slice, which a model resampling the image to its voxel size breaks; "
+                            "give it the image's own spacing (or no voxel size).");
         }
-        for (size_t l = 0; l < losses.size(); ++l)
+        // Chunked evaluation (a sliced model split to bound memory) recombines per-chunk means by their point-count
+        // weights, which equals the whole-volume loss ONLY for a per-point-mean distance. Reject a global distance
+        // (e.g. NCC) when chunking can be active along the axis drawn, rather than silently returning a wrong
+        // value/gradient; FeatureChunkSize=0 (whole volume) lifts the restriction.
+        const int64_t longest = *std::max_element(spatial.begin(), spatial.end());
+        if (m_FeatureChunkSize != 0 && static_cast<int64_t>(m_FeatureChunkSize) < longest)
         {
-          if (!losses[l]->IsPerPointMean())
+          for (size_t l = 0; l < losses.size(); ++l)
           {
-            itkExceptionMacro("ImpactFineRegistration Jacobian mode: distance '"
-                              << (l < m_Distance.size() ? m_Distance[l] : std::string("L2"))
-                              << "' does not decompose over the z-chunks used to bound memory (a global "
-                                 "statistic, or a window crossing the chunks). Set FeatureChunkSize=0 (whole "
-                                 "volume) to use it.");
+            if (!losses[l]->IsPerPointMean())
+            {
+              itkExceptionMacro("ImpactFineRegistration Jacobian mode: distance '"
+                                << (l < m_Distance.size() ? m_Distance[l] : std::string("L2"))
+                                << "' does not decompose over the chunks of slices used to bound memory (a global "
+                                   "statistic, or a window crossing the chunks). Set FeatureChunkSize=0 (whole "
+                                   "volume) to use it.");
+            }
           }
         }
       }
-      // Online mode: precompute the fixed features on the comparison grid. The moving features are
-      // re-extracted from the warped image every iteration in the Adam loop and brought to this same
-      // grid, so movingLayers / layerBaseGrid (the frozen-warp machinery) are unused here. A sliced
-      // model keeps the leading axis native (in-plane pooled) for 1:1 z-chunking; a full-dimension
-      // model is pooled to the whole loss grid and matched by resampling.
-      fixedLayersOnline.resize(fixedLayers.size());
-      for (size_t l = 0; l < fixedLayers.size(); ++l)
+      else
       {
-        fixedLayersOnline[l] =
-          (jacSliced ? poolInPlane(fixedLayers[l]) : poolLayerToLoss(fixedLayers[l])).contiguous();
+        // Online mode: precompute the fixed features on the comparison grid. The moving features are
+        // re-extracted from the warped image every iteration in the Adam loop and brought to this same
+        // grid by resampling, so movingLayers / layerBaseGrid (the frozen-warp machinery) are unused here.
+        fixedLayersOnline.resize(fixedLayers.size());
+        for (size_t l = 0; l < fixedLayers.size(); ++l)
+        {
+          fixedLayersOnline[l] = poolLayerToLoss(fixedLayers[l]).contiguous();
+        }
       }
-      movingLayers.clear();
     }
     else
     {
@@ -658,9 +724,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
   {
     optimizer.zero_grad();
+    // Dense Jacobian mode with a swept model: the image axis this iteration sweeps, and its fixed layers.
+    const unsigned int       sweptAxis = jacSliced ? axisDistribution(axisGenerator) : 0;
+    const SweptFixedLayers * fixedSwept = jacSliced ? &fixedSweptAlong(sweptAxis) : nullptr;
     if (featureMode)
     {
-      drawSubsets(jacobianMode ? fixedLayersOnline : fixedLayers);
+      drawSubsets(jacSliced ? fixedSwept->layers : jacobianMode ? fixedLayersOnline : fixedLayers);
     }
 
     // Diffusion regularizer: sum over spatial axes of mean( forward-difference(field)^2 ).
@@ -690,37 +759,58 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       // "Jacobian" (online) mode: warp the moving IMAGE by the current field and RE-EXTRACT features
       // through the network with autograd, descending on the true loss F(warp(I)) whose gradient carries
-      // the network term d(feature)/d(displacement). Moving and fixed features are matched on a common
-      // grid by RESAMPLING (never index alignment), so any feature resolution is handled -- like the
-      // itkv4 metric. A model whose features downsample every axis (full-dimension) is compared whole;
-      // a sliced model (features preserve z) is taken in z-chunks to bound peak memory.
+      // the network term d(feature)/d(displacement). A model whose features downsample every axis
+      // (full-dimension) is compared whole, its features matched to the fixed ones by RESAMPLING, like the
+      // itkv4 metric; a sliced model (features keep the swept axis) is taken in chunks of slices along the
+      // axis drawn for this iteration, to bound peak memory.
       if (jacSliced)
       {
-        // Peak memory is bounded by taking the field's leading (z) axis in chunks: each chunk backprops
+        // Peak memory is bounded by taking the field's swept axis in chunks: each chunk backprops
         // into a detached grid leaf -- its network subgraph is then freed -- and the shared field->grid
         // graph is traversed once at the end. The per-point feature distance decomposes over voxels, so
         // weighting a chunk by its voxel fraction makes the accumulated gradient equal the whole mean's.
+        const auto keep = static_cast<int64_t>(ImageDimension - 1 - sweptAxis); // tensor spatial index swept
         reg.backward();
         const torch::Tensor fullGrid = gridFromControl(theta); // {1, spatial..., Dim}, graph to theta
         torch::Tensor       gridLeaf = fullGrid.detach().clone();
         gridLeaf.set_requires_grad(true);
-        const int64_t nLead = gridLeaf.size(1);
+        const int64_t nLead = gridLeaf.size(1 + keep);
         const int64_t chunk = (m_FeatureChunkSize == 0) ? nLead : std::min<int64_t>(m_FeatureChunkSize, nLead);
-        // Each layer's loss over the z-chunk [i0, i0 + di) of the field.
+        // A swept model's PCA centres the moving features by their own mean over the slices its basis was read on
+        // (Impact::PcaSlices), which the chunks only give piece by piece: taken from those slices of the moving
+        // image as the field warps it now, without the graph, as the FireANTs engine detaches it.
+        std::vector<torch::Tensor> movingMeans(fixedSwept->basis.size());
+        if (std::any_of(fixedSwept->basis.begin(), fixedSwept->basis.end(), [](const torch::Tensor & basis) {
+              return basis.defined();
+            }))
+        {
+          const torch::Tensor slices =
+            F::grid_sample(movingT, Impact::PcaSlices(gridLeaf.detach(), 1 + keep), sampleOpts);
+          const std::vector<torch::Tensor> ml = Impact::ExtractFeatureLayers<ImageDimension>(
+            movingConfigs, slices, device, {}, false, {}, static_cast<int>(sweptAxis));
+          for (size_t l = 0; l < movingMeans.size(); ++l)
+          {
+            if (fixedSwept->basis[l].defined())
+            {
+              movingMeans[l] = Impact::PcaSampleMean(ml[l].squeeze(0));
+            }
+          }
+        }
+        // Each layer's loss over the chunk [i0, i0 + di) of the swept axis.
         auto chunkLosses = [&](int64_t i0, int64_t di, const torch::Tensor & gz, bool withGrad) {
-          torch::Tensor movingChunk = F::grid_sample(movingT, gz, sampleOpts); // {1,1,di,...}, grad -> gridLeaf
-          std::vector<torch::Tensor> ml =
-            Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingChunk, device, {}, withGrad);
+          torch::Tensor              movingChunk = F::grid_sample(movingT, gz, sampleOpts); // grad -> gridLeaf
+          std::vector<torch::Tensor> ml = Impact::ExtractFeatureLayers<ImageDimension>(
+            movingConfigs, movingChunk, device, {}, withGrad, {}, static_cast<int>(sweptAxis));
           std::vector<torch::Tensor> values;
           for (size_t l = 0; l < ml.size(); ++l)
           {
             torch::Tensor mll = ml[l];
-            if (l < pcaBasis.size() && pcaBasis[l].defined())
+            if (fixedSwept->basis[l].defined())
             {
-              mll = Impact::PcaTransform(mll.squeeze(0), pcaBasis[l]).unsqueeze(0);
+              mll = Impact::PcaTransform(mll.squeeze(0), fixedSwept->basis[l], movingMeans[l]).unsqueeze(0);
             }
-            mll = poolInPlane(mll); // features preserve z here, so only the trailing axes are resampled
-            values.push_back(layerLoss(l, pick(l, fixedLayersOnline[l].narrow(2, i0, di)), pick(l, mll)));
+            mll = poolExcept(mll, keep); // the features keep the swept axis, so only the others are resampled
+            values.push_back(layerLoss(l, pick(l, fixedSwept->layers[l].narrow(2 + keep, i0, di)), pick(l, mll)));
           }
           return values;
         };
@@ -734,7 +824,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
           {
             const int64_t              di = std::min(chunk, nLead - i0);
-            std::vector<torch::Tensor> values = chunkLosses(i0, di, gridLeaf.detach().narrow(1, i0, di), false);
+            std::vector<torch::Tensor> values = chunkLosses(i0, di, gridLeaf.detach().narrow(1 + keep, i0, di), false);
             whole.resize(values.size(), 0.0);
             for (size_t l = 0; l < values.size(); ++l)
             {
@@ -750,7 +840,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
         {
           const int64_t              di = std::min(chunk, nLead - i0);
-          torch::Tensor              gz = gridLeaf.narrow(1, i0, di);
+          torch::Tensor              gz = gridLeaf.narrow(1 + keep, i0, di);
           std::vector<torch::Tensor> values = chunkLosses(i0, di, gz, true);
           torch::Tensor              simChunk = torch::zeros({}, theta.options());
           for (size_t l = 0; l < values.size(); ++l)

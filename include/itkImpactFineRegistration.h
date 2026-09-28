@@ -207,9 +207,12 @@ public:
    * whole warped image -- same principle, differentiating the similarity through the model.) */
   itkSetMacro(Mode, std::string);
   itkGetConstReferenceMacro(Mode, std::string);
-  /** "Jacobian" mode only: number of z-slices (leading spatial axis) extracted per autograd chunk, to
-   * bound peak memory -- the per-voxel feature loss decomposes over z, so chunk gradients accumulate
-   * into the field. 0 = whole volume in one graph. Default 32. */
+  /** "Jacobian" mode with a model of lower dimension than the image (a 2D model on a volume): number of
+   * slices extracted per autograd chunk, to bound peak memory -- the per-voxel feature loss decomposes
+   * over the slices, so chunk gradients accumulate into the field. The slices run along one image axis
+   * drawn at random (from Seed) at every iteration, the fixed features of each axis extracted once, so
+   * the network sees the anatomy in the three orientations over the iterations. 0 = whole volume in one
+   * graph. Default 32. */
   itkSetMacro(FeatureChunkSize, unsigned int);
   itkGetConstMacro(FeatureChunkSize, unsigned int);
   /** @} */
