@@ -31,6 +31,7 @@
 #include "ImpactLoss.h"
 
 #include <itkMacro.h>
+#include <itkMath.h>
 #include <itkMatrix.h>
 #include <itkPoint.h>
 
@@ -38,6 +39,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <numeric>
 #include <random>
@@ -63,6 +65,45 @@ PatchTensorShape(const ImpactModelConfiguration & configuration)
 {
   const std::vector<int64_t> & patchSize = configuration.GetPatchSize();
   return std::vector<int64_t>(patchSize.rbegin(), patchSize.rend());
+}
+
+/** The plane a model of dimension 2 cuts its patch on in a volume, at the point of index `index` (any type with
+ * operator[] over three axes), as a rotation whose first two COLUMNS are the patch axes in the image's own frame:
+ * three angles drawn uniform in [0, 2 pi) from a generator seeded from the point, composed Rz * Ry * Rx, as the
+ * elastix metric draws them.
+ *
+ * The generator is seeded from the point itself rather than from a running generator, so the plane depends on WHERE
+ * the point is and not on how many points came before it: a metric stays a function of its parameters when a
+ * finite-difference step drops a few points, whatever the partition of its domain. Mixing the model index in keeps
+ * two models at one point from being handed the identical plane. Shared by the itkv4 metric and the fine
+ * registration stage's sampled Jacobian mode. */
+template <typename TIndex>
+Matrix<double, 3, 3>
+PatchPlaneRotation(unsigned int seed, size_t modelIndex, const TIndex & index)
+{
+  std::uint_fast32_t pointSeed = static_cast<std::uint_fast32_t>(seed) + 0x9e3779b9u * (modelIndex + 1u);
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    pointSeed = pointSeed * 2654435761u + static_cast<std::uint_fast32_t>(index[d]);
+  }
+  std::mt19937                           pointGenerator(pointSeed);
+  std::uniform_real_distribution<double> angles(0.0, 2.0 * itk::Math::pi);
+  const double                           a = angles(pointGenerator);
+  const double                           b = angles(pointGenerator);
+  const double                           c = angles(pointGenerator);
+  const double                           ca = std::cos(a), sa = std::sin(a), cb = std::cos(b), sb = std::sin(b);
+  const double                           cc = std::cos(c), sc = std::sin(c);
+  Matrix<double, 3, 3>                   plane;
+  plane[0][0] = cc * cb;
+  plane[0][1] = cc * sb * sa - sc * ca;
+  plane[0][2] = cc * sb * ca + sc * sa;
+  plane[1][0] = sc * cb;
+  plane[1][1] = sc * sb * sa + cc * ca;
+  plane[1][2] = sc * sb * ca - cc * sa;
+  plane[2][0] = -sb;
+  plane[2][1] = cb * sa;
+  plane[2][2] = cb * ca;
+  return plane;
 }
 
 /** Callback evaluating a patch of image intensities around a point (value-only path). Its third

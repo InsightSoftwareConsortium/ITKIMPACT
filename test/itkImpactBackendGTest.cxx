@@ -41,6 +41,7 @@
 #include "itkResampleImageFilter.h"
 #include "itkStatisticsImageFilter.h"
 #include <torch/torch.h>
+#include "vnl/vnl_det.h"
 #include "itkAffineTransform.h"
 #include "itkIdentityTransform.h"
 #include "itkDisplacementFieldTransform.h"
@@ -54,6 +55,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -2716,35 +2718,215 @@ TEST(ImpactTorchAdam, SampledVoxelsStillRecoverATranslation)
   }
 }
 
-// A share of the voxels only means something to a point-wise distance of the Static feature similarity: outside
-// (0, 1], with LNCC (windows of whole maps), in Jacobian mode or without a model, it is refused.
+// A share of the voxels only means something to a feature similarity read at points: outside (0, 1], with LNCC
+// (windows of whole maps), without a model, or in Jacobian mode without a patch to run the model on, it is refused.
 TEST(ImpactTorchAdam, SamplingRefusesWhatReadsWholeImages)
 {
   ImageType::SpacingType spacing;
   spacing.Fill(1.0);
   ImageType::DirectionType identity;
   identity.SetIdentity();
-  auto attempt = [&](double share, const std::string & distance, const std::string & mode, bool model) {
-    auto filter = TorchAdamFilterType::New();
-    filter->SetFixedImage(MakeTorchAdamPattern(12, 0, 0, 0, spacing, identity));
-    filter->SetMovingImage(MakeTorchAdamPattern(12, 1, 0, 0, spacing, identity));
-    if (model)
-    {
-      filter->AddModelConfiguration(itk::ImpactModelConfiguration(
-        ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false));
-      filter->SetDistance({ distance });
-      filter->SetMode(mode);
-    }
-    filter->SetSamplingPercentage(share);
-    filter->SetNumberOfIterations(2);
-    filter->Update();
-  };
+  auto attempt =
+    [&](double share, const std::string & distance, const std::string & mode, bool model, unsigned int patch = 0) {
+      auto filter = TorchAdamFilterType::New();
+      filter->SetFixedImage(MakeTorchAdamPattern(12, 0, 0, 0, spacing, identity));
+      filter->SetMovingImage(MakeTorchAdamPattern(12, 1, 0, 0, spacing, identity));
+      if (model)
+      {
+        filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+          ToyModelPath(), 3, 1, { patch, patch, patch }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false));
+        filter->SetDistance({ distance });
+        filter->SetMode(mode);
+      }
+      filter->SetSamplingPercentage(share);
+      filter->SetNumberOfIterations(2);
+      filter->Update();
+    };
   EXPECT_NO_THROW(attempt(0.5, "L2", "Static", true));
   EXPECT_THROW(attempt(0.0, "L2", "Static", true), itk::ExceptionObject);
   EXPECT_THROW(attempt(1.5, "L2", "Static", true), itk::ExceptionObject);
   EXPECT_THROW(attempt(0.5, "LNCC", "Static", true), itk::ExceptionObject);
-  EXPECT_THROW(attempt(0.5, "L2", "Jacobian", true), itk::ExceptionObject);
+  EXPECT_THROW(attempt(0.5, "L2", "Jacobian", true), itk::ExceptionObject) << "no patch";
+  EXPECT_NO_THROW(attempt(0.5, "L2", "Jacobian", true, 3));
+  EXPECT_NO_THROW(attempt(0.5, "NCC", "Jacobian", true, 3));
+  EXPECT_THROW(attempt(0.5, "LNCC", "Jacobian", true, 3), itk::ExceptionObject);
   EXPECT_THROW(attempt(0.5, "L2", "Static", false), itk::ExceptionObject);
+}
+
+// The plane a 2D model's patch is cut on around a sampled point is the metric's (PatchPlaneRotation: a rotation, a
+// function of the seed, the model and the point), and the fine stage's sampled Jacobian mode lays the patch on its
+// first two columns, stepped by the model's voxel sizes, the voxel read back on the point; a 3D model's patch is the
+// box of its voxel sizes along the image axes. In voxels of an anisotropic grid.
+TEST(ImpactTorchAdam, SampledJacobianPatchesLieOnTheMetricsPlanes)
+{
+  const std::array<int64_t, 3> p{ 4, 5, 6 };
+  const std::array<int64_t, 3> q{ 4, 5, 7 };
+  const auto                   rotation = itk::Impact::PatchPlaneRotation(7, 0, p);
+  const auto                   orthogonality = rotation.GetTranspose() * rotation.GetVnlMatrix();
+  for (unsigned int r = 0; r < 3; ++r)
+    for (unsigned int c = 0; c < 3; ++c)
+      EXPECT_NEAR(orthogonality(r, c), r == c ? 1.0 : 0.0, 1e-12);
+  EXPECT_NEAR(vnl_det(rotation.GetVnlMatrix()), 1.0, 1e-12);
+  EXPECT_EQ(rotation, itk::Impact::PatchPlaneRotation(7, 0, p)) << "a function of the point";
+  EXPECT_NE(rotation, itk::Impact::PatchPlaneRotation(7, 0, q));
+  EXPECT_NE(rotation, itk::Impact::PatchPlaneRotation(7, 1, p));
+  EXPECT_NE(rotation, itk::Impact::PatchPlaneRotation(8, 0, p));
+
+  const std::vector<double>     spacing{ 0.5, 0.8, 1.25 };
+  const torch::Tensor           points = torch::tensor({ 4, 5, 6, 2, 3, 1 }, torch::kLong).reshape({ 2, 3 });
+  itk::ImpactModelConfiguration plane(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt",
+                                      2,
+                                      1,
+                                      { 5, 3 },
+                                      { 0.5f, 0.75f, 1.f },
+                                      { 0, 0 },
+                                      { true, false },
+                                      false);
+  const torch::Tensor           planar = itk::Impact::SampledPatchPositions<3>(plane, points, spacing, 7, 0);
+  ASSERT_EQ(planar.sizes(), torch::IntArrayRef({ 2, 15, 3 }));
+  for (int64_t n = 0; n < 2; ++n)
+  {
+    const std::array<int64_t, 3> point{ points[n][0].item<int64_t>(),
+                                        points[n][1].item<int64_t>(),
+                                        points[n][2].item<int64_t>() };
+    const auto                   axes = itk::Impact::PatchPlaneRotation(7, 0, point);
+    for (int64_t k = 0; k < 15; ++k)
+    {
+      const double u = (k % 5 - 2) * 0.5, v = (k / 5 - 1) * 0.75; // mm along the two patch axes
+      for (unsigned int j = 0; j < 3; ++j)
+      {
+        EXPECT_NEAR(planar[n][k][j].item<double>(), point[j] + (axes[j][0] * u + axes[j][1] * v) / spacing[j], 1e-9)
+          << "point " << n << ", patch voxel " << k << ", axis " << j;
+      }
+    }
+  }
+  // The SampleCheck reads the patch's corners only: a patch is the image of a box.
+  const std::vector<int64_t> corners = itk::Impact::PatchCorners(plane);
+  EXPECT_EQ(corners, (std::vector<int64_t>{ 0, 4, 10, 14 }));
+  EXPECT_TRUE(torch::allclose(itk::Impact::SampledPatchPositions<3>(plane, points, spacing, 7, 0, corners),
+                              planar.index_select(1, torch::tensor(corners, torch::kLong))));
+  itk::ImpactModelConfiguration box(
+    ToyModelPath(), 3, 1, { 3, 3, 3 }, { 0.f, 1.f, 2.5f }, { 0, 0, 0 }, { true, false }, false);
+  const torch::Tensor boxed = itk::Impact::SampledPatchPositions<3>(box, points, spacing, 7, 0);
+  const double        step[3] = { 1.0, 1.25, 2.0 }; // unset = the spacing, then 1 mm / 0.8 and 2.5 mm / 1.25
+  for (int64_t k = 0; k < 27; ++k)
+  {
+    const int64_t index[3] = { k % 3, (k / 3) % 3, k / 9 };
+    for (unsigned int j = 0; j < 3; ++j)
+      EXPECT_NEAR(boxed[0][k][j].item<double>(), points[0][j].item<double>() + (index[j] - 1) * step[j], 1e-12);
+  }
+}
+
+// The sampled Jacobian mode's gradient (the drawn points' patches warped by the field, run through the network, their
+// centre features compared, backpropagated batch by batch to the control grid) against finite differences of its
+// value, for a per-point distance and for NCC, whose gradient is seeded from the whole point set. The gradient is read
+// off the first Adam step: without momentum it moves each control voxel by -lr g / (|g| + eps), -g for lr = eps. The
+// field starts off the voxel grid, so no patch sample crosses a voxel boundary under the finite-difference step.
+TEST(ImpactTorchAdam, SampledJacobianGradientMatchesFiniteDifferences)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto         fixed = MakeTorchAdamPattern(12, 0, 0, 0, spacing, identity);
+  auto         moving = MakeTorchAdamPattern(12, 1.0, -0.5, 0.7, spacing, identity);
+  const double start[3] = { 0.3, -0.2, 0.25 };
+  auto         fieldWith = [&](const TorchAdamFieldType::IndexType & where, unsigned int component, double delta) {
+    auto field = TorchAdamFieldType::New();
+    field->SetRegions(fixed->GetLargestPossibleRegion());
+    field->CopyInformation(fixed);
+    field->Allocate();
+    TorchAdamFieldType::PixelType value;
+    for (unsigned int d = 0; d < 3; ++d)
+      value[d] = static_cast<float>(start[d]);
+    field->FillBuffer(value);
+    value[component] += static_cast<float>(delta);
+    field->SetPixel(where, value);
+    return field;
+  };
+  auto run = [&](TorchAdamFieldType::Pointer field, const std::string & distance) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->SetInitialDisplacementField(field);
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 5, 5, 5 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false));
+    filter->SetDistance({ distance });
+    filter->SetMode("Jacobian");
+    filter->SetSamplingPercentage(0.3);
+    filter->SetBatchSize(64); // several batches
+    filter->NormalizeLossesOff();
+    filter->SetRegularizationWeight(0.0);
+    filter->SetNumberOfIterations(1);
+    filter->SetSeed(3);
+    filter->SetBeta1(0.0);
+    filter->SetBeta2(0.0);
+    filter->SetEpsilon(1e4);
+    filter->SetLearningRate(1e4);
+    filter->Update();
+    return filter;
+  };
+  const TorchAdamFieldType::IndexType origin{ { 0, 0, 0 } };
+  for (const std::string distance : { "L2", "NCC" })
+  {
+    auto initial = fieldWith(origin, 0, 0.0);
+    auto step = run(initial, distance);
+    ASSERT_EQ(step->GetMetricValuesPerIteration().size(), 1u);
+    // The three largest gradient entries.
+    std::vector<std::tuple<double, TorchAdamFieldType::IndexType, unsigned int>> entries;
+    itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType>                   it(step->GetDisplacementField(),
+                                                                  fixed->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+      for (unsigned int c = 0; c < 3; ++c)
+        entries.emplace_back(-(it.Get()[c] - initial->GetPixel(it.GetIndex())[c]), it.GetIndex(), c);
+    std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
+      return std::abs(std::get<0>(a)) > std::abs(std::get<0>(b));
+    });
+    ASSERT_GT(std::abs(std::get<0>(entries[0])), 1e-4) << distance << ": no gradient";
+    const double h = 0.05;
+    for (size_t e = 0; e < 3; ++e)
+    {
+      const auto & [gradient, where, component] = entries[e];
+      const double plus = run(fieldWith(where, component, h), distance)->GetMetricValuesPerIteration()[0];
+      const double minus = run(fieldWith(where, component, -h), distance)->GetMetricValuesPerIteration()[0];
+      const double difference = (plus - minus) / (2.0 * h);
+      EXPECT_NEAR(gradient, difference, 0.03 * std::abs(difference))
+        << distance << ": voxel " << where << ", component " << component;
+    }
+  }
+}
+
+// The sampled Jacobian mode registers: a translation between two patterns is recovered from a quarter of the voxels.
+// Each point constrains the field through its whole patch, which a full-resolution unsmoothed control grid leaves
+// under-determined (the dense Jacobian mode as well): the grid is the presets' kind, half the resolution, smoothed.
+TEST(ImpactTorchAdam, SampledJacobianRecoversATranslation)
+{
+  const double           tx = 1.5, ty = -2.0, tz = 1.0;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto filter = TorchAdamFilterType::New();
+  filter->SetFixedImage(MakeTorchAdamPattern(20, 0, 0, 0, spacing, identity));
+  filter->SetMovingImage(MakeTorchAdamPattern(20, tx, ty, tz, spacing, identity));
+  filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+    ToyModelPath(), 3, 1, { 3, 3, 3 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false));
+  filter->SetDistance({ "L2" });
+  filter->SetMode("Jacobian");
+  filter->SetSamplingPercentage(0.25);
+  filter->SetGridShrinkFactor(2);
+  filter->SetControlGridSmoothingIterations(1);
+  filter->SetNumberOfIterations(300);
+  filter->SetLearningRate(0.2);
+  filter->SetRegularizationWeight(0.02);
+  filter->Update();
+  itk::Vector<double, 3> expected;
+  expected[0] = tx;
+  expected[1] = ty;
+  expected[2] = tz;
+  const itk::Vector<double, 3> error = InteriorMeanError(filter->GetDisplacementField(), expected, 5);
+  for (unsigned int d = 0; d < 3; ++d)
+    EXPECT_LT(error[d], 0.5) << "axis " << d << " off";
 }
 
 // A model of lower dimension is swept slice by slice and, in Jacobian mode, taken in z-chunks matched with the

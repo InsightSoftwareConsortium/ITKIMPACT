@@ -145,12 +145,23 @@ public:
    * over. Odd; default 5. */
   itkSetMacro(LNCCKernel, unsigned int);
   itkGetConstMacro(LNCCKernel, unsigned int);
-  /** Share of each feature layer's voxels the Static similarity reads at every iteration, drawn anew at random
-   * from the seeded generator, as the metric draws its points (1 = every voxel, the default). Only the drawn
-   * points are warped, so an iteration costs that share of a full one. In (0, 1]; point-wise distances only
-   * (LNCC reads whole maps), Static mode only. */
+  /** Share of the voxels the feature similarity reads at every iteration, drawn anew at random from the seeded
+   * generator, as the metric draws its points (1 = every voxel, the default). In (0, 1]; point-wise distances and
+   * NCC only (LNCC reads whole maps).
+   * - Static mode: that share of each feature layer's voxels; only the drawn points are warped, so an iteration
+   *   costs that share of a full one.
+   * - Jacobian mode, elastix's scheme: that share of the fixed voxels, of which the points whose every model patch
+   *   fits in the image are kept (elastix's SampleCheck). Each model runs on its patch (PatchSize, its receptive
+   *   field: strictly positive on every model axis) around every point, cut in the fixed image and in the moving
+   *   image as the field warps it -- a 2D model on a plane drawn for each point, as the metric's PatchPlane --, and
+   *   its layers' centre voxels are compared. The whole images are never run through the network. */
   itkSetMacro(SamplingPercentage, double);
   itkGetConstMacro(SamplingPercentage, double);
+  /** Jacobian mode with SamplingPercentage < 1: most patches one forward takes, as the metric's BatchSize, bounded
+   * further by what the device holds (itkImpactBatchBudget.h); 0 (the default) = that bound alone, every point at
+   * once on the CPU. A batch that runs out of device memory is replayed at half the size. */
+  itkSetMacro(BatchSize, unsigned int);
+  itkGetConstMacro(BatchSize, unsigned int);
   itkSetMacro(PCA, std::vector<unsigned int>);
   itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
   /** @} */
@@ -281,6 +292,7 @@ private:
   bool         m_NormalizeLosses{ true };
   unsigned int m_LNCCKernel{ 5 };
   double       m_SamplingPercentage{ 1.0 };
+  unsigned int m_BatchSize{ 0 };
   std::string  m_Mode{ "Static" };
   unsigned int m_FeatureChunkSize{ 32 };
 

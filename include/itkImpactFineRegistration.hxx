@@ -23,6 +23,7 @@
 
 #include "itkImpactFineRegistration.h"
 #include "itkImpactTorchRegistrationHelpers.h"
+#include "itkImpactOnlineInference.h" // PatchTensorShape, PatchPlaneRotation
 #include "ImpactLoss.h"
 
 #include <itkResampleImageFilter.h>
@@ -32,7 +33,9 @@
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <array>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <tuple>
@@ -40,6 +43,106 @@
 
 namespace itk
 {
+namespace Impact
+{
+
+/** Where model `config`'s patch around each of `points` ({N, Dim} fixed-grid voxel indices, ITK order) samples the
+ * fixed grid, in its voxels (ITK order), {N, P, Dim} double: patch voxel k -- model axis 0 running fastest, as
+ * PatchTensorShape lays the patch out -- at (k_d - P_d / 2) * step_d along patch axis d, so the voxel the centre
+ * readback reads (size / 2) is the point itself. A model of the image's dimension spans the image axes, step_d its
+ * voxel size along axis d (the image's spacing when unset). A 2D model in a volume spans the plane drawn for each point
+ * (PatchPlaneRotation's first two columns, from `seed` and `modelIndex`, as the metric's PatchPlane), its steps its
+ * voxel sizes (the finest spacing when unset). `voxels`, when given, keeps those patch voxels only (P of them). */
+template <unsigned int Dim>
+torch::Tensor
+SampledPatchPositions(const ImpactModelConfiguration & config,
+                      const torch::Tensor &            points,
+                      const std::vector<double> &      spacing,
+                      unsigned int                     seed,
+                      size_t                           modelIndex,
+                      const std::vector<int64_t> &     voxels = {})
+{
+  const std::vector<int64_t> & patchSize = config.GetPatchSize();
+  const std::vector<float> &   voxelSize = config.GetVoxelSize();
+  const unsigned int           modelDimension = config.GetDimension();
+  const double                 finest = *std::min_element(spacing.begin(), spacing.end());
+  std::vector<int64_t>         kept = voxels;
+  if (kept.empty())
+  {
+    int64_t patchVoxels = 1;
+    for (unsigned int d = 0; d < modelDimension; ++d)
+    {
+      patchVoxels *= patchSize[d];
+    }
+    kept.resize(static_cast<size_t>(patchVoxels));
+    std::iota(kept.begin(), kept.end(), int64_t{ 0 });
+  }
+  // Each patch voxel's offset along each patch axis, in millimetres.
+  torch::Tensor offsets =
+    torch::empty({ static_cast<int64_t>(kept.size()), static_cast<int64_t>(modelDimension) }, torch::kFloat64);
+  auto offset = offsets.accessor<double, 2>();
+  for (int64_t k = 0; k < offsets.size(0); ++k)
+  {
+    int64_t rem = kept[k];
+    for (unsigned int d = 0; d < modelDimension; ++d)
+    {
+      const int64_t index = rem % patchSize[d];
+      rem /= patchSize[d];
+      const double step =
+        d < voxelSize.size() && voxelSize[d] > 0.0f ? voxelSize[d] : (modelDimension == Dim ? spacing[d] : finest);
+      offset[k][d] = static_cast<double>(index - patchSize[d] / 2) * step;
+    }
+  }
+  const torch::Tensor centres = points.to(torch::kFloat64).unsqueeze(1); // {N, 1, Dim}
+  const torch::Tensor perVoxel = 1.0 / torch::tensor(spacing, torch::kFloat64);
+  if (modelDimension == Dim)
+  {
+    return centres + (offsets * perVoxel).unsqueeze(0);
+  }
+  if (modelDimension != 2 || Dim != 3)
+  {
+    itkGenericExceptionMacro("IMPACT: a " << modelDimension << "D model's patch cannot be cut in a " << Dim
+                                          << "D image; only a 2D model in a volume is swept.");
+  }
+  // The two patch axes of each point's plane, in the image's frame: {N, Dim, 2}.
+  const int64_t count = points.size(0);
+  torch::Tensor axes = torch::empty({ count, static_cast<int64_t>(Dim), 2 }, torch::kFloat64);
+  auto          axis = axes.accessor<double, 3>();
+  const auto    point = points.accessor<int64_t, 2>();
+  for (int64_t n = 0; n < count; ++n)
+  {
+    const std::array<int64_t, 3> index{ point[n][0], point[n][1], point[n][Dim - 1] };
+    const Matrix<double, 3, 3>   plane = PatchPlaneRotation(seed, modelIndex, index);
+    for (unsigned int j = 0; j < Dim; ++j)
+    {
+      axis[n][j][0] = plane[j][0];
+      axis[n][j][1] = plane[j][1];
+    }
+  }
+  return centres + torch::einsum("njd,pd->npj", { axes, offsets }) * perVoxel;
+}
+
+/** The corners of model `config`'s patch, as patch voxel numbers (model axis 0 running fastest): a patch is the image
+ * of a box, so its extreme positions are at these. */
+inline std::vector<int64_t>
+PatchCorners(const ImpactModelConfiguration & config)
+{
+  std::vector<int64_t> corners{ 0 };
+  int64_t              stride = 1;
+  for (unsigned int d = 0; d < config.GetDimension(); ++d)
+  {
+    const int64_t last = (config.GetPatchSize()[d] - 1) * stride;
+    const size_t  count = corners.size();
+    for (size_t c = 0; c < count; ++c)
+    {
+      corners.push_back(corners[c] + last);
+    }
+    stride *= config.GetPatchSize()[d];
+  }
+  return corners;
+}
+
+} // namespace Impact
 
 template <typename TFixedImage, typename TMovingImage>
 ImpactFineRegistration<TFixedImage, TMovingImage>::ImpactFineRegistration() = default;
@@ -361,12 +464,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
                                                                                             << ".");
   }
   const bool sampled = m_SamplingPercentage < 1.0;
-  if (sampled && (!featureMode || jacobianMode))
+  if (sampled && !featureMode)
   {
-    // Refused rather than ignored: the intensity path and Jacobian mode compare whole images.
-    itkExceptionMacro("ImpactFineRegistration: SamplingPercentage samples the Static feature similarity; set a "
-                      "model in Static mode, or leave it at 1.");
+    // Refused rather than ignored: the intensity path compares whole images.
+    itkExceptionMacro("ImpactFineRegistration: SamplingPercentage samples the feature similarity; set a model, or "
+                      "leave it at 1.");
   }
+  // Jacobian mode on a share of the voxels: elastix's scheme, each model run on the patch around every drawn point.
+  const bool sampledJacobian = jacobianMode && sampled;
   // A "sliced" model has lower dimension than the image (a 2D backbone run slice by slice): its feature map keeps the
   // swept axis 1:1 with the image, so the online loss can be taken in chunks of slices that line up by index
   // (memory-bounded). Each iteration sweeps ONE image axis drawn at random (seeded): a dense engine draws no points,
@@ -375,7 +480,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // while one axis of the image costs one sweep and shows the network the anatomy in every orientation over the
   // iterations. A full-dimension model may downsample every axis, so its features are compared whole and aligned by
   // resampling, like the itkv4 metric.
-  const bool jacSliced = jacobianMode && !m_FixedModelsConfiguration.empty() &&
+  const bool jacSliced = jacobianMode && !sampled && !m_FixedModelsConfiguration.empty() &&
                          m_FixedModelsConfiguration[0].GetDimension() < ImageDimension;
 
   // Feature-mode setup: extract the fixed/moving feature layers (constants, not differentiated
@@ -545,7 +650,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
                              "which a random share of their voxels does not have; leave SamplingPercentage at 1.");
       }
     }
-    if (!jacSliced)
+    if (!jacSliced && !sampledJacobian)
     {
       // The moving features are extracted here for Static mode only: the Jacobian mode re-extracts them from the
       // warped image at every iteration.
@@ -616,6 +721,40 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
                                    "volume) to use it.");
             }
           }
+        }
+      }
+      else if (sampledJacobian)
+      {
+        // Each model runs on the patch of its receptive field around every point: a strictly positive PatchSize on
+        // each of its axes, which a patch in a volume can be cut along. How many patches one forward takes is
+        // measured on the device, as for the metric.
+        const std::vector<ImpactModelConfiguration> * const sides[] = { &m_FixedModelsConfiguration, &movingConfigs };
+        for (const auto * configs : sides)
+        {
+          for (const ImpactModelConfiguration & config : *configs)
+          {
+            const std::vector<int64_t> & patchSize = config.GetPatchSize();
+            if (patchSize.size() < config.GetDimension() || std::any_of(patchSize.begin(),
+                                                                        patchSize.begin() + config.GetDimension(),
+                                                                        [](int64_t extent) { return extent <= 0; }))
+            {
+              itkExceptionMacro("ImpactFineRegistration: SamplingPercentage in Jacobian mode runs each model on the "
+                                "patch of its receptive field around every drawn point; give "
+                                << config.GetModelPath() << " a strictly positive PatchSize on each of its "
+                                << config.GetDimension() << " axes.");
+            }
+            if (config.GetDimension() != ImageDimension && (config.GetDimension() != 2 || ImageDimension != 3))
+            {
+              itkExceptionMacro("ImpactFineRegistration: a " << config.GetDimension() << "D model's patch cannot be "
+                                                             << "cut in a " << ImageDimension << "D image.");
+            }
+            ModelTo(config, device);
+          }
+        }
+        Impact::ConfigureBatchSize(m_FixedModelsConfiguration, device, static_cast<int64_t>(m_BatchSize));
+        if (!m_MovingModelsConfiguration.empty())
+        {
+          Impact::ConfigureBatchSize(m_MovingModelsConfiguration, device, static_cast<int64_t>(m_BatchSize));
         }
       }
       else
@@ -727,7 +866,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     // Dense Jacobian mode with a swept model: the image axis this iteration sweeps, and its fixed layers.
     const unsigned int       sweptAxis = jacSliced ? axisDistribution(axisGenerator) : 0;
     const SweptFixedLayers * fixedSwept = jacSliced ? &fixedSweptAlong(sweptAxis) : nullptr;
-    if (featureMode)
+    if (featureMode && !sampledJacobian) // the sampled Jacobian mode draws them once it knows the channels
     {
       drawSubsets(jacSliced ? fixedSwept->layers : jacobianMode ? fixedLayersOnline : fixedLayers);
     }
@@ -763,7 +902,242 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       // (full-dimension) is compared whole, its features matched to the fixed ones by RESAMPLING, like the
       // itkv4 metric; a sliced model (features keep the swept axis) is taken in chunks of slices along the
       // axis drawn for this iteration, to bound peak memory.
-      if (jacSliced)
+      if (sampledJacobian)
+      {
+        // elastix's Jacobian scheme on the dense field. The points of this iteration: that share of the fixed voxels,
+        // drawn anew from the seeded generator, of which those whose every model patch fits in the image are kept
+        // (elastix's SampleCheck).
+        reg.backward();
+        const torch::Tensor smoothed = smoothControl(theta); // the field the patches are warped by, graph to theta
+        int64_t             voxels = 1;
+        for (const int64_t extent : spatial)
+        {
+          voxels *= extent;
+        }
+        const int64_t count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(voxels)));
+        const torch::Tensor flat = torch::randint(voxels, { count }, torch::TensorOptions().dtype(torch::kLong));
+        torch::Tensor       points = torch::empty({ count, static_cast<int64_t>(ImageDimension) }, torch::kLong);
+        int64_t             stride = 1;
+        for (unsigned int d = 0; d < ImageDimension; ++d) // ITK index, x fastest in the flat voxel number
+        {
+          const int64_t extent = spatial[ImageDimension - 1 - d];
+          points.select(1, d).copy_(flat.div(stride, "trunc").remainder(extent));
+          stride *= extent;
+        }
+        std::vector<double> lastIndex(ImageDimension), gridScale(ImageDimension);
+        for (unsigned int d = 0; d < ImageDimension; ++d)
+        {
+          lastIndex[d] = static_cast<double>(spatial[ImageDimension - 1 - d] - 1);
+          gridScale[d] = lastIndex[d] > 0.0 ? lastIndex[d] / 2.0 : 1.0;
+        }
+        const torch::Tensor upper = torch::tensor(lastIndex, torch::kFloat64);
+        torch::Tensor       fits = torch::ones({ count }, torch::kBool);
+        for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
+        {
+          const ImpactModelConfiguration & config = m_FixedModelsConfiguration[i];
+          const torch::Tensor              corners = Impact::SampledPatchPositions<ImageDimension>(
+            config, points, fixedSpacing, m_Seed, i, Impact::PatchCorners(config));
+          fits = fits & ((corners >= 0.0) & (corners <= upper)).flatten(1).all(1);
+        }
+        const torch::Tensor kept = points.index_select(0, fits.nonzero().flatten());
+        const int64_t       n = kept.size(0);
+        if (n == 0)
+        {
+          itkExceptionMacro("ImpactFineRegistration: no drawn point has its model patch inside the image; the patch "
+                            "(PatchSize x voxel size) is larger than the image, or SamplingPercentage too small.");
+        }
+        const torch::Tensor toGrid = torch::tensor(gridScale, torch::kFloat64);
+        // Model i's patches of points [begin, end), {b, 1, reversed PatchSize...}: in the fixed image, or in the moving
+        // image as the field warps it (differentiable, so the gradient reaches the control grid). The patch voxels are
+        // placed a batch at a time, as grid_sample coordinates (x, y, z: ITK order).
+        auto patchesOf = [&](size_t i, int64_t begin, int64_t end, bool moving) {
+          const torch::Tensor grid =
+            (Impact::SampledPatchPositions<ImageDimension>(
+               m_FixedModelsConfiguration[i], kept.narrow(0, begin, end - begin), fixedSpacing, m_Seed, i) /
+               toGrid -
+             1.0)
+              .to(torch::kFloat32)
+              .to(device);
+          const int64_t        samples = grid.size(0) * grid.size(1);
+          std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, samples, Dim}
+          where[ImageDimension] = samples;
+          where[ImageDimension + 1] = ImageDimension;
+          torch::Tensor at = grid.reshape(where);
+          if (moving)
+          {
+            const torch::Tensor displacement =
+              F::grid_sample(smoothed, at, sampleOpts).reshape({ static_cast<int64_t>(ImageDimension), samples }).t();
+            at = at + (displacement / scale).flip(-1).reshape(where);
+          }
+          std::vector<int64_t> shape{ end - begin, 1 };
+          for (const int64_t extent : Impact::PatchTensorShape(m_FixedModelsConfiguration[i]))
+          {
+            shape.push_back(extent);
+          }
+          return F::grid_sample(moving ? movingT : fixedT, at, sampleOpts).reshape(shape);
+        };
+        // Every kept layer's centre feature vector {b, C} of a model run on `patches`, normalized, the voxel the patch
+        // is centred on (GetCentersIndexLayers' size / 2).
+        auto centresOf = [&](const ImpactModelConfiguration & config,
+                             const torch::Tensor &            patches,
+                             const ImpactImageMetadata &      metadata) {
+          std::vector<int64_t> repeat(patches.dim(), 1);
+          repeat[1] = static_cast<int64_t>(config.GetNumberOfChannels());
+          std::vector<torch::jit::IValue> outputs =
+            Forward(config, patches.repeat(repeat).to(GetModelDtype(config)), metadata);
+          const std::vector<bool> &  mask = config.GetLayersMask();
+          std::vector<torch::Tensor> layers;
+          for (size_t it = 0; it < outputs.size() && it < mask.size(); ++it)
+          {
+            if (mask[it])
+            {
+              torch::Tensor layer = outputs[it].toTensor();
+              while (layer.dim() > 2)
+              {
+                layer = layer.select(2, layer.size(2) / 2);
+              }
+              layers.push_back(
+                Impact::NormalizeFeatureChannels(layer.to(torch::kFloat32), config.GetFeatureNormalization(), 1));
+            }
+          }
+          return layers;
+        };
+        std::vector<size_t> firstLayer{ 0 }; // model i's kept layers start at firstLayer[i] in the flat list
+        for (const auto & config : m_FixedModelsConfiguration)
+        {
+          firstLayer.push_back(firstLayer.back() + NumberOfKeptLayers(config));
+        }
+        // Every point's centre features on one side, without the graph, a batch of patches at a time.
+        std::vector<torch::Tensor> fixedCentres(losses.size());
+        std::vector<torch::Tensor> movingCentres(losses.size());
+        auto                       gather = [&](bool moving) {
+          torch::NoGradGuard noGrad;
+          for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
+          {
+            const ImpactModelConfiguration &        config = moving ? movingConfigs[i] : m_FixedModelsConfiguration[i];
+            std::vector<std::vector<torch::Tensor>> pieces(firstLayer[i + 1] - firstLayer[i]);
+            Impact::ForEachBatch(
+              config,
+              device,
+              n,
+              [&](int64_t begin, int64_t end) {
+                const std::vector<torch::Tensor> layers =
+                  centresOf(config, patchesOf(i, begin, end, moving), moving ? movingMetadata : fixedMetadata);
+                for (size_t k = 0; k < pieces.size(); ++k)
+                {
+                  pieces[k].push_back(layers[k]);
+                }
+              },
+              [] {});
+            for (size_t k = 0; k < pieces.size(); ++k)
+            {
+              (moving ? movingCentres : fixedCentres)[firstLayer[i] + k] = torch::cat(pieces[k]);
+            }
+          }
+        };
+        gather(false);
+        drawSubsets(fixedCentres);
+        // PCA, a 3D model's rule on the points: the basis fitted on the fixed features of this iteration's points,
+        // each side centred by its own mean over them -- the moving one taken without the graph, so that every point
+        // keeps a gradient of its own.
+        std::vector<torch::Tensor> basis(losses.size());
+        std::vector<torch::Tensor> movingMean(losses.size());
+        bool                       reduces = false;
+        for (size_t l = 0; l < losses.size(); ++l)
+        {
+          if (const int64_t components = pcaComponents(l, fixedCentres[l].size(1)); components > 0)
+          {
+            basis[l] = Impact::PcaFit(fixedCentres[l].t(), components);
+            fixedCentres[l] = Impact::PcaTransform(fixedCentres[l].t(), basis[l]).t();
+            reduces = true;
+          }
+        }
+        const bool latching = m_NormalizeLosses && !normalization.IsLatched(0);
+        const bool perPoint = std::all_of(losses.begin(), losses.end(), [](const std::unique_ptr<Impact::Loss> & loss) {
+          return loss->IsPerPointMean();
+        });
+        if (!perPoint || reduces || latching)
+        {
+          gather(true);
+        }
+        for (size_t l = 0; l < losses.size(); ++l)
+        {
+          if (basis[l].defined())
+          {
+            movingMean[l] = movingCentres[l].mean(0).unsqueeze(1);
+          }
+        }
+        // A moving side's features {b, C} as layer l compares them.
+        auto reduced = [&](size_t l, const torch::Tensor & centres) {
+          return pick(l, basis[l].defined() ? Impact::PcaTransform(centres.t(), basis[l], movingMean[l]).t() : centres);
+        };
+        if (latching)
+        {
+          for (size_t l = 0; l < losses.size(); ++l)
+          {
+            normalization.Latch(
+              l,
+              losses[l]->forwardValue(pick(l, fixedCentres[l]), reduced(l, movingCentres[l])).template item<double>());
+          }
+        }
+        // A global distance (NCC) mixes the points: its gradient with respect to each point's features is only known
+        // from the whole set, so it is taken there, on the features as a leaf, and seeds each batch's backward below.
+        double                     simValue = 0.0;
+        std::vector<torch::Tensor> seeds;
+        if (!perPoint)
+        {
+          std::vector<torch::Tensor> leaves;
+          torch::Tensor              total = torch::zeros({}, theta.options());
+          for (size_t l = 0; l < losses.size(); ++l)
+          {
+            leaves.push_back(movingCentres[l].detach().requires_grad_(true));
+            total = total + layerWeights[l] *
+                              normalized(l, losses[l]->forwardValue(pick(l, fixedCentres[l]), reduced(l, leaves[l])));
+          }
+          seeds = torch::autograd::grad({ total }, leaves);
+          simValue = total.template item<double>();
+        }
+        // The moving side again, with the graph, a batch at a time: each batch's backward reaches the control grid and
+        // frees its network graph. A per-point distance's batch weighs its share of the points. A batch that runs out
+        // of device memory is replayed at half the size, with the gradient it had added taken back.
+        torch::Tensor gradientBefore;
+        for (size_t i = 0; i < movingConfigs.size(); ++i)
+        {
+          Impact::ForEachBatch(
+            movingConfigs[i],
+            device,
+            n,
+            [&](int64_t begin, int64_t end) {
+              gradientBefore = theta.grad().clone();
+              const std::vector<torch::Tensor> layers =
+                centresOf(movingConfigs[i], patchesOf(i, begin, end, true), movingMetadata);
+              torch::Tensor surrogate = torch::zeros({}, theta.options());
+              for (size_t k = 0; k < layers.size(); ++k)
+              {
+                const size_t l = firstLayer[i] + k;
+                if (perPoint)
+                {
+                  const torch::Tensor value = losses[l]->forwardValue(
+                    pick(l, fixedCentres[l].narrow(0, begin, end - begin)), reduced(l, layers[k]));
+                  surrogate = surrogate + layerWeights[l] * normalized(l, value) *
+                                            (static_cast<double>(end - begin) / static_cast<double>(n));
+                }
+                else
+                {
+                  surrogate = surrogate + (layers[k] * seeds[l].narrow(0, begin, end - begin)).sum();
+                }
+              }
+              surrogate.backward();
+              if (perPoint)
+              {
+                simValue += surrogate.template item<double>();
+              }
+            },
+            [&] { theta.mutable_grad().copy_(gradientBefore); });
+        }
+        lossValue = simValue + reg.template item<double>();
+      }
+      else if (jacSliced)
       {
         // Peak memory is bounded by taking the field's swept axis in chunks: each chunk backprops
         // into a detached grid leaf -- its network subgraph is then freed -- and the shared field->grid
