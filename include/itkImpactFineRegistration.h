@@ -141,8 +141,10 @@ public:
    * the seeded generator (0 or a missing entry = all), as the metric's SubsetFeatures. */
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
-  /** Side, in voxels of the compared feature map, of the window the "LNCC" distance correlates each channel
-   * over. Odd; default 5. */
+  /** Side of the window the "LNCC" distance correlates each channel over, in voxels of the compared feature
+   * map along its finest axis in millimetres; along each other axis the window takes the odd number of
+   * voxels nearest the same length (the map's voxel side being the fixed image's times its pooling
+   * factor), so it is (nearly) a cube in millimetres. Odd; default 5. */
   itkSetMacro(LNCCKernel, unsigned int);
   itkGetConstMacro(LNCCKernel, unsigned int);
   /** Share of the voxels the feature similarity reads at every iteration, drawn anew at random from the seeded
@@ -174,12 +176,16 @@ public:
   itkSetMacro(Seed, unsigned int);
   itkGetConstMacro(Seed, unsigned int);
 
-  /** \name Adam / displacement-field optimization parameters. */
+  /** \name Adam / displacement-field optimization parameters.
+   * The control grid, its step and its smoothing are counted in voxels of the fixed image's finest axis,
+   * s_min = min_a s_a, and derived per axis, so that they are (nearly) isotropic in millimetres; on an
+   * isotropic image every axis takes the numbers as they are. */
   /** @{ */
   /** Number of Adam iterations (default 80, as in ConvexAdam). */
   itkSetMacro(NumberOfIterations, unsigned int);
   itkGetConstMacro(NumberOfIterations, unsigned int);
-  /** Adam learning rate (default 1.0). */
+  /** Adam learning rate, in units of s_min: the displacement is optimized in units of the finest voxel
+   * side, so a step moves up to LearningRate * s_min mm along every axis (default 1.0). */
   itkSetMacro(LearningRate, double);
   itkGetConstMacro(LearningRate, double);
   itkSetMacro(Beta1, double);
@@ -188,16 +194,20 @@ public:
   itkGetConstMacro(Beta2, double);
   itkSetMacro(Epsilon, double);
   itkGetConstMacro(Epsilon, double);
-  /** Weight of the diffusion (squared spatial-gradient) regularizer (default 1.25). */
+  /** Weight of the diffusion regularizer: the mean squared gradient of the (smoothed) displacement in mm
+   * per mm, summed over the axes -- on an isotropic image the gradient in voxels per voxel, as ConvexAdam's
+   * (default 1.25). */
   itkSetMacro(RegularizationWeight, double);
   itkGetConstMacro(RegularizationWeight, double);
-  /** Low-resolution control-grid shrink factor: the field is optimized at
-   * image-size / GridShrinkFactor and upsampled to full resolution each iteration
-   * (ConvexAdam-style) -- faster on large volumes and adds regularity. Default 1 (full resolution). */
+  /** Low-resolution control-grid shrink factor, in voxels of the finest axis: along axis a the field is
+   * optimized on a grid shrink_a = max(1, round(GridShrinkFactor * s_min / s_a)) times coarser than the
+   * image, and upsampled to full resolution each iteration (ConvexAdam-style) -- faster on large volumes
+   * and adds regularity. Default 1 (full resolution). */
   itkSetMacro(GridShrinkFactor, unsigned int);
   itkGetConstMacro(GridShrinkFactor, unsigned int);
   /** Number of 3x3x3 average-pool smoothing passes applied to the control grid each iteration
-   * (B-spline-like control-point smoothing). Default 0. */
+   * (B-spline-like control-point smoothing), in control cells, which GridShrinkFactor makes (nearly)
+   * isotropic in millimetres. Default 0. */
   itkSetMacro(ControlGridSmoothingIterations, unsigned int);
   itkGetConstMacro(ControlGridSmoothingIterations, unsigned int);
   /** In feature mode, re-extract the moving feature maps from the currently-warped moving image

@@ -153,15 +153,22 @@ public:
   itkSetMacro(Seed, unsigned int);
   itkGetConstMacro(Seed, unsigned int);
 
-  /** \name Coarse search parameters. */
+  /** \name Coarse search parameters.
+   * Counted in voxels of the fixed image's finest axis, s_min = min_a s_a, and derived per axis, so that
+   * the cells and the capture range are (nearly) isotropic in millimetres; on an isotropic image every
+   * axis takes the numbers as they are. */
   /** @{ */
-  /** Coarse-grid downsample factor (avg-pool stride); the cost volume runs on the
-   * image-size / GridSpacing grid. Default 4. */
+  /** Cell size of the coarse grid the cost volume runs on, in voxels of the finest axis: along axis a a
+   * cell spans gs_a = max(1, round(GridSpacing * s_min / s_a)) voxels (avg-pool kernel and stride), a
+   * cell of about GridSpacing * s_min mm. The cost smoothing, the NCC/LNCC window and the displacement
+   * smoothing are counted in cells. Default 4. */
   itkSetMacro(GridSpacing, unsigned int);
   itkGetConstMacro(GridSpacing, unsigned int);
-  /** Displacement search half-width, in coarse-grid voxels: the candidate set is the dense cube
-   * [-hw, hw]^Dim, so the captured range is +/- DisplacementHalfWidth * GridSpacing full-resolution
-   * voxels. Default 3. */
+  /** Displacement search half-width, in cells of the finest axis: the capture range is R =
+   * DisplacementHalfWidth * GridSpacing * s_min mm each way, which axis a covers with hw_a = ceil(R /
+   * (gs_a * s_a)) cells, so the candidates are the box prod_a (2 hw_a + 1). The coupling penalty
+   * weighs a move of one cell along axis a by (gs_a * s_a / (GridSpacing * s_min))^2, so that a
+   * distance in millimetres costs the same along every axis. Default 3. */
   itkSetMacro(DisplacementHalfWidth, unsigned int);
   itkGetConstMacro(DisplacementHalfWidth, unsigned int);
   /** Also solve the backward (moving->fixed) coarse problem and symmetrize the two fields

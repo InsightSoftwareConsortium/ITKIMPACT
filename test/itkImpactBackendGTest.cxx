@@ -2330,10 +2330,13 @@ TEST(ImpactLoss, LocalNCCComparesWindowsOfDenseMaps)
   const auto          options = torch::TensorOptions().dtype(torch::kFloat64);
   const torch::Tensor fixed = torch::rand({ 1, 3, 9, 9, 9 }, options);
   ASSERT_TRUE(loss->IsSpatial());
-  EXPECT_NEAR(loss->forwardSpatial(fixed, fixed, 3).item<double>(), 0.0, 1e-6);
+  const std::vector<int64_t> window{ 3, 3, 3 };
+  EXPECT_NEAR(loss->forwardSpatial(fixed, fixed, window).item<double>(), 0.0, 1e-6);
   const torch::Tensor moving0 = torch::rand({ 1, 3, 9, 9, 9 }, options);
   torch::Tensor       moving = moving0.clone().set_requires_grad(true);
-  const torch::Tensor value = loss->forwardSpatial(fixed, moving, 3);
+  const torch::Tensor value = loss->forwardSpatial(fixed, moving, window);
+  EXPECT_NE(loss->forwardSpatial(fixed, moving0, { 3, 1, 3 }).item<double>(), value.item<double>())
+    << "the window has a side per axis";
   EXPECT_GT(value.item<double>(), 0.1);
   value.backward();
   for (const int64_t flat : { 0L, 400L, 1500L })
@@ -2341,7 +2344,9 @@ TEST(ImpactLoss, LocalNCCComparesWindowsOfDenseMaps)
     torch::Tensor plus = moving0.clone(), minus = moving0.clone();
     plus.view(-1)[flat] += 1e-6;
     minus.view(-1)[flat] -= 1e-6;
-    const double fd = (loss->forwardSpatial(fixed, plus, 3).item<double>() - loss->forwardSpatial(fixed, minus, 3).item<double>()) / 2e-6;
+    const double fd = (loss->forwardSpatial(fixed, plus, window).item<double>() -
+                       loss->forwardSpatial(fixed, minus, window).item<double>()) /
+                      2e-6;
     EXPECT_NEAR(moving.grad().view(-1)[flat].item<double>(), fd, 1e-5 + 1e-3 * std::abs(fd)) << "element " << flat;
   }
   torch::Tensor points = torch::rand({ 10, 3 }, options);
@@ -3476,11 +3481,14 @@ TEST(ImpactConvexAdam, NormalizedCoarseCostIgnoresTheFeatureRange)
 
 // The coarse cost volume compares each layer with its distance, over the cell window around every coarse voxel --
 // the two 3^3 box passes ConvexAdam smooths its cost with --, for every candidate displacement of the edge-replicated
-// moving features. Checked for every distance against loops in double precision: a point-wise distance's terms
-// averaged over the window, NCC and LNCC correlated over it from the window's weighted moments.
+// moving features, in a box of its own half-width per axis. Checked for every distance against loops in double
+// precision: a point-wise distance's terms averaged over the window, NCC and LNCC correlated over it from the
+// window's weighted moments.
 TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
 {
-  const int64_t C = 3, Z = 5, Y = 4, X = 6, halfWidth = 1, side = 3, L = 27;
+  const int64_t              C = 3, Z = 5, Y = 4, X = 6;
+  const std::vector<int64_t> halfWidths{ 1, 2, 1 }; // z, y, x
+  const int64_t              sx = 3, sy = 5, L = 45;
   torch::manual_seed(3);
   const torch::Tensor fixed = torch::rand({ 1, C, Z, Y, X }) + 0.1;
   const torch::Tensor moving = torch::rand({ 1, C, Z, Y, X }) + 0.1;
@@ -3515,12 +3523,12 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
   {
     const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor cost = torch::zeros({ L, Z, Y, X });
-    itk::Impact::AccumulateCoarseCost<3>(cost, *distance, fixed, moving, halfWidth, 0.5);
+    itk::Impact::AccumulateCoarseCost<3>(cost, *distance, fixed, moving, halfWidths, 0.5);
     double worst = 0;
     for (int64_t l = 0; l < L; ++l)
     {
       // The candidate's offsets, x fastest.
-      const int64_t dx = l % side - halfWidth, dy = (l / side) % side - halfWidth, dz = l / (side * side) - halfWidth;
+      const int64_t dx = l % sx - halfWidths[2], dy = (l / sx) % sy - halfWidths[1], dz = l / (sx * sy) - halfWidths[0];
       auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
         return static_cast<double>(M[0][c][clampTo(z + dz, Z)][clampTo(y + dy, Y)][clampTo(x + dx, X)]);
       };
@@ -3626,6 +3634,141 @@ TEST(ImpactConvexAdam, CoarseRecoversATranslationWithEveryDistance)
     const auto error = InteriorMeanError(coarse->GetDisplacementField(), expected, 8);
     for (unsigned int d = 0; d < 3; ++d)
       EXPECT_LT(error[d], 1.5) << name << ", axis " << d;
+  }
+}
+
+// ConvexAdam's knobs are counted in voxels of the fixed image's finest axis, s_min, and derived per axis so that they
+// are (nearly) isotropic in millimetres: on an isotropic image every axis keeps the numbers as they are, whatever the
+// spacing; on a 1 x 1 x 3 mm or a 1 x 1 x 2.5 mm image the thick axis takes fewer voxels. All in tensor order (z, y,
+// x).
+TEST(ImpactConvexAdam, KnobsAreCountedInUnitsOfTheFinestVoxelSide)
+{
+  using Counts = std::vector<int64_t>;
+  for (const double side : { 1.0, 2.0, 0.7 })
+  {
+    const std::vector<double> sides{ side, side, side };
+    EXPECT_EQ(itk::Impact::IsotropicVoxelCounts(sides, 6), (Counts{ 6, 6, 6 })) << side << " mm";
+    EXPECT_EQ(itk::Impact::CaptureHalfWidths(sides, { 6, 6, 6 }, 6, 4), (Counts{ 4, 4, 4 })) << side << " mm";
+    EXPECT_EQ(itk::Impact::IsotropicWindow(sides, { 24, 24, 24 }, { 1, 2, 12, 12, 12 }, 5), (Counts{ 5, 5, 5 }));
+  }
+  ImageType::SpacingType thick;
+  thick[0] = 1.0;
+  thick[1] = 1.0;
+  thick[2] = 3.0;
+  const std::vector<double> sides = itk::Impact::TensorVoxelSides<3>(thick);
+  EXPECT_EQ(sides, (std::vector<double>{ 3.0, 1.0, 1.0 }));
+  const Counts cells = itk::Impact::IsotropicVoxelCounts(sides, 6); // coarse cells of 6 mm
+  EXPECT_EQ(cells, (Counts{ 2, 6, 6 }));
+  EXPECT_EQ(itk::Impact::CaptureHalfWidths(sides, cells, 6, 4), (Counts{ 4, 4, 4 }))
+    << "24 mm each way: 9^3 candidates";
+  EXPECT_EQ(itk::Impact::IsotropicVoxelCounts(sides, 2), (Counts{ 1, 2, 2 })) << "the fine control grid's shrink";
+  const std::vector<double> sides25{ 2.5, 1.0, 1.0 };
+  const Counts              cells25 = itk::Impact::IsotropicVoxelCounts(sides25, 6); // round(2.4) = 2: 5 mm along z
+  EXPECT_EQ(cells25, (Counts{ 2, 6, 6 }));
+  EXPECT_EQ(itk::Impact::CaptureHalfWidths(sides25, cells25, 6, 4), (Counts{ 5, 4, 4 }))
+    << "24 mm: 5 cells of 5 mm along z, 4 of 6 mm in-plane, 11 x 9 x 9 candidates";
+  // The LNCC window, on a map at the image's resolution and on one pooled to the fine grid of shrink (1, 2, 2).
+  EXPECT_EQ(itk::Impact::IsotropicWindow(sides, { 24, 24, 24 }, { 1, 2, 24, 24, 24 }, 5), (Counts{ 1, 5, 5 }));
+  EXPECT_EQ(itk::Impact::IsotropicWindow(sides, { 24, 24, 24 }, { 1, 2, 24, 12, 12 }, 5), (Counts{ 3, 5, 5 }));
+}
+
+// On an isotropic image, the coarse and the fine stage work in voxels whatever the spacing: the same images at 2 mm
+// give exactly twice the field in millimetres they give at 1 mm, through every knob (cells, capture range, shrink,
+// smoothing, learning rate, regularization, the LNCC window) and the warm start.
+TEST(ImpactConvexAdam, IsotropicSpacingOnlyScalesTheField)
+{
+  using CoarseType = itk::ImpactCoarseRegistration<ImageType>;
+  using FieldType = CoarseType::DisplacementFieldType;
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto run = [&](double side) {
+    ImageType::SpacingType spacing;
+    spacing.Fill(side);
+    auto fixed = MakeTorchAdamPattern(20, 0, 0, 0, spacing, identity);
+    auto moving = MakeTorchAdamPattern(20, 2.5, -1.5, 1.0, spacing, identity);
+    auto coarse = CoarseType::New();
+    coarse->SetFixedImage(fixed);
+    coarse->SetMovingImage(moving);
+    coarse->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+    coarse->SetDistance({ "L2", "NCC" });
+    coarse->SetGridSpacing(2);
+    coarse->SetDisplacementHalfWidth(3);
+    coarse->Update();
+    auto fine = TorchAdamFilterType::New();
+    fine->SetFixedImage(fixed);
+    fine->SetMovingImage(moving);
+    fine->SetInitialDisplacementField(coarse->GetDisplacementField());
+    fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+    fine->SetDistance({ "L2", "LNCC" });
+    fine->SetGridShrinkFactor(2);
+    fine->SetControlGridSmoothingIterations(2);
+    fine->SetNumberOfIterations(15);
+    fine->SetLearningRate(0.5);
+    fine->SetRegularizationWeight(1.0);
+    fine->Update();
+    return std::make_pair(FieldType::Pointer(coarse->GetDisplacementField()),
+                          FieldType::Pointer(fine->GetDisplacementField()));
+  };
+  const auto [coarse1, fine1] = run(1.0);
+  const auto [coarse2, fine2] = run(2.0);
+  for (const auto & [one, two] : { std::make_pair(coarse1, coarse2), std::make_pair(fine1, fine2) })
+  {
+    long                                              differing = 0;
+    itk::ImageRegionConstIteratorWithIndex<FieldType> it(one, one->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+      for (unsigned int d = 0; d < 3; ++d)
+        differing += 2.0f * it.Get()[d] != two->GetPixel(it.GetIndex())[d];
+    EXPECT_EQ(differing, 0) << (one == coarse1 ? "coarse" : "fine") << " field";
+  }
+}
+
+// On a 1 x 1 x 3 mm image, the coarse and the fine stage recover a translation along the thick axis as well as
+// in-plane, in millimetres.
+TEST(ImpactConvexAdam, AnisotropicSpacingRecoversADisplacementAlongEveryAxis)
+{
+  using CoarseType = itk::ImpactCoarseRegistration<ImageType>;
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  ImageType::SpacingType spacing;
+  spacing[0] = 1.0;
+  spacing[1] = 1.0;
+  spacing[2] = 3.0;
+  // 3 mm along x, -2 mm along y, 6 mm (2 voxels) along z.
+  auto                   fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto                   moving = MakeTorchAdamPattern(24, 3.0, -2.0, 2.0, spacing, identity);
+  itk::Vector<double, 3> expected;
+  expected[0] = 3.0;
+  expected[1] = -2.0;
+  expected[2] = 6.0;
+  const itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false);
+  auto coarse = CoarseType::New();
+  coarse->SetFixedImage(fixed);
+  coarse->SetMovingImage(moving);
+  coarse->AddModelConfiguration(config);
+  coarse->SetGridSpacing(2);
+  coarse->SetDisplacementHalfWidth(4);
+  coarse->Update();
+  const auto coarseError = InteriorMeanError(coarse->GetDisplacementField(), expected, 6);
+  auto       fine = TorchAdamFilterType::New();
+  fine->SetFixedImage(fixed);
+  fine->SetMovingImage(moving);
+  fine->SetInitialDisplacementField(coarse->GetDisplacementField());
+  fine->AddModelConfiguration(config);
+  fine->SetDistance({ "L2" });
+  fine->SetGridShrinkFactor(2);
+  fine->SetControlGridSmoothingIterations(1);
+  fine->SetNumberOfIterations(100);
+  fine->SetLearningRate(0.2);
+  fine->SetRegularizationWeight(0.1);
+  fine->Update();
+  const auto fineError = InteriorMeanError(fine->GetDisplacementField(), expected, 6);
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    EXPECT_LT(coarseError[d], 1.5) << "coarse, axis " << d << " (mm)";
+    EXPECT_LT(fineError[d], 0.6) << "fine, axis " << d << " (mm)";
   }
 }
 

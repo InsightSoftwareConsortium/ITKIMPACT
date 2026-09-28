@@ -29,6 +29,7 @@
 
 #include <torch/torch.h>
 #include <cmath>
+#include <vector>
 #include <iostream>
 
 namespace itk::Impact
@@ -166,9 +167,11 @@ public:
   }
 
   /** The loss between two feature maps on one grid, {1, C, spatial...}, for a spatial distance; `kernel` is the
-   * side of its window in voxels. */
+   * side of its window in voxels along each spatial axis, odd, in the maps' axis order. */
   virtual torch::Tensor
-  forwardSpatial(const torch::Tensor & fixedMap, const torch::Tensor & movingMap, int64_t kernel) const
+  forwardSpatial(const torch::Tensor &        fixedMap,
+                 const torch::Tensor &        movingMap,
+                 const std::vector<int64_t> & kernel) const
   {
     (void)fixedMap;
     (void)movingMap;
@@ -895,15 +898,29 @@ public:
   }
 
   torch::Tensor
-  forwardSpatial(const torch::Tensor & fixedMap, const torch::Tensor & movingMap, int64_t kernel) const override
+  forwardSpatial(const torch::Tensor &        fixedMap,
+                 const torch::Tensor &        movingMap,
+                 const std::vector<int64_t> & kernel) const override
   {
     namespace F = torch::nn::functional;
-    const int64_t dimension = fixedMap.dim() - 2;
-    auto          mean = [&](const torch::Tensor & x) {
+    const int64_t        dimension = fixedMap.dim() - 2;
+    std::vector<int64_t> padding;
+    for (const int64_t side : kernel)
+    {
+      padding.push_back(side / 2);
+    }
+    auto mean = [&](const torch::Tensor & x) {
       if (dimension == 3)
-        return F::avg_pool3d(
-          x, F::AvgPool3dFuncOptions(kernel).stride(1).padding(kernel / 2).count_include_pad(false));
-      return F::avg_pool2d(x, F::AvgPool2dFuncOptions(kernel).stride(1).padding(kernel / 2).count_include_pad(false));
+        return F::avg_pool3d(x,
+                             F::AvgPool3dFuncOptions(torch::ExpandingArray<3>(at::IntArrayRef(kernel)))
+                               .stride(1)
+                               .padding(torch::ExpandingArray<3>(at::IntArrayRef(padding)))
+                               .count_include_pad(false));
+      return F::avg_pool2d(x,
+                           F::AvgPool2dFuncOptions(torch::ExpandingArray<2>(at::IntArrayRef(kernel)))
+                             .stride(1)
+                             .padding(torch::ExpandingArray<2>(at::IntArrayRef(padding)))
+                             .count_include_pad(false));
     };
     return 1.0 - SquaredCorrelation(mean(fixedMap),
                                     mean(movingMap),

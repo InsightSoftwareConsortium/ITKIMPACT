@@ -41,6 +41,8 @@
 
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 #if defined(_WIN32)
@@ -375,6 +377,83 @@ PcaSweepDimensions(const std::vector<ImpactModelConfiguration> & configs, unsign
   }
   return dimensions;
 }
+
+/** \name Voxel counts read in units of the finest voxel side
+ * The registration stages count their cells, windows and steps in voxels of the fixed image's finest axis, s_min, and
+ * derive each axis's own count from it, so that they are (nearly) isotropic in millimetres. On an isotropic image the
+ * derived counts are the given ones on every axis. Every vector here runs in tensor order (z, y, x). */
+/** @{ */
+/** The voxel sides of `spacing` (ITK order, x first) in tensor order (z, y, x). */
+template <unsigned int Dim, typename TSpacing>
+std::vector<double>
+TensorVoxelSides(const TSpacing & spacing)
+{
+  std::vector<double> sides(Dim);
+  for (unsigned int a = 0; a < Dim; ++a)
+  {
+    sides[a] = spacing[Dim - 1 - a];
+  }
+  return sides;
+}
+
+/** Per axis, `count` voxels of the finest axis in voxels of axis a, max(1, round(count * s_min / s_a)). */
+inline std::vector<int64_t>
+IsotropicVoxelCounts(const std::vector<double> & sides, double count)
+{
+  const double         finest = *std::min_element(sides.begin(), sides.end());
+  std::vector<int64_t> counts(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    counts[a] = std::max<int64_t>(1, std::llround(count * finest / sides[a]));
+  }
+  return counts;
+}
+
+/** Per axis, the number of cells of `cells[a]` voxels a search of `halfWidth` cells of `cellSize` voxels of the finest
+ * axis reaches each way: ceil(R / (cells[a] * s_a)), R = halfWidth * cellSize * s_min mm. */
+inline std::vector<int64_t>
+CaptureHalfWidths(const std::vector<double> &  sides,
+                  const std::vector<int64_t> & cells,
+                  int64_t                      cellSize,
+                  int64_t                      halfWidth)
+{
+  const double         finest = *std::min_element(sides.begin(), sides.end());
+  std::vector<int64_t> halfWidths(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    // cell_ref / cell_a, exactly 1 on an isotropic image; the tolerance keeps 1 from rounding up.
+    const double ratio = (static_cast<double>(cellSize) * finest) / (static_cast<double>(cells[a]) * sides[a]);
+    halfWidths[a] = static_cast<int64_t>(std::ceil(static_cast<double>(halfWidth) * ratio - 1e-9));
+  }
+  return halfWidths;
+}
+
+/** Per axis, a window of `kernel` voxels along the finest axis in millimetres of a map of shape `mapShape` ({1, C,
+ * spatial...}) over an image of `spatial` voxels of `sides` mm: along each axis the odd number of voxels nearest the
+ * same length, the map's voxel side being the image's times its rounded pooling factor. `kernel` on every axis of an
+ * isotropic map. */
+inline std::vector<int64_t>
+IsotropicWindow(const std::vector<double> &  sides,
+                const std::vector<int64_t> & spatial,
+                c10::IntArrayRef             mapShape,
+                int64_t                      kernel)
+{
+  std::vector<double> side(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    const int64_t pooling =
+      std::max<int64_t>(1, std::llround(static_cast<double>(spatial[a]) / static_cast<double>(mapShape[2 + a])));
+    side[a] = sides[a] * static_cast<double>(pooling);
+  }
+  const double         smallest = *std::min_element(side.begin(), side.end());
+  std::vector<int64_t> window(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    window[a] = 2 * static_cast<int64_t>(std::floor(static_cast<double>(kernel) * (smallest / side[a]) / 2.0)) + 1;
+  }
+  return window;
+}
+/** @} */
 
 /** Channel-first {1, Dim, z,y,x} -> channel-last {z,y,x, Dim} permutation (drops batch). */
 template <unsigned int Dim>

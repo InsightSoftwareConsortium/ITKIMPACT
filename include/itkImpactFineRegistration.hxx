@@ -262,16 +262,27 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     spatial[d] = static_cast<int64_t>(fixedSize[ImageDimension - 1 - d]);
   }
 
-  // ---- 2. Optimizable control grid {1, N, coarse z,y,x}; component order (z,y,x), full-res
-  // voxel units. With GridShrinkFactor>1 it lives at image-size / GridShrinkFactor and is
-  // upsampled to full resolution each iteration (ConvexAdam-style); the values stay in full-res
-  // voxel units. Warm-started from an initial field (e.g. the coarse stage) if provided, else zero. ----
-  const int64_t        shrink = static_cast<int64_t>(std::max(1u, m_GridShrinkFactor));
+  // ---- 2. Optimizable control grid {1, N, coarse z,y,x}; component order (z,y,x), in units of the
+  // fixed image's finest voxel side s_min, so that an Adam step of LearningRate moves LearningRate * s_min
+  // mm along every axis. Along axis a the grid is shrink_a = max(1, round(GridShrinkFactor * s_min / s_a))
+  // times coarser than the image, (nearly) isotropic in millimetres, and is upsampled to full resolution
+  // each iteration (ConvexAdam-style). An isotropic image keeps GridShrinkFactor on every axis and its
+  // voxels as the unit. Warm-started from an initial field (e.g. the coarse stage) if provided, else zero. ----
+  const std::vector<double>  voxelSide = Impact::TensorVoxelSides<ImageDimension>(m_FixedImage->GetSpacing());
+  const double               finest = *std::min_element(voxelSide.begin(), voxelSide.end());
+  const std::vector<int64_t> shrink =
+    Impact::IsotropicVoxelCounts(voxelSide, static_cast<double>(std::max(1u, m_GridShrinkFactor)));
   std::vector<int64_t> coarseSpatial(ImageDimension);
+  std::vector<float>   voxelsPerUnit(ImageDimension); // s_min / s_a: a field unit in voxels of axis a
   for (unsigned int d = 0; d < ImageDimension; ++d)
   {
-    coarseSpatial[d] = std::max<int64_t>(1, spatial[d] / shrink);
+    coarseSpatial[d] = std::max<int64_t>(1, spatial[d] / shrink[d]);
+    voxelsPerUnit[d] = static_cast<float>(finest / voxelSide[d]);
   }
+  // One factor per displacement component, {1, N, 1, ...}.
+  std::vector<int64_t> componentShape(ImageDimension + 2, 1);
+  componentShape[1] = static_cast<int64_t>(ImageDimension);
+  const torch::Tensor  unitToVoxels = torch::tensor(voxelsPerUnit, torch::kFloat32).view(componentShape).to(device);
   std::vector<int64_t> fieldShape;
   fieldShape.push_back(1);
   fieldShape.push_back(static_cast<int64_t>(ImageDimension));
@@ -286,9 +297,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       itkExceptionMacro("InitialDisplacementField must be defined on the fixed-image grid.");
     }
-    torch::Tensor initField = Impact::DisplacementToVoxelField<ImageDimension>(
-      m_InitialDisplacementField, m_FixedImage->GetSpacing(), m_FixedImage->GetDirection(), device); // {1,N,z,y,x}
-    if (shrink > 1)
+    torch::Tensor initField =
+      Impact::DisplacementToVoxelField<ImageDimension>(
+        m_InitialDisplacementField, m_FixedImage->GetSpacing(), m_FixedImage->GetDirection(), device) /
+      unitToVoxels; // {1,N,z,y,x}, in units of s_min
+    if (coarseSpatial != spatial)
     {
       if constexpr (ImageDimension == 3)
         initField = torch::nn::functional::interpolate(
@@ -322,11 +335,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   torch::Tensor grid0 =
     torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true); // {1, z,y,x, N}
 
-  // Per-component normalization (size-1)/2 in (z, y, x) order (exact for align_corners=true).
+  // Per-component normalization in (z, y, x) order: the field units (s_min) per grid_sample unit, (size-1)/2 voxels
+  // (exact for align_corners=true) of s_a / s_min units each.
   std::vector<float> scaleValues(ImageDimension);
   for (unsigned int d = 0; d < ImageDimension; ++d)
   {
-    scaleValues[d] = (spatial[d] > 1) ? static_cast<float>((spatial[d] - 1) / 2.0) : 1.0f;
+    scaleValues[d] = (spatial[d] > 1) ? static_cast<float>((spatial[d] - 1) / 2.0 * (voxelSide[d] / finest)) : 1.0f;
   }
   torch::Tensor scale =
     torch::from_blob(scaleValues.data(), { static_cast<int64_t>(ImageDimension) }, torch::kFloat32).clone().to(device);
@@ -514,7 +528,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   auto layerLoss = [&](size_t l, const torch::Tensor & fixedMap, const torch::Tensor & movingMap) -> torch::Tensor {
     if (losses[l]->IsSpatial())
     {
-      return losses[l]->forwardSpatial(fixedMap, movingMap, static_cast<int64_t>(m_LNCCKernel));
+      // LNCCKernel voxels along the map's finest axis in millimetres, the same length along the others.
+      return losses[l]->forwardSpatial(
+        fixedMap, movingMap, Impact::IsotropicWindow(voxelSide, spatial, fixedMap.sizes(), m_LNCCKernel));
     }
     const int64_t channels = fixedMap.size(1);
     return losses[l]->forwardValue(fixedMap.permute(toChannelLast).reshape({ -1, channels }),
@@ -887,9 +903,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       {
         continue;
       }
+      // The gradient in mm per mm: the field (s_min units) differentiated per control cell of controlSpacing voxels,
+      // each s_a mm -- exactly the voxel-unit gradient on an isotropic image.
       const double controlSpacing = static_cast<double>(spatial[ax]) / static_cast<double>(len);
+      const double unitRatio = finest / voxelSide[ax];
       reg = reg + (regField.narrow(tdim, 1, len - 1) - regField.narrow(tdim, 0, len - 1)).pow(2).mean() /
-                    (controlSpacing * controlSpacing);
+                    (controlSpacing * controlSpacing) * (unitRatio * unitRatio);
     }
     reg = reg * m_RegularizationWeight;
 
@@ -1338,8 +1357,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   output->SetDirection(m_FixedImage->GetDirection());
   output->Allocate();
 
-  Impact::WriteVoxelFieldToDisplacement<ImageDimension>(
-    controlGridToFullField(theta.detach()), m_FixedImage->GetSpacing(), m_FixedImage->GetDirection(), output);
+  Impact::WriteVoxelFieldToDisplacement<ImageDimension>(controlGridToFullField(theta.detach()) * unitToVoxels,
+                                                        m_FixedImage->GetSpacing(),
+                                                        m_FixedImage->GetDirection(),
+                                                        output);
 
   // Wrap the field in a ready-to-use transform.
   m_DisplacementFieldTransform = DisplacementFieldTransformType::New();
