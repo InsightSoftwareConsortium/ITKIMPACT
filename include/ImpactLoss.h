@@ -135,6 +135,17 @@ public:
     throw std::runtime_error("forwardValue() is not implemented for this loss");
   }
 
+  /** The per-point terms forwardValue() averages, for a per-point-mean loss (IsPerPointMean): the feature vectors
+   * run along dimension 1, as {N, C} or {1, C, spatial...}, and dimension 1 is reduced. The coarse registration stage
+   * reads its cost volume from them. */
+  virtual torch::Tensor
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const
+  {
+    (void)fixedOutput;
+    (void)movingOutput;
+    throw std::runtime_error("forwardPoints() is not implemented for this loss");
+  }
+
   /** True if forwardValue() is a MEAN of independent per-point (per-row) terms -- i.e. the point
    * axis (dim 0) is reduced only by the final mean(). Such a loss can be evaluated on disjoint
    * subsets of points and recombined by their point-count weights (used by ImpactFineRegistration's
@@ -304,11 +315,17 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     // Sum (not mean) over channels so the similarity scales with the channel count and its
-    // balance against the diffusion regularizer matches the reference (see L2::forwardValue).
-    return (fixedOutput - movingOutput).abs().sum(1).mean();
+    // balance against the diffusion regularizer matches the reference (see L2::forwardPoints).
+    return (fixedOutput - movingOutput).abs().sum(1);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -343,12 +360,18 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     // Sum (not mean) over channels, i.e. an SSD over feature vectors, so the similarity scales
     // with the channel count exactly like ConvexAdam's `(mov-fix)^2.mean(1)*C`. A per-channel
     // mean makes the similarity ~C times smaller, over-regularizing the Adam refinement.
-    return (fixedOutput - movingOutput).pow(2).sum(1).mean();
+    return (fixedOutput - movingOutput).pow(2).sum(1);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -409,7 +432,7 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     torch::Tensor intersectionSum = (fixedOutput * movingOutput).sum(1);
     torch::Tensor unionSum = (fixedOutput + movingOutput).sum(1);
@@ -417,7 +440,13 @@ public:
     torch::Tensor unionSumSafe = unionSum + isEmpty.to(unionSum.scalar_type());
     torch::Tensor dice = 2.0 * intersectionSum / unionSumSafe;
     dice = dice.masked_fill(isEmpty, 1.0); // empty/empty => Dice = 1 (non-mutating)
-    return 1.0 - dice.mean();
+    return 1.0 - dice;
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -479,14 +508,20 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     torch::Tensor dotProduct = (fixedOutput * movingOutput).sum(1);
     torch::Tensor normFixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor normMoving = torch::norm(movingOutput, 2, 1);
     torch::Tensor cosine = dotProduct / (normFixed * normMoving);
     torch::Tensor expL1 = torch::exp(-this->lambda * (fixedOutput - movingOutput).abs());
-    return 1.0 - (cosine.unsqueeze(-1) * expL1).mean(1).mean();
+    return 1.0 - (cosine.unsqueeze(1) * expL1).mean(1);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -531,12 +566,18 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     torch::Tensor dotProduct = (fixedOutput * movingOutput).sum(1);
     torch::Tensor normFixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor normMoving = torch::norm(movingOutput, 2, 1);
-    return 1.0 - (dotProduct / (normFixed * normMoving)).mean();
+    return 1.0 - dotProduct / (normFixed * normMoving);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -585,6 +626,20 @@ public:
   NCC()
     : Loss()
   {}
+
+  /** Each channel's correlation from its moments -- the means of f, m, f^2, m^2 and f*m over a window (the coarse
+   * stage's cells) --, with the same floors as the global statistic below. */
+  static torch::Tensor
+  Correlation(const torch::Tensor & meanFixed,
+              const torch::Tensor & meanMoving,
+              const torch::Tensor & meanFixedSquare,
+              const torch::Tensor & meanMovingSquare,
+              const torch::Tensor & meanProduct)
+  {
+    const torch::Tensor varianceFixed = (meanFixedSquare - meanFixed * meanFixed).clamp_min(0.0);
+    const torch::Tensor varianceMoving = (meanMovingSquare - meanMoving * meanMoving).clamp_min(0.0);
+    return (meanProduct - meanFixed * meanMoving) / Denominator(varianceFixed, varianceMoving);
+  }
 
   /** NCC is a GLOBAL statistic: forwardValue() reduces over the point axis (per-channel sums over all
    * points) before combining, so it does NOT decompose over point subsets. Blocks chunked evaluation. */
@@ -793,6 +848,21 @@ public:
     : Loss()
   {}
 
+  /** Each channel's squared correlation from its moments over a window -- the means of f, m, f^2, m^2 and f*m --,
+   * both variances floored as ANTs does. */
+  static torch::Tensor
+  SquaredCorrelation(const torch::Tensor & meanFixed,
+                     const torch::Tensor & meanMoving,
+                     const torch::Tensor & meanFixedSquare,
+                     const torch::Tensor & meanMovingSquare,
+                     const torch::Tensor & meanProduct)
+  {
+    const torch::Tensor covariance = meanProduct - meanFixed * meanMoving;
+    const torch::Tensor varianceFixed = (meanFixedSquare - meanFixed * meanFixed).clamp_min(s_epsilon);
+    const torch::Tensor varianceMoving = (meanMovingSquare - meanMoving * meanMoving).clamp_min(s_epsilon);
+    return covariance * covariance / (varianceFixed * varianceMoving);
+  }
+
   bool
   IsSpatial() const override
   {
@@ -835,12 +905,12 @@ public:
           x, F::AvgPool3dFuncOptions(kernel).stride(1).padding(kernel / 2).count_include_pad(false));
       return F::avg_pool2d(x, F::AvgPool2dFuncOptions(kernel).stride(1).padding(kernel / 2).count_include_pad(false));
     };
-    const torch::Tensor fixedMean = mean(fixedMap);
-    const torch::Tensor movingMean = mean(movingMap);
-    const torch::Tensor covariance = mean(fixedMap * movingMap) - fixedMean * movingMean;
-    const torch::Tensor fixedVariance = (mean(fixedMap * fixedMap) - fixedMean * fixedMean).clamp_min(s_epsilon);
-    const torch::Tensor movingVariance = (mean(movingMap * movingMap) - movingMean * movingMean).clamp_min(s_epsilon);
-    return 1.0 - (covariance * covariance / (fixedVariance * movingVariance)).mean();
+    return 1.0 - SquaredCorrelation(mean(fixedMap),
+                                    mean(movingMap),
+                                    mean(fixedMap * fixedMap),
+                                    mean(movingMap * movingMap),
+                                    mean(fixedMap * movingMap))
+                   .mean();
   }
 };
 

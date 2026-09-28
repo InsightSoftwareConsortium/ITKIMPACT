@@ -44,7 +44,7 @@ namespace itk
  *   fixed + moving -> ImpactCoarseRegistration -> initial field
  *                  -> ImpactFineRegistration (SetInitialDisplacementField) -> refined field
  *
- * Follows the ConvexAdam strategy (Siebert/Hansen/Heinrich): build a discrete SSD cost
+ * Follows the ConvexAdam strategy (Siebert/Hansen/Heinrich): build a discrete cost
  * volume over a dense displacement search window on a coarse grid, then run a coupled-convex
  * global regularization (an increasing-coupling argmin/smoothing schedule) to obtain a smooth
  * coarse field, finally upsampled to full resolution. All heavy computation uses LibTorch. The
@@ -123,11 +123,20 @@ public:
    * features (0 or a missing entry = all), as ImpactFineRegistration::SetPCA. */
   itkSetMacro(PCA, std::vector<unsigned int>);
   itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
+  /** Per kept layer, the distance its cost compares with, as ImpactFineRegistration::SetDistance: L1,
+   * L2 (the default, ConvexAdam's squared differences), Cosine, L1Cosine, Dice, NCC or LNCC, a missing
+   * entry repeating the last one. The cost at a coarse voxel is the distance over the cell window around
+   * it -- the two 3^Dim box passes ConvexAdam smooths its cost with, a triangular 5^Dim window of coarse
+   * voxels: a point-wise distance is averaged over it, and NCC and LNCC both correlate each channel over
+   * it (neither the whole image nor LNCCKernel: one window per coarse voxel and candidate). Unused on
+   * intensities, which keep the squared differences. */
+  itkSetMacro(Distance, std::vector<std::string>);
+  itkGetConstReferenceMacro(Distance, std::vector<std::string>);
   /** Weight of each kept feature layer in the cost volume, one entry per layer kept across the
    * models, as ImpactFineRegistration::SetLayersWeight (a missing entry weighs 1). The cost sums
-   * the squared differences over every channel of every layer, so without a weight a layer with
-   * larger features or more channels outweighs the others, and the coupling schedule, whose
-   * coefficients are absolute, regularises it too little. Non-negative; unused on intensities. */
+   * the layers' distances, so without a weight a layer with larger features or more channels
+   * outweighs the others, and the coupling schedule, whose coefficients are absolute, regularises
+   * it too little. Non-negative; unused on intensities. */
   itkSetMacro(LayersWeight, std::vector<float>);
   itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
   /** Divide each layer's cost by its value at zero displacement, so every layer starts at 1 and
@@ -192,6 +201,7 @@ private:
   std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
   std::vector<unsigned int>             m_SubsetFeatures;
   std::vector<unsigned int>             m_PCA;
+  std::vector<std::string>              m_Distance;
   std::vector<float>                    m_LayersWeight;
   bool                                  m_NormalizeLosses{ true };
 

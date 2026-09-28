@@ -3223,6 +3223,161 @@ TEST(ImpactConvexAdam, NormalizedCoarseCostIgnoresTheFeatureRange)
   EXPECT_LT(meanDifference(run(1.0, true), run(10.0, true)), 1e-4) << "normalized, it must not";
 }
 
+// The coarse cost volume compares each layer with its distance, over the cell window around every coarse voxel --
+// the two 3^3 box passes ConvexAdam smooths its cost with --, for every candidate displacement of the edge-replicated
+// moving features. Checked for every distance against loops in double precision: a point-wise distance's terms
+// averaged over the window, NCC and LNCC correlated over it from the window's weighted moments.
+TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
+{
+  const int64_t C = 3, Z = 5, Y = 4, X = 6, halfWidth = 1, side = 3, L = 27;
+  torch::manual_seed(3);
+  const torch::Tensor fixed = torch::rand({ 1, C, Z, Y, X }) + 0.1;
+  const torch::Tensor moving = torch::rand({ 1, C, Z, Y, X }) + 0.1;
+  auto                F = fixed.accessor<float, 5>();
+  auto                M = moving.accessor<float, 5>();
+  using Volume = std::vector<double>; // z, y, x
+  auto at = [&](int64_t z, int64_t y, int64_t x) { return (z * Y + y) * X + x; };
+  // One zero-padded 3^3 box pass (the voxels outside the volume count as 0, and every window divides by 27).
+  auto box = [&](const Volume & q) {
+    Volume out(q.size(), 0.0);
+    for (int64_t z = 0; z < Z; ++z)
+      for (int64_t y = 0; y < Y; ++y)
+        for (int64_t x = 0; x < X; ++x)
+        {
+          double sum = 0;
+          for (int64_t dz = -1; dz <= 1; ++dz)
+            for (int64_t dy = -1; dy <= 1; ++dy)
+              for (int64_t dx = -1; dx <= 1; ++dx)
+              {
+                const int64_t u = z + dz, v = y + dy, w = x + dx;
+                if (u >= 0 && u < Z && v >= 0 && v < Y && w >= 0 && w < X)
+                  sum += q[at(u, v, w)];
+              }
+          out[at(z, y, x)] = sum / 27.0;
+        }
+    return out;
+  };
+  auto window = [&](const Volume & q) { return box(box(q)); };
+  auto clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
+
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  {
+    const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
+    torch::Tensor cost = torch::zeros({ L, Z, Y, X });
+    itk::Impact::AccumulateCoarseCost<3>(cost, *distance, fixed, moving, halfWidth, 0.5);
+    double worst = 0;
+    for (int64_t l = 0; l < L; ++l)
+    {
+      // The candidate's offsets, x fastest.
+      const int64_t dx = l % side - halfWidth, dy = (l / side) % side - halfWidth, dz = l / (side * side) - halfWidth;
+      auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
+        return static_cast<double>(M[0][c][clampTo(z + dz, Z)][clampTo(y + dy, Y)][clampTo(x + dx, X)]);
+      };
+      auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
+      Volume expected(Z * Y * X, 0.0);
+      if (name == "NCC" || name == "LNCC")
+      {
+        const Volume weight = window(Volume(Z * Y * X, 1.0));
+        for (int64_t c = 0; c < C; ++c)
+        {
+          Volume vf(Z * Y * X), vm(Z * Y * X), vff(Z * Y * X), vmm(Z * Y * X), vfm(Z * Y * X);
+          for (int64_t z = 0; z < Z; ++z)
+            for (int64_t y = 0; y < Y; ++y)
+              for (int64_t x = 0; x < X; ++x)
+              {
+                const double  a = f(c, z, y, x), b = m(c, z, y, x);
+                const int64_t i = at(z, y, x);
+                vf[i] = a;
+                vm[i] = b;
+                vff[i] = a * a;
+                vmm[i] = b * b;
+                vfm[i] = a * b;
+              }
+          const Volume mf = window(vf), mm = window(vm), mff = window(vff), mmm = window(vmm), mfm = window(vfm);
+          for (size_t i = 0; i < expected.size(); ++i)
+          {
+            const double w = weight[i];
+            const double meanF = mf[i] / w, meanM = mm[i] / w;
+            const double covariance = mfm[i] / w - meanF * meanM;
+            const double varianceF = mff[i] / w - meanF * meanF, varianceM = mmm[i] / w - meanM * meanM;
+            const double correlation =
+              name == "NCC"
+                ? covariance / std::max(std::sqrt(std::max(varianceF, 0.0)) * std::sqrt(std::max(varianceM, 0.0)), 1e-8)
+                : covariance * covariance / (std::max(varianceF, 1e-5) * std::max(varianceM, 1e-5));
+            expected[i] += (1.0 - correlation) / C;
+          }
+        }
+      }
+      else
+      {
+        Volume terms(Z * Y * X, 0.0);
+        for (int64_t z = 0; z < Z; ++z)
+          for (int64_t y = 0; y < Y; ++y)
+            for (int64_t x = 0; x < X; ++x)
+            {
+              double l1 = 0, l2 = 0, dot = 0, ff = 0, mm = 0, sum = 0;
+              for (int64_t c = 0; c < C; ++c)
+              {
+                const double a = f(c, z, y, x), b = m(c, z, y, x);
+                l1 += std::abs(a - b);
+                l2 += (a - b) * (a - b);
+                dot += a * b;
+                ff += a * a;
+                mm += b * b;
+                sum += a + b;
+              }
+              const double cosine = dot / std::sqrt(ff * mm);
+              double       damped = 0;
+              for (int64_t c = 0; c < C; ++c)
+                damped += cosine * std::exp(-0.1 * std::abs(f(c, z, y, x) - m(c, z, y, x))) / C;
+              terms[at(z, y, x)] = name == "L1"       ? l1
+                                   : name == "L2"     ? l2
+                                   : name == "Cosine" ? 1.0 - cosine
+                                   : name == "Dice"   ? 1.0 - 2.0 * dot / sum
+                                                      : 1.0 - damped;
+            }
+        expected = window(terms);
+      }
+      for (int64_t z = 0; z < Z; ++z)
+        for (int64_t y = 0; y < Y; ++y)
+          for (int64_t x = 0; x < X; ++x)
+            worst = std::max(worst, std::abs(cost[l][z][y][x].item<double>() - 0.5 * expected[at(z, y, x)]));
+    }
+    EXPECT_LT(worst, 1e-5) << name;
+  }
+}
+
+// Every distance finds the translation between two patterns in the coarse stage.
+TEST(ImpactConvexAdam, CoarseRecoversATranslationWithEveryDistance)
+{
+  using CoarseType = itk::ImpactCoarseRegistration<ImageType>;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto                   fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto                   moving = MakeTorchAdamPattern(24, 3.0, -2.5, 1.5, spacing, identity);
+  itk::Vector<double, 3> expected;
+  expected[0] = 3.0;
+  expected[1] = -2.5;
+  expected[2] = 1.5;
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "NCC", "LNCC" })
+  {
+    auto coarse = CoarseType::New();
+    coarse->SetFixedImage(fixed);
+    coarse->SetMovingImage(moving);
+    coarse->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false));
+    coarse->SetDistance({ name });
+    coarse->SetGridSpacing(2);
+    coarse->SetDisplacementHalfWidth(3);
+    coarse->Update();
+    const auto error = InteriorMeanError(coarse->GetDisplacementField(), expected, 8);
+    for (unsigned int d = 0; d < 3; ++d)
+      EXPECT_LT(error[d], 1.5) << name << ", axis " << d;
+  }
+}
+
 // PCA and the channel subset reach the coarse stage too: a subset drawn from the seeded generator gives the same
 // field twice, a subset of every channel changes nothing, and a PCA as wide as the layer changes nothing either.
 TEST(ImpactConvexAdam, CoarseTakesPCAAndASeededChannelSubset)
