@@ -2822,6 +2822,49 @@ TEST(ImpactTorchAdam, SampledJacobianPatchesLieOnTheMetricsPlanes)
   }
 }
 
+// elastix's IMPACT metric cuts a 2D model's patch through Impact::GetPatchIndex: for the same point, seed and model
+// it lays the patch on the plane the itkv4 metric (PatchPlaneRotation) and ImpactFineRegistration's sampled Jacobian
+// mode (SampledPatchPositions) use, so the three hosts draw identical planes. A 3D model keeps its precomputed box.
+TEST(ImpactBackend, GetPatchIndexCutsTheSamePlaneAsTheOtherHosts)
+{
+  itk::ImpactModelConfiguration plane(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt",
+                                      2,
+                                      1,
+                                      { 5, 3 },
+                                      { 0.5f, 0.75f, 1.f },
+                                      { 0, 0 },
+                                      { true, false },
+                                      false);
+  const std::vector<double>     millimetre{ 1.0, 1.0, 1.0 };
+  for (const std::array<int64_t, 3> point : { std::array<int64_t, 3>{ 4, 5, 6 }, std::array<int64_t, 3>{ 2, 3, 1 } })
+  {
+    for (const size_t model : { size_t{ 0 }, size_t{ 1 } })
+    {
+      const std::vector<std::vector<float>> patch = itk::Impact::GetPatchIndex(plane, 7, model, point, 3);
+      const torch::Tensor centre = torch::tensor({ point[0], point[1], point[2] }, torch::kLong).reshape({ 1, 3 });
+      const torch::Tensor positions = itk::Impact::SampledPatchPositions<3>(plane, centre, millimetre, 7, model);
+      const auto          rotation = itk::Impact::PatchPlaneRotation(7, model, point);
+      ASSERT_EQ(patch.size(), 15u);
+      for (size_t k = 0; k < 15; ++k)
+      {
+        const double u = (static_cast<double>(k % 5) - 2) * 0.5, v = (static_cast<double>(k / 5) - 1) * 0.75;
+        for (unsigned int j = 0; j < 3; ++j)
+        {
+          EXPECT_NEAR(patch[k][j], rotation[j][0] * u + rotation[j][1] * v, 1e-6) << "PatchPlaneRotation";
+          EXPECT_NEAR(patch[k][j], positions[0][static_cast<int64_t>(k)][j].item<double>() - point[j], 1e-6)
+            << "the sampled Jacobian mode's patch";
+        }
+      }
+    }
+  }
+  EXPECT_NE(itk::Impact::GetPatchIndex(plane, 7, 0, std::array<int64_t, 3>{ 4, 5, 6 }, 3),
+            itk::Impact::GetPatchIndex(plane, 7, 0, std::array<int64_t, 3>{ 4, 5, 7 }, 3))
+    << "a plane per point";
+  itk::ImpactModelConfiguration box(
+    ToyModelPath(), 3, 1, { 3, 3, 3 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
+  EXPECT_EQ(itk::Impact::GetPatchIndex(box, 7, 0, std::array<int64_t, 3>{ 4, 5, 6 }, 3), box.GetPatchIndex());
+}
+
 // The sampled Jacobian mode's gradient (the drawn points' patches warped by the field, run through the network, their
 // centre features compared, backpropagated batch by batch to the control grid) against finite differences of its
 // value, for a per-point distance and for NCC, whose gradient is seeded from the whole point set. The gradient is read
