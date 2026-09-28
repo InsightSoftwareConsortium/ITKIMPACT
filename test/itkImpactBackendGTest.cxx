@@ -2896,6 +2896,75 @@ TEST(ImpactTorchAdam, SampledJacobianGradientMatchesFiniteDifferences)
   }
 }
 
+// The sampled Jacobian mode as the presets run it: two models, a smoothed half-resolution control grid, the
+// normalization on, and several batches of points. Every batch back-propagates through the same smoothing of the
+// control grid, which a backward frees: the gradient is gathered on the smoothed field and crosses the smoothing once.
+// The first iteration's value is then each layer normalized to 1, and the gradient (read off a momentum-free first
+// Adam step, as above) does not depend on how the points are batched.
+TEST(ImpactTorchAdam, SampledJacobianBatchesShareTheSmoothedControlGrid)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto fixed = MakeTorchAdamPattern(12, 0, 0, 0, spacing, identity);
+  auto moving = MakeTorchAdamPattern(12, 1.0, -0.5, 0.7, spacing, identity);
+  auto run = [&](unsigned int batch, unsigned int iterations, bool readGradient) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 3, 3, 3 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false));
+    filter->AddModelConfiguration(
+      itk::ImpactModelConfiguration(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt",
+                                    2,
+                                    1,
+                                    { 5, 5 },
+                                    { 1.f, 1.f, 1.f },
+                                    { 0, 0 },
+                                    { false, true },
+                                    false));
+    filter->SetDistance({ "L2", "L2" });
+    filter->SetMode("Jacobian");
+    filter->SetSamplingPercentage(0.3);
+    filter->SetBatchSize(batch);
+    filter->SetGridShrinkFactor(2);
+    filter->SetControlGridSmoothingIterations(3);
+    filter->SetRegularizationWeight(0.0);
+    filter->SetNumberOfIterations(iterations);
+    filter->SetSeed(3);
+    if (readGradient)
+    {
+      filter->SetBeta1(0.0);
+      filter->SetBeta2(0.0);
+      filter->SetEpsilon(1e4);
+      filter->SetLearningRate(1e4);
+    }
+    filter->Update();
+    return filter;
+  };
+  auto batched = run(64, 1, true);
+  auto whole = run(0, 1, true);
+  ASSERT_EQ(batched->GetMetricValuesPerIteration().size(), 1u);
+  EXPECT_NEAR(batched->GetMetricValuesPerIteration()[0], 2.0, 1e-5) << "two layers, each normalized to 1";
+  double                                                     step = 0.0, difference = 0.0;
+  itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(whole->GetDisplacementField(),
+                                                                fixed->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    for (unsigned int c = 0; c < 3; ++c)
+    {
+      step = std::max(step, std::abs(static_cast<double>(it.Get()[c])));
+      difference = std::max(
+        difference,
+        std::abs(static_cast<double>(it.Get()[c]) - batched->GetDisplacementField()->GetPixel(it.GetIndex())[c]));
+    }
+  }
+  ASSERT_GT(step, 1e-6) << "no gradient";
+  EXPECT_LT(difference, 1e-3 * step) << "the batches must add up to the whole set's gradient";
+  EXPECT_NO_THROW(run(64, 3, false)) << "later iterations";
+}
+
 // The sampled Jacobian mode registers: a translation between two patterns is recovered from a quarter of the voxels.
 // Each point constrains the field through its whole patch, which a full-resolution unsmoothed control grid leaves
 // under-determined (the dense Jacobian mode as well): the grid is the presets' kind, half the resolution, smoothed.

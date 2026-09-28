@@ -908,7 +908,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         // drawn anew from the seeded generator, of which those whose every model patch fits in the image are kept
         // (elastix's SampleCheck).
         reg.backward();
-        const torch::Tensor smoothed = smoothControl(theta); // the field the patches are warped by, graph to theta
+        // The field the patches are warped by. Every batch below back-propagates into this detached leaf, and its
+        // accumulated gradient crosses the smoothing passes to the control grid once, at the end: the smoothing's graph
+        // is shared by every batch of every model, and a backward frees the graph it runs through.
+        const torch::Tensor smoothedControl = smoothControl(theta); // graph to theta
+        torch::Tensor       smoothed = smoothedControl.detach().requires_grad_(true);
+        smoothed.mutable_grad() = torch::zeros_like(smoothed);
         int64_t             voxels = 1;
         for (const int64_t extent : spatial)
         {
@@ -1097,9 +1102,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           seeds = torch::autograd::grad({ total }, leaves);
           simValue = total.template item<double>();
         }
-        // The moving side again, with the graph, a batch at a time: each batch's backward reaches the control grid and
-        // frees its network graph. A per-point distance's batch weighs its share of the points. A batch that runs out
-        // of device memory is replayed at half the size, with the gradient it had added taken back.
+        // The moving side again, with the graph, a batch at a time: each batch's backward reaches the smoothed field
+        // and frees its network graph. A per-point distance's batch weighs its share of the points. A batch that runs
+        // out of device memory is replayed at half the size, with the gradient it had added taken back.
         torch::Tensor gradientBefore;
         for (size_t i = 0; i < movingConfigs.size(); ++i)
         {
@@ -1108,7 +1113,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             device,
             n,
             [&](int64_t begin, int64_t end) {
-              gradientBefore = theta.grad().clone();
+              gradientBefore = smoothed.grad().clone();
               const std::vector<torch::Tensor> layers =
                 centresOf(movingConfigs[i], patchesOf(i, begin, end, true), movingMetadata);
               torch::Tensor surrogate = torch::zeros({}, theta.options());
@@ -1133,8 +1138,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
                 simValue += surrogate.template item<double>();
               }
             },
-            [&] { theta.mutable_grad().copy_(gradientBefore); });
+            [&] { smoothed.mutable_grad().copy_(gradientBefore); });
         }
+        smoothedControl.backward(smoothed.grad()); // the smoothing passes, once: -> theta.grad
         lossValue = simValue + reg.template item<double>();
       }
       else if (jacSliced)
