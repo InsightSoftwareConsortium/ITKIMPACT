@@ -3873,6 +3873,455 @@ TEST(ImpactConvexAdam, BalancedCoarseLayersSpreadAlikeAndKeepTheRawTotal)
   EXPECT_TRUE(raw->GetLayerSpreads().empty());
 }
 
+namespace
+{
+// A mask image on `reference`'s grid holding the voxels whose index along `axis` is below `limit`.
+itk::Image<unsigned char, 3>::Pointer
+HalfMask(const ImageType * reference, unsigned int axis, long limit)
+{
+  auto mask = itk::Image<unsigned char, 3>::New();
+  mask->SetRegions(reference->GetLargestPossibleRegion());
+  mask->CopyInformation(reference);
+  mask->Allocate();
+  itk::ImageRegionIteratorWithIndex<itk::Image<unsigned char, 3>> it(mask, mask->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    it.Set(it.GetIndex()[axis] < limit ? 1 : 0);
+  return mask;
+}
+} // namespace
+
+// The coarse cost volume with masks, against loops in double precision: each cell weighs by the fixed cell's mask share
+// times the moving mask's share shifted with the features (zero outside the image), every mean over the window is a
+// ratio of the weighted window sums, and a window without weight costs 0 and has no support. A correlation over a
+// window whose weight sits in about one cell is ill-conditioned in single precision (its variances are differences of
+// nearly equal moments), so NCC and LNCC are compared where the window holds at least a tenth of a full cell.
+TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
+{
+  const int64_t              C = 3, Z = 5, Y = 4, X = 6;
+  const std::vector<int64_t> halfWidths{ 1, 2, 1 }; // z, y, x
+  const int64_t              sx = 3, sy = 5, L = 45;
+  torch::manual_seed(4);
+  const torch::Tensor fixed = torch::rand({ 1, C, Z, Y, X }) + 0.1;
+  const torch::Tensor moving = torch::rand({ 1, C, Z, Y, X }) + 0.1;
+  torch::Tensor       fixedShare = torch::rand({ 1, 1, Z, Y, X });
+  torch::Tensor       movingShare = torch::rand({ 1, 1, Z, Y, X });
+  fixedShare.narrow(4, 0, 3).zero_(); // no fixed mask in the first three columns: some windows hold no weight
+  movingShare.narrow(3, 0, 2).zero_();
+  auto F = fixed.accessor<float, 5>();
+  auto M = moving.accessor<float, 5>();
+  auto PF = fixedShare.accessor<float, 5>();
+  auto PM = movingShare.accessor<float, 5>();
+  using Volume = std::vector<double>;
+  auto at = [&](int64_t z, int64_t y, int64_t x) { return (z * Y + y) * X + x; };
+  auto box = [&](const Volume & q) {
+    Volume out(q.size(), 0.0);
+    for (int64_t z = 0; z < Z; ++z)
+      for (int64_t y = 0; y < Y; ++y)
+        for (int64_t x = 0; x < X; ++x)
+        {
+          double sum = 0;
+          for (int64_t dz = -1; dz <= 1; ++dz)
+            for (int64_t dy = -1; dy <= 1; ++dy)
+              for (int64_t dx = -1; dx <= 1; ++dx)
+              {
+                const int64_t u = z + dz, v = y + dy, w = x + dx;
+                if (u >= 0 && u < Z && v >= 0 && v < Y && w >= 0 && w < X)
+                  sum += q[at(u, v, w)];
+              }
+          out[at(z, y, x)] = sum / 27.0;
+        }
+    return out;
+  };
+  auto                window = [&](const Volume & q) { return box(box(q)); };
+  auto                clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
+  const torch::Tensor support =
+    itk::Impact::CoarseMaskSupport<3>(fixedShare, movingShare, halfWidths, fixed.sizes(), L);
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  {
+    const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
+    torch::Tensor cost = torch::zeros({ L, Z, Y, X });
+    itk::Impact::AccumulateCoarseCost<3>(cost, *distance, fixed, moving, halfWidths, 0.5, fixedShare, movingShare);
+    double worst = 0;
+    long   unsupported = 0;
+    for (int64_t l = 0; l < L; ++l)
+    {
+      const int64_t dx = l % sx - halfWidths[2], dy = (l / sx) % sy - halfWidths[1], dz = l / (sx * sy) - halfWidths[0];
+      auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
+        return static_cast<double>(M[0][c][clampTo(z + dz, Z)][clampTo(y + dy, Y)][clampTo(x + dx, X)]);
+      };
+      auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
+      Volume weight(Z * Y * X, 0.0);
+      for (int64_t z = 0; z < Z; ++z)
+        for (int64_t y = 0; y < Y; ++y)
+          for (int64_t x = 0; x < X; ++x)
+          {
+            const int64_t u = z + dz, v = y + dy, w = x + dx; // the moving share is 0 outside the image
+            const double  pm = (u >= 0 && u < Z && v >= 0 && v < Y && w >= 0 && w < X) ? PM[0][0][u][v][w] : 0.0;
+            weight[at(z, y, x)] = PF[0][0][z][y][x] * pm;
+          }
+      const Volume total = window(weight);
+      auto         weighted = [&](const Volume & q) {
+        Volume product(q.size());
+        for (size_t i = 0; i < q.size(); ++i)
+          product[i] = q[i] * weight[i];
+        const Volume sum = window(product);
+        Volume       mean(q.size(), 0.0);
+        for (size_t i = 0; i < q.size(); ++i)
+          mean[i] = total[i] > 0 ? sum[i] / total[i] : 0.0;
+        return mean;
+      };
+      Volume expected(Z * Y * X, 0.0);
+      if (name == "NCC" || name == "LNCC")
+      {
+        for (int64_t c = 0; c < C; ++c)
+        {
+          Volume vf(Z * Y * X), vm(Z * Y * X), vff(Z * Y * X), vmm(Z * Y * X), vfm(Z * Y * X);
+          for (int64_t z = 0; z < Z; ++z)
+            for (int64_t y = 0; y < Y; ++y)
+              for (int64_t x = 0; x < X; ++x)
+              {
+                const double  a = f(c, z, y, x), b = m(c, z, y, x);
+                const int64_t i = at(z, y, x);
+                vf[i] = a;
+                vm[i] = b;
+                vff[i] = a * a;
+                vmm[i] = b * b;
+                vfm[i] = a * b;
+              }
+          const Volume mf = weighted(vf), mm = weighted(vm), mff = weighted(vff), mmm = weighted(vmm),
+                       mfm = weighted(vfm);
+          for (size_t i = 0; i < expected.size(); ++i)
+          {
+            if (!(total[i] > 0))
+              continue;
+            const double covariance = mfm[i] - mf[i] * mm[i];
+            const double varianceF = mff[i] - mf[i] * mf[i], varianceM = mmm[i] - mm[i] * mm[i];
+            const double correlation =
+              name == "NCC"
+                ? covariance / std::max(std::sqrt(std::max(varianceF, 0.0)) * std::sqrt(std::max(varianceM, 0.0)), 1e-8)
+                : covariance * covariance / (std::max(varianceF, 1e-5) * std::max(varianceM, 1e-5));
+            expected[i] += (1.0 - correlation) / C;
+          }
+        }
+      }
+      else
+      {
+        Volume terms(Z * Y * X, 0.0);
+        for (int64_t z = 0; z < Z; ++z)
+          for (int64_t y = 0; y < Y; ++y)
+            for (int64_t x = 0; x < X; ++x)
+            {
+              double l1 = 0, l2 = 0, dot = 0, ff = 0, mm = 0, sum = 0;
+              for (int64_t c = 0; c < C; ++c)
+              {
+                const double a = f(c, z, y, x), b = m(c, z, y, x);
+                l1 += std::abs(a - b);
+                l2 += (a - b) * (a - b);
+                dot += a * b;
+                ff += a * a;
+                mm += b * b;
+                sum += a + b;
+              }
+              const double cosine = dot / std::sqrt(ff * mm);
+              double       damped = 0;
+              for (int64_t c = 0; c < C; ++c)
+                damped += cosine * std::exp(-0.1 * std::abs(f(c, z, y, x) - m(c, z, y, x))) / C;
+              terms[at(z, y, x)] = name == "L1"       ? l1
+                                   : name == "L2"     ? l2
+                                   : name == "Cosine" ? 1.0 - cosine
+                                   : name == "Dice"   ? 1.0 - 2.0 * dot / sum
+                                                      : 1.0 - damped;
+            }
+        expected = weighted(terms);
+      }
+      for (int64_t z = 0; z < Z; ++z)
+        for (int64_t y = 0; y < Y; ++y)
+          for (int64_t x = 0; x < X; ++x)
+          {
+            const bool conditioned = (name != "NCC" && name != "LNCC") || total[at(z, y, x)] >= 0.1 / 27.0;
+            if (conditioned)
+              worst = std::max(worst, std::abs(cost[l][z][y][x].item<double>() - 0.5 * expected[at(z, y, x)]));
+            const bool held = total[at(z, y, x)] > 0;
+            EXPECT_EQ(support[l][z][y][x].item<bool>(), held) << name << " candidate " << l;
+            unsupported += !held;
+          }
+    }
+    EXPECT_LT(worst, name == "NCC" || name == "LNCC" ? 1e-4 : 1e-5) << name;
+    EXPECT_GT(unsupported, 0) << "some windows must hold no weight";
+  }
+  // Without data, a candidate costs the worst supported one there, and a voxel with no data at all costs 0.
+  const torch::Tensor volume = torch::tensor({ 1.f, 5.f, 3.f, 7.f, 2.f, 4.f }).reshape({ 3, 2 });
+  const torch::Tensor held = torch::tensor({ true, false, false, false, true, false }).reshape({ 3, 2 });
+  const torch::Tensor filled = itk::Impact::FillCoarseCostWithoutData(volume, held);
+  EXPECT_TRUE(torch::equal(filled, torch::tensor({ 1.f, 0.f, 2.f, 0.f, 2.f, 0.f }).reshape({ 3, 2 })));
+}
+
+// A coarse voxel whose cells hold no fixed mask has no data cost and follows its neighbours through the coupling:
+// with the fixed mask on one half, the field over the other half stays within the translation the masked half finds
+// (the first argmin of a volume of zeros, the most negative candidate, would put it at -hw cells on every axis, 6
+// voxels here).
+TEST(ImpactConvexAdam, CoarseCellsWithoutMaskFollowTheirNeighbours)
+{
+  using CoarseType = itk::ImpactCoarseRegistration<ImageType>;
+  using FieldType = CoarseType::DisplacementFieldType;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto moving = MakeTorchAdamPattern(24, 2.0, -2.0, 2.0, spacing, identity);
+  auto coarse = CoarseType::New();
+  coarse->SetFixedImage(fixed);
+  coarse->SetMovingImage(moving);
+  coarse->SetFixedMask(HalfMask(fixed, 0, 12));
+  coarse->AddModelConfiguration(itk::ImpactModelConfiguration(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false));
+  coarse->SetGridSpacing(2);
+  coarse->SetDisplacementHalfWidth(3);
+  coarse->Update();
+  itk::Vector<double, 3> expected;
+  expected[0] = 2.0;
+  expected[1] = -2.0;
+  expected[2] = 2.0;
+  double                                            worst = 0;
+  itk::ImageRegionConstIteratorWithIndex<FieldType> it(coarse->GetDisplacementField(),
+                                                       fixed->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    if (it.GetIndex()[0] >= 12)
+      for (unsigned int d = 0; d < 3; ++d)
+        worst = std::max(worst, std::abs(it.Get()[d]) - std::abs(expected[d]));
+  EXPECT_LT(worst, 1.0) << "no voxel of the unmasked half moves half a cell beyond the translation";
+  const auto error = InteriorMeanError(coarse->GetDisplacementField(), expected, 8);
+  EXPECT_LT(error[1] + error[2], 2.0) << "the masked half still registers";
+}
+
+// The fine stage's masked distance, against loops in double precision for every distance: a point-wise distance's
+// terms averaged over the kept voxels, NCC's correlation over them, LNCC's local terms (windows over every voxel)
+// averaged over them; 0 for a mask keeping nothing; the whole map without a mask.
+TEST(ImpactTorchAdam, MaskedMapLossMatchesABruteForceForEveryDistance)
+{
+  const int64_t C = 3, Z = 4, Y = 5, X = 6;
+  torch::manual_seed(6);
+  const auto                 options = torch::TensorOptions().dtype(torch::kFloat64);
+  const torch::Tensor        fixed = torch::rand({ 1, C, Z, Y, X }, options) + 0.1;
+  const torch::Tensor        moving = torch::rand({ 1, C, Z, Y, X }, options) + 0.1;
+  const torch::Tensor        mask = torch::rand({ 1, 1, Z, Y, X }) > 0.4;
+  const std::vector<int64_t> window{ 3, 3, 3 };
+  auto                       F = fixed.accessor<double, 5>();
+  auto                       M = moving.accessor<double, 5>();
+  auto                       K = mask.accessor<bool, 5>();
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  {
+    const auto   loss = itk::Impact::LossFactory::Instance().Create(name);
+    const double value = itk::Impact::MapLoss<3>(*loss, fixed, moving, mask, window).item<double>();
+    double       expected = 0;
+    long         kept = 0;
+    if (name == "NCC")
+    {
+      for (int64_t c = 0; c < C; ++c)
+      {
+        double sf = 0, sm = 0, sff = 0, smm = 0, sfm = 0;
+        long   n = 0;
+        for (int64_t z = 0; z < Z; ++z)
+          for (int64_t y = 0; y < Y; ++y)
+            for (int64_t x = 0; x < X; ++x)
+              if (K[0][0][z][y][x])
+              {
+                const double a = F[0][c][z][y][x], b = M[0][c][z][y][x];
+                sf += a;
+                sm += b;
+                sff += a * a;
+                smm += b * b;
+                sfm += a * b;
+                ++n;
+              }
+        const double covariance = sfm - sf * sm / n;
+        expected += covariance / std::sqrt((sff - sf * sf / n) * (smm - sm * sm / n)) / C;
+      }
+      expected = 1.0 - expected;
+    }
+    else
+    {
+      for (int64_t z = 0; z < Z; ++z)
+        for (int64_t y = 0; y < Y; ++y)
+          for (int64_t x = 0; x < X; ++x)
+          {
+            if (!K[0][0][z][y][x])
+              continue;
+            ++kept;
+            double term = 0;
+            if (name == "LNCC")
+            {
+              for (int64_t c = 0; c < C; ++c)
+              {
+                double sf = 0, sm = 0, sff = 0, smm = 0, sfm = 0;
+                long   n = 0;
+                for (int64_t u = std::max<int64_t>(z - 1, 0); u <= std::min<int64_t>(z + 1, Z - 1); ++u)
+                  for (int64_t v = std::max<int64_t>(y - 1, 0); v <= std::min<int64_t>(y + 1, Y - 1); ++v)
+                    for (int64_t w = std::max<int64_t>(x - 1, 0); w <= std::min<int64_t>(x + 1, X - 1); ++w)
+                    {
+                      const double a = F[0][c][u][v][w], b = M[0][c][u][v][w];
+                      sf += a;
+                      sm += b;
+                      sff += a * a;
+                      smm += b * b;
+                      sfm += a * b;
+                      ++n;
+                    }
+                const double mf = sf / n, mm = sm / n;
+                const double covariance = sfm / n - mf * mm;
+                term +=
+                  covariance * covariance / (std::max(sff / n - mf * mf, 1e-5) * std::max(smm / n - mm * mm, 1e-5)) / C;
+              }
+              term = 1.0 - term;
+            }
+            else
+            {
+              double l1 = 0, l2 = 0, dot = 0, ff = 0, mm = 0, sum = 0;
+              for (int64_t c = 0; c < C; ++c)
+              {
+                const double a = F[0][c][z][y][x], b = M[0][c][z][y][x];
+                l1 += std::abs(a - b);
+                l2 += (a - b) * (a - b);
+                dot += a * b;
+                ff += a * a;
+                mm += b * b;
+                sum += a + b;
+              }
+              const double cosine = dot / std::sqrt(ff * mm);
+              double       damped = 0;
+              for (int64_t c = 0; c < C; ++c)
+                damped += cosine * std::exp(-0.1 * std::abs(F[0][c][z][y][x] - M[0][c][z][y][x])) / C;
+              term = name == "L1"       ? l1
+                     : name == "L2"     ? l2
+                     : name == "Cosine" ? 1.0 - cosine
+                     : name == "Dice"   ? 1.0 - 2.0 * dot / sum
+                                        : 1.0 - damped;
+            }
+            expected += term;
+          }
+      expected /= kept;
+    }
+    EXPECT_NEAR(value, expected, 1e-9) << name;
+    EXPECT_EQ(itk::Impact::MapLoss<3>(*loss, fixed, moving, torch::zeros_like(mask), window).item<double>(), 0.0)
+      << name << ": a mask keeping nothing";
+    EXPECT_NEAR(itk::Impact::MapLoss<3>(*loss, fixed, moving, {}, window).item<double>(),
+                itk::Impact::MapLoss<3>(*loss, fixed, moving, torch::ones_like(mask), window).item<double>(),
+                1e-9)
+      << name << ": no mask is every voxel";
+  }
+}
+
+// With a fixed mask on one half of the image and nothing but the similarity moving the field (no regularization, no
+// smoothing, a full-resolution control grid), the control points of the other half receive no gradient and stay where
+// they started, exactly -- in Static mode and in the intensity path; in Jacobian mode, beyond the model's reach (its
+// 3^3 convolution) of the mask's edge. The masked half registers.
+TEST(ImpactTorchAdam, MaskedOutVoxelsDoNotMove)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto fixed = MakeTorchAdamPattern(16, 0, 0, 0, spacing, identity);
+  auto moving = MakeTorchAdamPattern(16, 1.0, -1.0, 1.0, spacing, identity);
+  auto mask = HalfMask(fixed, 0, 8);
+  for (const std::string mode : { "Static", "Jacobian", "Intensity" })
+  {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->SetFixedMask(mask);
+    if (mode != "Intensity")
+    {
+      filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+        ToyModelPath(), 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false));
+      filter->SetDistance({ "L2" });
+      filter->SetMode(mode);
+    }
+    filter->SetRegularizationWeight(0.0);
+    filter->SetNumberOfIterations(30);
+    filter->SetLearningRate(0.1);
+    filter->Update();
+    const long reach = mode == "Jacobian" ? 10 : 8; // the first index that must not move
+    double     outside = 0, inside = 0;
+    itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(filter->GetDisplacementField(),
+                                                                  fixed->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+      for (unsigned int d = 0; d < 3; ++d)
+      {
+        if (it.GetIndex()[0] >= reach)
+          outside = std::max(outside, static_cast<double>(std::abs(it.Get()[d])));
+        if (it.GetIndex()[0] < 6)
+          inside = std::max(inside, static_cast<double>(std::abs(it.Get()[d])));
+      }
+    EXPECT_EQ(outside, 0.0) << mode << ": a control point outside the mask moved";
+    EXPECT_GT(inside, 0.2) << mode << ": the masked half must register";
+  }
+}
+
+// With masks the fine stage still recovers a translation where they hold, in every mode (the sampled ones drawing
+// their points in the fixed mask), with a moving mask as well.
+TEST(ImpactTorchAdam, MaskedRegistrationRecoversATranslation)
+{
+  const double           tx = 1.5, ty = -1.0, tz = 1.0;
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto                   fixed = MakeTorchAdamPattern(20, 0, 0, 0, spacing, identity);
+  auto                   moving = MakeTorchAdamPattern(20, tx, ty, tz, spacing, identity);
+  itk::Vector<double, 3> expected;
+  expected[0] = tx;
+  expected[1] = ty;
+  expected[2] = tz;
+  struct Case
+  {
+    std::string  mode;
+    double       share;
+    unsigned int patch;
+    std::string  distance;
+  };
+  for (const Case & c : { Case{ "Static", 1.0, 0, "L2" },
+                          Case{ "Static", 0.3, 0, "NCC" },
+                          Case{ "Jacobian", 1.0, 0, "L2" },
+                          Case{ "Jacobian", 0.3, 3, "L2" } })
+  {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->SetFixedMask(HalfMask(fixed, 2, 14));
+    filter->SetMovingMask(HalfMask(moving, 2, 17));
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { c.patch, c.patch, c.patch }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false));
+    filter->SetDistance({ c.distance });
+    filter->SetMode(c.mode);
+    filter->SetSamplingPercentage(c.share);
+    filter->SetGridShrinkFactor(2);
+    filter->SetControlGridSmoothingIterations(1);
+    filter->SetNumberOfIterations(200);
+    filter->SetLearningRate(0.2);
+    filter->SetRegularizationWeight(0.05);
+    filter->Update();
+    // Inside the fixed mask (z < 14), away from the image border.
+    itk::Vector<double, 3> error;
+    error.Fill(0.0);
+    long                                                       n = 0;
+    itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(filter->GetDisplacementField(),
+                                                                  fixed->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    {
+      const auto i = it.GetIndex();
+      if (i[0] < 5 || i[0] >= 15 || i[1] < 5 || i[1] >= 15 || i[2] < 5 || i[2] >= 11)
+        continue;
+      for (unsigned int d = 0; d < 3; ++d)
+        error[d] += std::abs(it.Get()[d] - expected[d]);
+      ++n;
+    }
+    for (unsigned int d = 0; d < 3; ++d)
+      EXPECT_LT(error[d] / n, 0.5) << c.mode << " " << c.share << " " << c.distance << ": axis " << d;
+  }
+}
+
 // PCA and the channel subset reach the coarse stage too: a subset drawn from the seeded generator gives the same
 // field twice, a subset of every channel changes nothing, and a PCA as wide as the layer changes nothing either.
 TEST(ImpactConvexAdam, CoarseTakesPCAAndASeededChannelSubset)

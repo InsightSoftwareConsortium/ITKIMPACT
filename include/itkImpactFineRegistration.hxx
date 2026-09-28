@@ -253,6 +253,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
 
   torch::Tensor fixedT = Impact::ImageToBatchTensor(m_FixedImage.GetPointer()).to(device);
   torch::Tensor movingT = Impact::ImageToBatchTensor(movingOnFixed.GetPointer()).to(device);
+  // The masks on the fixed grid, bool; undefined when absent, and then nothing below costs anything.
+  const torch::Tensor fixedMask = Impact::MaskOnGrid(m_FixedMask.GetPointer(), m_FixedImage.GetPointer(), device);
+  const torch::Tensor movingMask = Impact::MaskOnGrid(m_MovingMask.GetPointer(), m_FixedImage.GetPointer(), device);
+  const bool          masked = fixedMask.defined() || movingMask.defined();
 
   // Spatial sizes in torch (z, y, x) order.
   const auto &         fixedSize = m_FixedImage->GetLargestPossibleRegion().GetSize();
@@ -496,6 +500,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // resampling, like the itkv4 metric.
   const bool jacSliced = jacobianMode && !sampled && !m_FixedModelsConfiguration.empty() &&
                          m_FixedModelsConfiguration[0].GetDimension() < ImageDimension;
+  // The moving mask as floats at full resolution, which the modes warping it there need.
+  const torch::Tensor movingMaskShare =
+    movingMask.defined() && (jacSliced || sampledJacobian) ? movingMask.to(torch::kFloat32) : torch::Tensor();
 
   // Feature-mode setup: extract the fixed/moving feature layers (constants, not differentiated
   // through), optionally PCA-reduce them (fit on fixed), and build one loss per kept layer.
@@ -524,26 +531,65 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     return (l < subsets.size() && subsets[l].defined()) ? layer.index_select(1, subsets[l]) : layer;
   };
   // Layer l's loss between two feature maps on one grid ({1, C, spatial...}): a spatial distance (LNCC) reads the
-  // maps whole, the others compare their feature vectors voxel by voxel.
-  auto layerLoss = [&](size_t l, const torch::Tensor & fixedMap, const torch::Tensor & movingMap) -> torch::Tensor {
-    if (losses[l]->IsSpatial())
+  // maps whole (its window LNCCKernel voxels along the map's finest axis in millimetres, the same length along the
+  // others), the others compare their feature vectors voxel by voxel; over the voxels `mask` keeps, when given.
+  auto layerLoss = [&](size_t                l,
+                       const torch::Tensor & fixedMap,
+                       const torch::Tensor & movingMap,
+                       const torch::Tensor & mask = {}) -> torch::Tensor {
+    return Impact::MapLoss<ImageDimension>(
+      *losses[l],
+      fixedMap,
+      movingMap,
+      mask,
+      losses[l]->IsSpatial() ? Impact::IsotropicWindow(voxelSide, spatial, fixedMap.sizes(), m_LNCCKernel)
+                             : std::vector<int64_t>{});
+  };
+  // The masks on a grid of `size` voxels: the fixed one as bool (its share of each voxel >= 0.5), the moving one as its
+  // share, to be warped; undefined when absent.
+  auto fixedMaskOn = [&](const std::vector<int64_t> & size) {
+    return fixedMask.defined() ? Impact::MaskShare<ImageDimension>(fixedMask, size) >= 0.5 : torch::Tensor();
+  };
+  auto movingShareOn = [&](const std::vector<int64_t> & size) {
+    return movingMask.defined() ? Impact::MaskShare<ImageDimension>(movingMask, size) : torch::Tensor();
+  };
+  // The voxels that count: `fixedOn`, and where the moving mask's share `movingShare` warped by `grid` (grid_sample
+  // coordinates, a function returning them, only called with a moving mask) holds.
+  auto countedVoxels = [&](const torch::Tensor & fixedOn, const torch::Tensor & movingShare, const auto & grid) {
+    if (!movingShare.defined())
     {
-      // LNCCKernel voxels along the map's finest axis in millimetres, the same length along the others.
-      return losses[l]->forwardSpatial(
-        fixedMap, movingMap, Impact::IsotropicWindow(voxelSide, spatial, fixedMap.sizes(), m_LNCCKernel));
+      return fixedOn;
     }
-    const int64_t channels = fixedMap.size(1);
-    return losses[l]->forwardValue(fixedMap.permute(toChannelLast).reshape({ -1, channels }),
-                                   movingMap.permute(toChannelLast).reshape({ -1, channels }));
+    torch::NoGradGuard  noGrad;
+    const torch::Tensor warped = F::grid_sample(movingShare, grid().detach(), sampleOpts) >= 0.5;
+    return fixedOn.defined() ? fixedOn.logical_and(warped) : warped;
   };
   // SamplingPercentage < 1: layer l's loss on that share of its voxels, drawn anew at every iteration. Only those
   // points are warped: the fixed features are read at the drawn voxels, the moving ones at the same voxels displaced
   // by the residual field, interpolated there as gridForLayerControl's resizeField would (align_corners both).
-  auto sampledLayerLoss = [&](size_t l, const torch::Tensor & smoothedResidual) -> torch::Tensor {
-    const int64_t       voxels = layerBaseGrid[l].numel() / ImageDimension;
-    const int64_t       count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(voxels)));
-    const torch::Tensor drawn =
-      torch::randint(voxels, { count }, torch::TensorOptions().dtype(torch::kLong).device(device));
+  // With masks, the points are drawn in the fixed mask (that share of its voxels), and those the moving mask, warped by
+  // the total field, does not hold are dropped.
+  std::vector<torch::Tensor> fixedLayerMask, movingLayerShare, fixedLayerCandidates; // Static mode, per layer
+  auto                       sampledLayerLoss =
+    [&](size_t l, const torch::Tensor & smoothedResidual, const torch::Tensor & smoothedTotal) -> torch::Tensor {
+    const int64_t voxels = layerBaseGrid[l].numel() / ImageDimension;
+    int64_t       count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(voxels)));
+    torch::Tensor drawn;
+    if (fixedMask.defined())
+    {
+      const int64_t candidates = fixedLayerCandidates[l].numel();
+      if (candidates == 0)
+      {
+        return torch::zeros({}, theta.options());
+      }
+      count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(candidates)));
+      drawn = fixedLayerCandidates[l].index_select(
+        0, torch::randint(candidates, { count }, torch::TensorOptions().dtype(torch::kLong).device(device)));
+    }
+    else
+    {
+      drawn = torch::randint(voxels, { count }, torch::TensorOptions().dtype(torch::kLong).device(device));
+    }
     const torch::Tensor  points = layerBaseGrid[l].reshape({ voxels, ImageDimension }).index_select(0, drawn);
     std::vector<int64_t> pointShape(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, n, N}
     pointShape[ImageDimension] = count;
@@ -555,7 +601,29 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     const torch::Tensor moving = F::grid_sample(pick(l, movingLayers[l]), warpedPoints, sampleOpts);
     const int64_t       channels = moving.size(1);
     const torch::Tensor fixed = pick(l, fixedLayers[l]).reshape({ channels, voxels }).index_select(1, drawn);
-    return losses[l]->forwardValue(fixed.t(), moving.reshape({ channels, count }).t());
+    if (!movingMask.defined())
+    {
+      return losses[l]->forwardValue(fixed.t(), moving.reshape({ channels, count }).t());
+    }
+    torch::Tensor rows;
+    {
+      torch::NoGradGuard noGrad;
+      torch::Tensor      atTotal = warpedPoints.detach();
+      if (smoothedTotal.defined())
+      {
+        const torch::Tensor total = F::grid_sample(smoothedTotal, points.reshape(pointShape), sampleOpts)
+                                      .reshape({ static_cast<int64_t>(ImageDimension), count })
+                                      .t();
+        atTotal = (points + (total / scale).flip(-1)).reshape(pointShape);
+      }
+      rows = (F::grid_sample(movingLayerShare[l], atTotal, sampleOpts) >= 0.5).flatten().nonzero().flatten();
+    }
+    if (rows.numel() == 0)
+    {
+      return (moving * 0.0).sum();
+    }
+    return losses[l]->forwardValue(fixed.index_select(1, rows).t(),
+                                   moving.reshape({ channels, count }).index_select(1, rows).t());
   };
   const std::vector<ImpactModelConfiguration> & movingConfigs =
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
@@ -618,6 +686,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   {
     std::vector<torch::Tensor> layers;
     std::vector<torch::Tensor> basis;
+    std::vector<torch::Tensor> masks; // the fixed mask on each layer's grid (with one)
   };
   std::vector<SweptFixedLayers> sweptFixed(ImageDimension);
   auto                          fixedSweptAlong = [&](unsigned int axis) -> const SweptFixedLayers & {
@@ -639,6 +708,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           layer = Impact::PcaReduce(layer.squeeze(0), entry.basis[l], components, sweep[l]).unsqueeze(0);
         }
         entry.layers[l] = poolExcept(layer, keep).contiguous();
+        if (fixedMask.defined())
+        {
+          entry.masks.push_back(
+            fixedMaskOn(std::vector<int64_t>(entry.layers[l].sizes().begin() + 2, entry.layers[l].sizes().end())));
+        }
       }
     }
     return entry;
@@ -782,6 +856,16 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         for (size_t l = 0; l < fixedLayers.size(); ++l)
         {
           fixedLayersOnline[l] = poolLayerToLoss(fixedLayers[l]).contiguous();
+          if (masked)
+          {
+            const std::vector<int64_t> ls(fixedLayersOnline[l].sizes().begin() + 2, fixedLayersOnline[l].sizes().end());
+            fixedLayerMask.push_back(fixedMaskOn(ls));
+            movingLayerShare.push_back(movingShareOn(ls));
+            std::vector<int64_t> gs{ 1, 1 };
+            gs.insert(gs.end(), ls.begin(), ls.end());
+            layerBaseGrid.push_back(torch::affine_grid_generator(idAffine, gs, /*align_corners=*/true));
+            layerSpatials.push_back(ls);
+          }
         }
       }
     }
@@ -811,6 +895,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           }
           layerBaseGrid[l] = torch::affine_grid_generator(idAffine, gs, /*align_corners=*/true);
         }
+        if (masked)
+        {
+          fixedLayerMask.push_back(fixedMaskOn(ls));
+          movingLayerShare.push_back(movingShareOn(ls));
+          if (sampled && fixedMask.defined())
+          {
+            fixedLayerCandidates.push_back(fixedLayerMask.back().flatten().nonzero().flatten());
+          }
+        }
       }
     }
   }
@@ -820,13 +913,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // moving image warped by the current total field, and the loop warps them by the residual
   // (theta - thetaRef); thetaRef stays 0 (residual == theta) when disabled.
   torch::Tensor thetaRef = torch::zeros_like(theta);
+  bool          refreshed = false; // whether thetaRef has moved off 0
 
   // ConvexAdam-style intensity refinement: evaluate the similarity at the control-grid resolution
   // (coarseSpatial), so GridShrinkFactor plays the role of the reference's grid_sp_adam. Moving/fixed
   // are pooled once to that grid and the field is warped and compared there, instead of upsampling
   // the field and warping at full resolution every iteration. With GridShrinkFactor==1
   // coarseSpatial==spatial and this is bit-identical to the full-res path.
-  torch::Tensor movingCoarse, fixedCoarse, gridBaseCoarse;
+  torch::Tensor movingCoarse, fixedCoarse, gridBaseCoarse, fixedCoarseMask, movingCoarseShare;
   if (!featureMode)
   {
     auto poolToCoarse = [&](const torch::Tensor & t) -> torch::Tensor {
@@ -843,6 +937,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     };
     movingCoarse = poolToCoarse(movingT);
     fixedCoarse = poolToCoarse(fixedT);
+    fixedCoarseMask = fixedMaskOn(coarseSpatial);
+    movingCoarseShare = movingShareOn(coarseSpatial);
     std::vector<int64_t> gs{ 1, 1 };
     for (auto s : coarseSpatial)
     {
@@ -963,201 +1059,228 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             config, points, fixedSpacing, m_Seed, i, Impact::PatchCorners(config));
           fits = fits & ((corners >= 0.0) & (corners <= upper)).flatten(1).all(1);
         }
-        const torch::Tensor kept = points.index_select(0, fits.nonzero().flatten());
-        const int64_t       n = kept.size(0);
-        if (n == 0)
+        if (fixedMask.defined()) // the points drawn in the fixed mask
+        {
+          fits = fits & fixedMask.flatten().index_select(0, flat.to(device)).to(torch::kCPU);
+        }
+        torch::Tensor       kept = points.index_select(0, fits.nonzero().flatten());
+        const torch::Tensor toGrid = torch::tensor(gridScale, torch::kFloat64);
+        if (movingMask.defined() && kept.size(0) > 0)
+        {
+          // ... that the moving mask, warped by the field, holds at their centre.
+          torch::NoGradGuard   noGrad;
+          std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, n, Dim}
+          where[ImageDimension] = kept.size(0);
+          where[ImageDimension + 1] = ImageDimension;
+          const torch::Tensor centres =
+            (kept.to(torch::kFloat64) / toGrid - 1.0).to(torch::kFloat32).to(device).reshape(where);
+          const torch::Tensor displacement = F::grid_sample(smoothedControl.detach(), centres, sampleOpts)
+                                               .reshape({ static_cast<int64_t>(ImageDimension), kept.size(0) })
+                                               .t();
+          const torch::Tensor holds =
+            F::grid_sample(movingMaskShare, centres + (displacement / scale).flip(-1).reshape(where), sampleOpts) >=
+            0.5;
+          kept = kept.index_select(0, holds.flatten().nonzero().flatten().to(torch::kCPU));
+        }
+        const int64_t n = kept.size(0);
+        if (n == 0 && !masked)
         {
           itkExceptionMacro("ImpactFineRegistration: no drawn point has its model patch inside the image; the patch "
                             "(PatchSize x voxel size) is larger than the image, or SamplingPercentage too small.");
         }
-        const torch::Tensor toGrid = torch::tensor(gridScale, torch::kFloat64);
-        // Model i's patches of points [begin, end), {b, 1, reversed PatchSize...}: in the fixed image, or in the moving
-        // image as the field warps it (differentiable, so the gradient reaches the control grid). The patch voxels are
-        // placed a batch at a time, as grid_sample coordinates (x, y, z: ITK order).
-        auto patchesOf = [&](size_t i, int64_t begin, int64_t end, bool moving) {
-          const torch::Tensor grid =
-            (Impact::SampledPatchPositions<ImageDimension>(
-               m_FixedModelsConfiguration[i], kept.narrow(0, begin, end - begin), fixedSpacing, m_Seed, i) /
-               toGrid -
-             1.0)
-              .to(torch::kFloat32)
-              .to(device);
-          const int64_t        samples = grid.size(0) * grid.size(1);
-          std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, samples, Dim}
-          where[ImageDimension] = samples;
-          where[ImageDimension + 1] = ImageDimension;
-          torch::Tensor at = grid.reshape(where);
-          if (moving)
-          {
-            const torch::Tensor displacement =
-              F::grid_sample(smoothed, at, sampleOpts).reshape({ static_cast<int64_t>(ImageDimension), samples }).t();
-            at = at + (displacement / scale).flip(-1).reshape(where);
-          }
-          std::vector<int64_t> shape{ end - begin, 1 };
-          for (const int64_t extent : Impact::PatchTensorShape(m_FixedModelsConfiguration[i]))
-          {
-            shape.push_back(extent);
-          }
-          return F::grid_sample(moving ? movingT : fixedT, at, sampleOpts).reshape(shape);
-        };
-        // Every kept layer's centre feature vector {b, C} of a model run on `patches`, normalized, the voxel the patch
-        // is centred on (GetCentersIndexLayers' size / 2).
-        auto centresOf = [&](const ImpactModelConfiguration & config,
-                             const torch::Tensor &            patches,
-                             const ImpactImageMetadata &      metadata) {
-          std::vector<int64_t> repeat(patches.dim(), 1);
-          repeat[1] = static_cast<int64_t>(config.GetNumberOfChannels());
-          std::vector<torch::jit::IValue> outputs =
-            Forward(config, patches.repeat(repeat).to(GetModelDtype(config)), metadata);
-          const std::vector<bool> &  mask = config.GetLayersMask();
-          std::vector<torch::Tensor> layers;
-          for (size_t it = 0; it < outputs.size() && it < mask.size(); ++it)
-          {
-            if (mask[it])
+        double simValue = 0.0; // no point in the masks: no data this iteration
+        if (n > 0)
+        {
+          // Model i's patches of points [begin, end), {b, 1, reversed PatchSize...}: in the fixed image, or in the
+          // moving image as the field warps it (differentiable, so the gradient reaches the control grid). The patch
+          // voxels are placed a batch at a time, as grid_sample coordinates (x, y, z: ITK order).
+          auto patchesOf = [&](size_t i, int64_t begin, int64_t end, bool moving) {
+            const torch::Tensor grid =
+              (Impact::SampledPatchPositions<ImageDimension>(
+                 m_FixedModelsConfiguration[i], kept.narrow(0, begin, end - begin), fixedSpacing, m_Seed, i) /
+                 toGrid -
+               1.0)
+                .to(torch::kFloat32)
+                .to(device);
+            const int64_t        samples = grid.size(0) * grid.size(1);
+            std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, samples, Dim}
+            where[ImageDimension] = samples;
+            where[ImageDimension + 1] = ImageDimension;
+            torch::Tensor at = grid.reshape(where);
+            if (moving)
             {
-              torch::Tensor layer = outputs[it].toTensor();
-              while (layer.dim() > 2)
+              const torch::Tensor displacement =
+                F::grid_sample(smoothed, at, sampleOpts).reshape({ static_cast<int64_t>(ImageDimension), samples }).t();
+              at = at + (displacement / scale).flip(-1).reshape(where);
+            }
+            std::vector<int64_t> shape{ end - begin, 1 };
+            for (const int64_t extent : Impact::PatchTensorShape(m_FixedModelsConfiguration[i]))
+            {
+              shape.push_back(extent);
+            }
+            return F::grid_sample(moving ? movingT : fixedT, at, sampleOpts).reshape(shape);
+          };
+          // Every kept layer's centre feature vector {b, C} of a model run on `patches`, normalized, the voxel the
+          // patch is centred on (GetCentersIndexLayers' size / 2).
+          auto centresOf = [&](const ImpactModelConfiguration & config,
+                               const torch::Tensor &            patches,
+                               const ImpactImageMetadata &      metadata) {
+            std::vector<int64_t> repeat(patches.dim(), 1);
+            repeat[1] = static_cast<int64_t>(config.GetNumberOfChannels());
+            std::vector<torch::jit::IValue> outputs =
+              Forward(config, patches.repeat(repeat).to(GetModelDtype(config)), metadata);
+            const std::vector<bool> &  mask = config.GetLayersMask();
+            std::vector<torch::Tensor> layers;
+            for (size_t it = 0; it < outputs.size() && it < mask.size(); ++it)
+            {
+              if (mask[it])
               {
-                layer = layer.select(2, layer.size(2) / 2);
+                torch::Tensor layer = outputs[it].toTensor();
+                while (layer.dim() > 2)
+                {
+                  layer = layer.select(2, layer.size(2) / 2);
+                }
+                layers.push_back(
+                  Impact::NormalizeFeatureChannels(layer.to(torch::kFloat32), config.GetFeatureNormalization(), 1));
               }
-              layers.push_back(
-                Impact::NormalizeFeatureChannels(layer.to(torch::kFloat32), config.GetFeatureNormalization(), 1));
+            }
+            return layers;
+          };
+          std::vector<size_t> firstLayer{ 0 }; // model i's kept layers start at firstLayer[i] in the flat list
+          for (const auto & config : m_FixedModelsConfiguration)
+          {
+            firstLayer.push_back(firstLayer.back() + NumberOfKeptLayers(config));
+          }
+          // Every point's centre features on one side, without the graph, a batch of patches at a time.
+          std::vector<torch::Tensor> fixedCentres(losses.size());
+          std::vector<torch::Tensor> movingCentres(losses.size());
+          auto                       gather = [&](bool moving) {
+            torch::NoGradGuard noGrad;
+            for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
+            {
+              const ImpactModelConfiguration & config = moving ? movingConfigs[i] : m_FixedModelsConfiguration[i];
+              std::vector<std::vector<torch::Tensor>> pieces(firstLayer[i + 1] - firstLayer[i]);
+              Impact::ForEachBatch(
+                config,
+                device,
+                n,
+                [&](int64_t begin, int64_t end) {
+                  const std::vector<torch::Tensor> layers =
+                    centresOf(config, patchesOf(i, begin, end, moving), moving ? movingMetadata : fixedMetadata);
+                  for (size_t k = 0; k < pieces.size(); ++k)
+                  {
+                    pieces[k].push_back(layers[k]);
+                  }
+                },
+                [] {});
+              for (size_t k = 0; k < pieces.size(); ++k)
+              {
+                (moving ? movingCentres : fixedCentres)[firstLayer[i] + k] = torch::cat(pieces[k]);
+              }
+            }
+          };
+          gather(false);
+          drawSubsets(fixedCentres);
+          // PCA, a 3D model's rule on the points: the basis fitted on the fixed features of this iteration's points,
+          // each side centred by its own mean over them -- the moving one taken without the graph, so that every point
+          // keeps a gradient of its own.
+          std::vector<torch::Tensor> basis(losses.size());
+          std::vector<torch::Tensor> movingMean(losses.size());
+          bool                       reduces = false;
+          for (size_t l = 0; l < losses.size(); ++l)
+          {
+            if (const int64_t components = pcaComponents(l, fixedCentres[l].size(1)); components > 0)
+            {
+              basis[l] = Impact::PcaFit(fixedCentres[l].t(), components);
+              fixedCentres[l] = Impact::PcaTransform(fixedCentres[l].t(), basis[l]).t();
+              reduces = true;
             }
           }
-          return layers;
-        };
-        std::vector<size_t> firstLayer{ 0 }; // model i's kept layers start at firstLayer[i] in the flat list
-        for (const auto & config : m_FixedModelsConfiguration)
-        {
-          firstLayer.push_back(firstLayer.back() + NumberOfKeptLayers(config));
-        }
-        // Every point's centre features on one side, without the graph, a batch of patches at a time.
-        std::vector<torch::Tensor> fixedCentres(losses.size());
-        std::vector<torch::Tensor> movingCentres(losses.size());
-        auto                       gather = [&](bool moving) {
-          torch::NoGradGuard noGrad;
-          for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
+          const bool latching = m_NormalizeLosses && !normalization.IsLatched(0);
+          const bool perPoint =
+            std::all_of(losses.begin(), losses.end(), [](const std::unique_ptr<Impact::Loss> & loss) {
+              return loss->IsPerPointMean();
+            });
+          if (!perPoint || reduces || latching)
           {
-            const ImpactModelConfiguration &        config = moving ? movingConfigs[i] : m_FixedModelsConfiguration[i];
-            std::vector<std::vector<torch::Tensor>> pieces(firstLayer[i + 1] - firstLayer[i]);
+            gather(true);
+          }
+          for (size_t l = 0; l < losses.size(); ++l)
+          {
+            if (basis[l].defined())
+            {
+              movingMean[l] = movingCentres[l].mean(0).unsqueeze(1);
+            }
+          }
+          // A moving side's features {b, C} as layer l compares them.
+          auto reduced = [&](size_t l, const torch::Tensor & centres) {
+            return pick(l,
+                        basis[l].defined() ? Impact::PcaTransform(centres.t(), basis[l], movingMean[l]).t() : centres);
+          };
+          if (latching)
+          {
+            for (size_t l = 0; l < losses.size(); ++l)
+            {
+              normalization.Latch(l,
+                                  losses[l]
+                                    ->forwardValue(pick(l, fixedCentres[l]), reduced(l, movingCentres[l]))
+                                    .template item<double>());
+            }
+          }
+          // A global distance (NCC) mixes the points: its gradient with respect to each point's features is only known
+          // from the whole set, so it is taken there, on the features as a leaf, and seeds each batch's backward below.
+          std::vector<torch::Tensor> seeds;
+          if (!perPoint)
+          {
+            std::vector<torch::Tensor> leaves;
+            torch::Tensor              total = torch::zeros({}, theta.options());
+            for (size_t l = 0; l < losses.size(); ++l)
+            {
+              leaves.push_back(movingCentres[l].detach().requires_grad_(true));
+              total = total + layerWeights[l] *
+                                normalized(l, losses[l]->forwardValue(pick(l, fixedCentres[l]), reduced(l, leaves[l])));
+            }
+            seeds = torch::autograd::grad({ total }, leaves);
+            simValue = total.template item<double>();
+          }
+          // The moving side again, with the graph, a batch at a time: each batch's backward reaches the smoothed field
+          // and frees its network graph. A per-point distance's batch weighs its share of the points. A batch that runs
+          // out of device memory is replayed at half the size, with the gradient it had added taken back.
+          torch::Tensor gradientBefore;
+          for (size_t i = 0; i < movingConfigs.size(); ++i)
+          {
             Impact::ForEachBatch(
-              config,
+              movingConfigs[i],
               device,
               n,
               [&](int64_t begin, int64_t end) {
+                gradientBefore = smoothed.grad().clone();
                 const std::vector<torch::Tensor> layers =
-                  centresOf(config, patchesOf(i, begin, end, moving), moving ? movingMetadata : fixedMetadata);
-                for (size_t k = 0; k < pieces.size(); ++k)
+                  centresOf(movingConfigs[i], patchesOf(i, begin, end, true), movingMetadata);
+                torch::Tensor surrogate = torch::zeros({}, theta.options());
+                for (size_t k = 0; k < layers.size(); ++k)
                 {
-                  pieces[k].push_back(layers[k]);
+                  const size_t l = firstLayer[i] + k;
+                  if (perPoint)
+                  {
+                    const torch::Tensor value = losses[l]->forwardValue(
+                      pick(l, fixedCentres[l].narrow(0, begin, end - begin)), reduced(l, layers[k]));
+                    surrogate = surrogate + layerWeights[l] * normalized(l, value) *
+                                              (static_cast<double>(end - begin) / static_cast<double>(n));
+                  }
+                  else
+                  {
+                    surrogate = surrogate + (layers[k] * seeds[l].narrow(0, begin, end - begin)).sum();
+                  }
                 }
-              },
-              [] {});
-            for (size_t k = 0; k < pieces.size(); ++k)
-            {
-              (moving ? movingCentres : fixedCentres)[firstLayer[i] + k] = torch::cat(pieces[k]);
-            }
-          }
-        };
-        gather(false);
-        drawSubsets(fixedCentres);
-        // PCA, a 3D model's rule on the points: the basis fitted on the fixed features of this iteration's points,
-        // each side centred by its own mean over them -- the moving one taken without the graph, so that every point
-        // keeps a gradient of its own.
-        std::vector<torch::Tensor> basis(losses.size());
-        std::vector<torch::Tensor> movingMean(losses.size());
-        bool                       reduces = false;
-        for (size_t l = 0; l < losses.size(); ++l)
-        {
-          if (const int64_t components = pcaComponents(l, fixedCentres[l].size(1)); components > 0)
-          {
-            basis[l] = Impact::PcaFit(fixedCentres[l].t(), components);
-            fixedCentres[l] = Impact::PcaTransform(fixedCentres[l].t(), basis[l]).t();
-            reduces = true;
-          }
-        }
-        const bool latching = m_NormalizeLosses && !normalization.IsLatched(0);
-        const bool perPoint = std::all_of(losses.begin(), losses.end(), [](const std::unique_ptr<Impact::Loss> & loss) {
-          return loss->IsPerPointMean();
-        });
-        if (!perPoint || reduces || latching)
-        {
-          gather(true);
-        }
-        for (size_t l = 0; l < losses.size(); ++l)
-        {
-          if (basis[l].defined())
-          {
-            movingMean[l] = movingCentres[l].mean(0).unsqueeze(1);
-          }
-        }
-        // A moving side's features {b, C} as layer l compares them.
-        auto reduced = [&](size_t l, const torch::Tensor & centres) {
-          return pick(l, basis[l].defined() ? Impact::PcaTransform(centres.t(), basis[l], movingMean[l]).t() : centres);
-        };
-        if (latching)
-        {
-          for (size_t l = 0; l < losses.size(); ++l)
-          {
-            normalization.Latch(
-              l,
-              losses[l]->forwardValue(pick(l, fixedCentres[l]), reduced(l, movingCentres[l])).template item<double>());
-          }
-        }
-        // A global distance (NCC) mixes the points: its gradient with respect to each point's features is only known
-        // from the whole set, so it is taken there, on the features as a leaf, and seeds each batch's backward below.
-        double                     simValue = 0.0;
-        std::vector<torch::Tensor> seeds;
-        if (!perPoint)
-        {
-          std::vector<torch::Tensor> leaves;
-          torch::Tensor              total = torch::zeros({}, theta.options());
-          for (size_t l = 0; l < losses.size(); ++l)
-          {
-            leaves.push_back(movingCentres[l].detach().requires_grad_(true));
-            total = total + layerWeights[l] *
-                              normalized(l, losses[l]->forwardValue(pick(l, fixedCentres[l]), reduced(l, leaves[l])));
-          }
-          seeds = torch::autograd::grad({ total }, leaves);
-          simValue = total.template item<double>();
-        }
-        // The moving side again, with the graph, a batch at a time: each batch's backward reaches the smoothed field
-        // and frees its network graph. A per-point distance's batch weighs its share of the points. A batch that runs
-        // out of device memory is replayed at half the size, with the gradient it had added taken back.
-        torch::Tensor gradientBefore;
-        for (size_t i = 0; i < movingConfigs.size(); ++i)
-        {
-          Impact::ForEachBatch(
-            movingConfigs[i],
-            device,
-            n,
-            [&](int64_t begin, int64_t end) {
-              gradientBefore = smoothed.grad().clone();
-              const std::vector<torch::Tensor> layers =
-                centresOf(movingConfigs[i], patchesOf(i, begin, end, true), movingMetadata);
-              torch::Tensor surrogate = torch::zeros({}, theta.options());
-              for (size_t k = 0; k < layers.size(); ++k)
-              {
-                const size_t l = firstLayer[i] + k;
+                surrogate.backward();
                 if (perPoint)
                 {
-                  const torch::Tensor value = losses[l]->forwardValue(
-                    pick(l, fixedCentres[l].narrow(0, begin, end - begin)), reduced(l, layers[k]));
-                  surrogate = surrogate + layerWeights[l] * normalized(l, value) *
-                                            (static_cast<double>(end - begin) / static_cast<double>(n));
+                  simValue += surrogate.template item<double>();
                 }
-                else
-                {
-                  surrogate = surrogate + (layers[k] * seeds[l].narrow(0, begin, end - begin)).sum();
-                }
-              }
-              surrogate.backward();
-              if (perPoint)
-              {
-                simValue += surrogate.template item<double>();
-              }
-            },
-            [&] { smoothed.mutable_grad().copy_(gradientBefore); });
+              },
+              [&] { smoothed.mutable_grad().copy_(gradientBefore); });
+          }
         }
         smoothedControl.backward(smoothed.grad()); // the smoothing passes, once: -> theta.grad
         lossValue = simValue + reg.template item<double>();
@@ -1195,6 +1318,34 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             }
           }
         }
+        // With masks, the voxels each layer counts in the whole volume at this iteration, so that a chunk weighs its
+        // share of them (instead of its share of the voxels).
+        std::vector<torch::Tensor> counted, countedTotal;
+        if (masked)
+        {
+          torch::Tensor warpedMoving;
+          if (movingMask.defined())
+          {
+            torch::NoGradGuard noGrad;
+            warpedMoving = F::grid_sample(movingMaskShare, fullGrid.detach(), sampleOpts) >= 0.5;
+          }
+          for (size_t l = 0; l < fixedSwept->layers.size(); ++l)
+          {
+            const std::vector<int64_t> ls(fixedSwept->layers[l].sizes().begin() + 2,
+                                          fixedSwept->layers[l].sizes().end());
+            torch::Tensor              voxels = fixedMask.defined() ? fixedSwept->masks[l] : torch::Tensor();
+            if (warpedMoving.defined())
+            {
+              const torch::Tensor holds = Impact::MaskShare<ImageDimension>(warpedMoving, ls) >= 0.5;
+              voxels = voxels.defined() ? voxels.logical_and(holds) : holds;
+            }
+            counted.push_back(voxels);
+            countedTotal.push_back(voxels.sum().clamp_min(1).to(torch::kFloat32));
+          }
+        }
+        auto chunkShare = [&](size_t l, int64_t i0, int64_t di) {
+          return counted[l].narrow(2 + keep, i0, di).sum().to(torch::kFloat32) / countedTotal[l];
+        };
         // Each layer's loss over the chunk [i0, i0 + di) of the swept axis.
         auto chunkLosses = [&](int64_t i0, int64_t di, const torch::Tensor & gz, bool withGrad) {
           torch::Tensor              movingChunk = F::grid_sample(movingT, gz, sampleOpts); // grad -> gridLeaf
@@ -1209,7 +1360,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
               mll = Impact::PcaTransform(mll.squeeze(0), fixedSwept->basis[l], movingMeans[l]).unsqueeze(0);
             }
             mll = poolExcept(mll, keep); // the features keep the swept axis, so only the others are resampled
-            values.push_back(layerLoss(l, pick(l, fixedSwept->layers[l].narrow(2 + keep, i0, di)), pick(l, mll)));
+            values.push_back(layerLoss(l,
+                                       pick(l, fixedSwept->layers[l].narrow(2 + keep, i0, di)),
+                                       pick(l, mll),
+                                       masked ? counted[l].narrow(2 + keep, i0, di) : torch::Tensor()));
           }
           return values;
         };
@@ -1227,7 +1381,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             whole.resize(values.size(), 0.0);
             for (size_t l = 0; l < values.size(); ++l)
             {
-              whole[l] += values[l].template item<double>() * static_cast<double>(di) / static_cast<double>(nLead);
+              whole[l] += masked
+                            ? (values[l] * chunkShare(l, i0, di)).template item<double>()
+                            : values[l].template item<double>() * static_cast<double>(di) / static_cast<double>(nLead);
             }
           }
           for (size_t l = 0; l < whole.size(); ++l)
@@ -1244,9 +1400,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           torch::Tensor              simChunk = torch::zeros({}, theta.options());
           for (size_t l = 0; l < values.size(); ++l)
           {
-            simChunk = simChunk + layerWeights[l] * normalized(l, values[l]);
+            simChunk = masked ? simChunk + layerWeights[l] * normalized(l, values[l]) * chunkShare(l, i0, di)
+                              : simChunk + layerWeights[l] * normalized(l, values[l]);
           }
-          torch::Tensor weighted = simChunk * (static_cast<double>(di) / static_cast<double>(nLead));
+          torch::Tensor weighted =
+            masked ? simChunk : simChunk * (static_cast<double>(di) / static_cast<double>(nLead));
           weighted.backward(); // accumulates into gridLeaf.grad; this chunk's network graph is freed
           simValue += weighted.template item<double>();
         }
@@ -1277,7 +1435,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             else
               mll = F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kBilinear).align_corners(true));
           }
-          sim = sim + layerWeights[l] * normalized(l, layerLoss(l, pick(l, fixedLayersOnline[l]), pick(l, mll)));
+          torch::Tensor counted;
+          if (masked)
+          {
+            counted = countedVoxels(fixedLayerMask[l], movingLayerShare[l], [&] {
+              return layerBaseGrid[l] +
+                     (resizeField(smoothControl(theta.detach()), layerSpatials[l]).permute(toChannelLast) / scale)
+                       .flip(-1);
+            });
+          }
+          sim =
+            sim + layerWeights[l] * normalized(l, layerLoss(l, pick(l, fixedLayersOnline[l]), pick(l, mll), counted));
         }
         torch::Tensor loss = sim + reg;
         loss.backward();
@@ -1294,18 +1462,30 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         // Build each layer's sampling grid directly at its resolution from the smoothed residual
         // (no full-res detour); smoothing is shared across layers.
         const torch::Tensor smoothedResidual = smoothControl(theta - thetaRef);
+        // The moving mask follows the total field, which is the residual until a refresh.
+        const torch::Tensor smoothedTotal =
+          movingMask.defined() && refreshed ? smoothControl(theta).detach() : torch::Tensor();
         similarity = torch::zeros({}, theta.options());
         for (size_t l = 0; l < movingLayers.size(); ++l)
         {
           if (sampled)
           {
-            similarity = similarity + layerWeights[l] * normalized(l, sampledLayerLoss(l, smoothedResidual));
+            similarity =
+              similarity + layerWeights[l] * normalized(l, sampledLayerLoss(l, smoothedResidual, smoothedTotal));
             continue;
           }
           // Only the drawn channels are warped.
-          torch::Tensor warpedLayer =
-            F::grid_sample(pick(l, movingLayers[l]), gridForLayerControl(smoothedResidual, l), sampleOpts);
-          similarity = similarity + layerWeights[l] * normalized(l, layerLoss(l, pick(l, fixedLayers[l]), warpedLayer));
+          const torch::Tensor grid = gridForLayerControl(smoothedResidual, l);
+          torch::Tensor       warpedLayer = F::grid_sample(pick(l, movingLayers[l]), grid, sampleOpts);
+          torch::Tensor       counted;
+          if (masked)
+          {
+            counted = countedVoxels(fixedLayerMask[l], movingLayerShare[l], [&] {
+              return smoothedTotal.defined() ? gridForLayerControl(smoothedTotal, l) : grid;
+            });
+          }
+          similarity =
+            similarity + layerWeights[l] * normalized(l, layerLoss(l, pick(l, fixedLayers[l]), warpedLayer, counted));
         }
       }
       else
@@ -1314,7 +1494,16 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         torch::Tensor dd = smoothControl(theta - thetaRef).permute(toChannelLast);
         torch::Tensor grid = gridBaseCoarse + (dd / scale).flip(-1);
         torch::Tensor warpedImage = F::grid_sample(movingCoarse, grid, sampleOpts);
-        similarity = (warpedImage - fixedCoarse).pow(2).mean();
+        if (!masked)
+        {
+          similarity = (warpedImage - fixedCoarse).pow(2).mean();
+        }
+        else
+        {
+          const torch::Tensor counted = countedVoxels(fixedCoarseMask, movingCoarseShare, [&] { return grid; });
+          similarity =
+            torch::where(counted, (warpedImage - fixedCoarse).pow(2), 0.0).sum() / counted.sum().clamp_min(1);
+        }
       }
       torch::Tensor loss = similarity + reg;
       loss.backward();
@@ -1333,6 +1522,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       torch::NoGradGuard noGrad;
       thetaRef = theta.detach().clone();
+      refreshed = true;
       torch::Tensor movingWarped = F::grid_sample(movingT, gridFromControl(thetaRef), sampleOpts);
       movingLayers = extractMovingFeatures(movingWarped);
       for (size_t l = 0; l < movingLayers.size(); ++l)

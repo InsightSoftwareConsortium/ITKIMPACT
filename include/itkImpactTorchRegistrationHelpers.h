@@ -38,6 +38,9 @@
 #include <itkImageRegionConstIterator.h>
 #include <itkImageRegionIteratorWithIndex.h>
 #include <itkMacro.h>
+#include <itkIdentityTransform.h>
+#include <itkNearestNeighborInterpolateImageFunction.h>
+#include <itkResampleImageFilter.h>
 
 #include <torch/torch.h>
 
@@ -452,6 +455,123 @@ IsotropicWindow(const std::vector<double> &  sides,
     window[a] = 2 * static_cast<int64_t>(std::floor(static_cast<double>(kernel) * (smallest / side[a]) / 2.0)) + 1;
   }
   return window;
+}
+/** @} */
+
+/** \name Masks
+ * A voxel counts where the fixed mask and the moving mask warped by the current field both hold (>= 0.5), as the
+ * FireANTs engine counts it. Masks travel as bool tensors {1, 1, spatial...}; the shares of a mask a coarser grid
+ * pools are floats. */
+/** @{ */
+/** A mask image as a bool tensor {1, 1, spatial...} (tensor axis order) on `device`: in where the image is not 0. */
+template <typename TMask>
+torch::Tensor
+MaskToTensor(const TMask * mask, const torch::Device & device)
+{
+  constexpr unsigned int Dim = TMask::ImageDimension;
+  const auto             size = mask->GetLargestPossibleRegion().GetSize();
+  std::vector<int64_t>   shape(Dim);
+  int64_t                voxels = 1;
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    shape[d] = static_cast<int64_t>(size[Dim - 1 - d]);
+    voxels *= shape[d];
+  }
+  std::vector<uint8_t>            buffer(static_cast<size_t>(voxels));
+  ImageRegionConstIterator<TMask> it(mask, mask->GetLargestPossibleRegion());
+  size_t                          i = 0;
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it) // raster order, ITK x fastest
+  {
+    buffer[i++] = it.Get() != 0;
+  }
+  // to() copies, so the tensor owns its memory once `buffer` is gone.
+  return torch::from_blob(buffer.data(), shape, torch::kUInt8).to(device, torch::kBool).unsqueeze(0).unsqueeze(0);
+}
+
+/** `mask` as MaskToTensor gives it on `reference`'s grid, resampled there by nearest neighbour through the identity
+ * when its own grid differs; undefined for no mask. */
+template <typename TMask, typename TReference>
+torch::Tensor
+MaskOnGrid(const TMask * mask, const TReference * reference, const torch::Device & device)
+{
+  if (mask == nullptr)
+  {
+    return {};
+  }
+  if (mask->GetLargestPossibleRegion().GetSize() == reference->GetLargestPossibleRegion().GetSize() &&
+      mask->GetSpacing() == reference->GetSpacing() && mask->GetOrigin() == reference->GetOrigin() &&
+      mask->GetDirection() == reference->GetDirection())
+  {
+    return MaskToTensor(mask, device);
+  }
+  auto resample = ResampleImageFilter<TMask, TMask, double>::New();
+  resample->SetInput(mask);
+  resample->SetTransform(IdentityTransform<double, TMask::ImageDimension>::New());
+  resample->SetInterpolator(NearestNeighborInterpolateImageFunction<TMask, double>::New());
+  resample->SetUseReferenceImage(true);
+  resample->SetReferenceImage(reference);
+  resample->Update();
+  return MaskToTensor(resample->GetOutput(), device);
+}
+
+/** The share of `mask` ({1, 1, spatial...}, bool) in each voxel of a grid of `size` voxels over the same extent
+ * (adaptive average pooling), as floats; the mask itself, as floats, on its own grid. */
+template <unsigned int Dim>
+torch::Tensor
+MaskShare(const torch::Tensor & mask, const std::vector<int64_t> & size)
+{
+  namespace F = torch::nn::functional;
+  const torch::Tensor share = mask.to(torch::kFloat32);
+  if (std::equal(size.begin(), size.end(), share.sizes().begin() + 2))
+  {
+    return share;
+  }
+  if constexpr (Dim == 3)
+    return F::adaptive_avg_pool3d(share, F::AdaptiveAvgPool3dFuncOptions({ size[0], size[1], size[2] }));
+  else
+    return F::adaptive_avg_pool2d(share, F::AdaptiveAvgPool2dFuncOptions({ size[0], size[1] }));
+}
+
+/** `loss` between two feature maps on one grid ({1, C, spatial...}) over the voxels `mask` ({1, 1, spatial...}, bool)
+ * keeps: a point-wise distance's terms averaged over them (a ratio of two sums), NCC's correlation over them, LNCC's
+ * local terms averaged over them. 0 when the mask keeps none. Without a mask, the loss over every voxel. */
+template <unsigned int Dim>
+torch::Tensor
+MapLoss(const Loss &                 loss,
+        const torch::Tensor &        fixedMap,
+        const torch::Tensor &        movingMap,
+        const torch::Tensor &        mask,
+        const std::vector<int64_t> & kernel)
+{
+  if (loss.IsSpatial())
+  {
+    return loss.forwardSpatial(fixedMap, movingMap, kernel, mask);
+  }
+  const int64_t channels = fixedMap.size(1);
+  if (!mask.defined())
+  {
+    std::vector<int64_t> toChannelLast{ 0 };
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      toChannelLast.push_back(2 + static_cast<int64_t>(d));
+    }
+    toChannelLast.push_back(1);
+    return loss.forwardValue(fixedMap.permute(toChannelLast).reshape({ -1, channels }),
+                             movingMap.permute(toChannelLast).reshape({ -1, channels }));
+  }
+  if (loss.IsPerPointMean())
+  {
+    const torch::Tensor keep = mask.squeeze(1);
+    return torch::where(keep, loss.forwardPoints(fixedMap, movingMap), 0.0).sum() / keep.sum().clamp_min(1);
+  }
+  // A statistic over the points (NCC): the rows of the kept voxels.
+  const torch::Tensor rows = mask.flatten().nonzero().flatten();
+  if (rows.numel() == 0)
+  {
+    return (movingMap * 0.0).sum();
+  }
+  return loss.forwardValue(fixedMap.reshape({ channels, -1 }).index_select(1, rows).t(),
+                           movingMap.reshape({ channels, -1 }).index_select(1, rows).t());
 }
 /** @} */
 

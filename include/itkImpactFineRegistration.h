@@ -101,6 +101,17 @@ public:
   SetMovingImage(const MovingImageType * image);
   itkGetConstObjectMacro(MovingImage, MovingImageType);
 
+  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid; absent, the whole image
+   * counts, at no cost. As in the FireANTs engine, a voxel counts where the fixed mask and the moving mask warped by
+   * the current field both hold (>= 0.5), on the grid each distance compares: every distance's terms are averaged
+   * over those voxels only (NCC correlates them, LNCC averages its local terms there), in Static and Jacobian mode;
+   * the sampled modes draw their points in the fixed mask and keep those the warped moving mask holds. */
+  using MaskImageType = Image<unsigned char, ImageDimension>;
+  itkSetConstObjectMacro(FixedMask, MaskImageType);
+  itkGetConstObjectMacro(FixedMask, MaskImageType);
+  itkSetConstObjectMacro(MovingMask, MaskImageType);
+  itkGetConstObjectMacro(MovingMask, MaskImageType);
+
   /** Set/Get an optional initial displacement field used as a warm start (e.g. the output
    * of an affine or a ConvexAdam-style discrete stage). Must be defined on the fixed grid. */
   itkSetObjectMacro(InitialDisplacementField, DisplacementFieldType);
@@ -278,6 +289,8 @@ protected:
 private:
   typename FixedImageType::ConstPointer        m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer       m_MovingImage{ nullptr };
+  typename MaskImageType::ConstPointer         m_FixedMask{ nullptr };
+  typename MaskImageType::ConstPointer         m_MovingMask{ nullptr };
   typename DisplacementFieldType::Pointer      m_InitialDisplacementField{ nullptr };
 
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;

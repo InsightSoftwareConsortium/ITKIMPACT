@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -63,17 +64,46 @@ CoarseBoxWindow(const torch::Tensor & t)
  * is `distance` over the cell window around it (CoarseBoxWindow): a point-wise distance's terms (Loss::forwardPoints)
  * averaged over the window -- for L2 exactly ConvexAdam's smoothed SSD --, NCC and LNCC each channel's correlation over
  * the window, from its weighted means of f, m, f^2, m^2 and f*m (the weight falling outside the image dropped). A
- * point-wise term that is not a number (the cosine of a zero vector) counts as no similarity, 1. */
+ * point-wise term that is not a number (the cosine of a zero vector) counts as no similarity, 1.
+ *
+ * `weight` ({1, 1, coarse...}), when given, weighs each cell in the window (the masks' shares, CoarseMaskWeight): every
+ * mean is then a ratio of two window sums, and a coarse voxel whose window holds no weight costs 0 (see
+ * CoarseMaskSupport). */
 template <unsigned int Dim>
 torch::Tensor
-CoarseLayerCost(const Loss & distance, const torch::Tensor & fixed, const torch::Tensor & shifted)
+CoarseLayerCost(const Loss &          distance,
+                const torch::Tensor & fixed,
+                const torch::Tensor & shifted,
+                const torch::Tensor & weight = {})
 {
+  if (!weight.defined())
+  {
+    if (distance.IsPerPointMean())
+    {
+      return CoarseBoxWindow<Dim>(torch::nan_to_num(distance.forwardPoints(fixed, shifted), 1.0).unsqueeze(1));
+    }
+    const torch::Tensor weights = CoarseBoxWindow<Dim>(torch::ones_like(fixed.narrow(1, 0, 1)));
+    auto                mean = [&weights](const torch::Tensor & t) { return CoarseBoxWindow<Dim>(t) / weights; };
+    const torch::Tensor meanFixed = mean(fixed);
+    const torch::Tensor meanMoving = mean(shifted);
+    const torch::Tensor meanFixedSquare = mean(fixed * fixed);
+    const torch::Tensor meanMovingSquare = mean(shifted * shifted);
+    const torch::Tensor meanProduct = mean(fixed * shifted);
+    const torch::Tensor correlation =
+      distance.IsSpatial()
+        ? LNCC::SquaredCorrelation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct)
+        : NCC::Correlation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
+    return 1.0 - correlation.mean(1, /*keepdim=*/true);
+  }
+  const torch::Tensor total = CoarseBoxWindow<Dim>(weight);
+  const torch::Tensor held = total > 0.0;
+  const torch::Tensor divisor = torch::where(held, total, 1.0);
   if (distance.IsPerPointMean())
   {
-    return CoarseBoxWindow<Dim>(torch::nan_to_num(distance.forwardPoints(fixed, shifted), 1.0).unsqueeze(1));
+    const torch::Tensor terms = torch::nan_to_num(distance.forwardPoints(fixed, shifted), 1.0).unsqueeze(1);
+    return torch::where(held, CoarseBoxWindow<Dim>(terms * weight) / divisor, 0.0);
   }
-  const torch::Tensor weights = CoarseBoxWindow<Dim>(torch::ones_like(fixed.narrow(1, 0, 1)));
-  auto                mean = [&weights](const torch::Tensor & t) { return CoarseBoxWindow<Dim>(t) / weights; };
+  auto                mean = [&](const torch::Tensor & t) { return CoarseBoxWindow<Dim>(t * weight) / divisor; };
   const torch::Tensor meanFixed = mean(fixed);
   const torch::Tensor meanMoving = mean(shifted);
   const torch::Tensor meanFixedSquare = mean(fixed * fixed);
@@ -83,21 +113,35 @@ CoarseLayerCost(const Loss & distance, const torch::Tensor & fixed, const torch:
     distance.IsSpatial()
       ? LNCC::SquaredCorrelation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct)
       : NCC::Correlation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
-  return 1.0 - correlation.mean(1, /*keepdim=*/true);
+  return torch::where(held, 1.0 - correlation.mean(1, /*keepdim=*/true), 0.0);
 }
 
-/** Add `weight` times one feature layer's coarse cost volume to `cost` ({L, coarse...}): for each of the L =
- * prod_a (2 halfWidths[a] + 1) candidate displacements -- `halfWidths` per tensor axis, in coarse voxels, the last
- * tensor axis (ITK x) running fastest, the order of the solver's displacement table --, the CoarseLayerCost of `moving`
- * shifted by it (edge-replicated) against `fixed`, both {1, C, coarse...}. */
+/** The shift of `volume` ({1, C, coarse...}) by candidate `l` of the box of `halfWidths` (see AccumulateCoarseCost),
+ * read in `padded`, the volume padded by the half-widths. */
 template <unsigned int Dim>
-void
-AccumulateCoarseCost(torch::Tensor &              cost,
-                     const Loss &                 distance,
-                     const torch::Tensor &        fixed,
-                     const torch::Tensor &        moving,
+torch::Tensor
+CoarseCandidateShift(const torch::Tensor &        padded,
                      const std::vector<int64_t> & halfWidths,
-                     double                       weight)
+                     int64_t                      l,
+                     c10::IntArrayRef             coarse)
+{
+  torch::Tensor shifted = padded;
+  int64_t       rem = l;
+  for (int a = static_cast<int>(Dim) - 1; a >= 0; --a)
+  {
+    const int64_t side = 2 * halfWidths[a] + 1;
+    const int64_t offset = (rem % side) - halfWidths[a];
+    rem /= side;
+    shifted = shifted.narrow(2 + a, halfWidths[a] + offset, coarse[2 + a]);
+  }
+  return shifted;
+}
+
+/** `volume` padded by `halfWidths` on each side of each axis: edge-replicated (features), or with zeros (a mask's
+ * share: outside the image no voxel is in the mask). */
+template <unsigned int Dim>
+torch::Tensor
+CoarsePad(const torch::Tensor & volume, const std::vector<int64_t> & halfWidths, bool replicate)
 {
   namespace F = torch::nn::functional;
   std::vector<int64_t> padding; // F::pad takes its pairs from the last axis backwards
@@ -106,20 +150,94 @@ AccumulateCoarseCost(torch::Tensor &              cost,
     padding.push_back(halfWidths[a]);
     padding.push_back(halfWidths[a]);
   }
-  const torch::Tensor padded = F::pad(moving, F::PadFuncOptions(padding).mode(torch::kReplicate));
+  return replicate ? F::pad(volume, F::PadFuncOptions(padding).mode(torch::kReplicate))
+                   : F::pad(volume, F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
+}
+
+/** The weight of each coarse cell for one candidate: the fixed cell's share of the fixed mask times the share of the
+ * moving mask in the moving cell the candidate shifts it to (`shiftedMoving`); either alone when the other mask is
+ * absent. */
+inline torch::Tensor
+CoarseMaskWeight(const torch::Tensor & fixedShare, const torch::Tensor & shiftedMoving)
+{
+  if (!fixedShare.defined())
+  {
+    return shiftedMoving;
+  }
+  return shiftedMoving.defined() ? fixedShare * shiftedMoving : fixedShare;
+}
+
+/** Add `weight` times one feature layer's coarse cost volume to `cost` ({L, coarse...}): for each of the L =
+ * prod_a (2 halfWidths[a] + 1) candidate displacements -- `halfWidths` per tensor axis, in coarse voxels, the last
+ * tensor axis (ITK x) running fastest, the order of the solver's displacement table --, the CoarseLayerCost of `moving`
+ * shifted by it (edge-replicated) against `fixed`, both {1, C, coarse...}. With masks, `fixedShare` and `movingShare`
+ * ({1, 1, coarse...}, either undefined when its mask is absent) weigh the cells, the moving one shifted with the
+ * features (zero outside the image). */
+template <unsigned int Dim>
+void
+AccumulateCoarseCost(torch::Tensor &              cost,
+                     const Loss &                 distance,
+                     const torch::Tensor &        fixed,
+                     const torch::Tensor &        moving,
+                     const std::vector<int64_t> & halfWidths,
+                     double                       weight,
+                     const torch::Tensor &        fixedShare = {},
+                     const torch::Tensor &        movingShare = {})
+{
+  const torch::Tensor padded = CoarsePad<Dim>(moving, halfWidths, true);
+  const torch::Tensor paddedShare =
+    movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths, false) : movingShare;
+  const bool masked = fixedShare.defined() || movingShare.defined();
   for (int64_t l = 0; l < cost.size(0); ++l)
   {
-    torch::Tensor shifted = padded;
-    int64_t       rem = l;
-    for (int a = static_cast<int>(Dim) - 1; a >= 0; --a)
+    const torch::Tensor shifted = CoarseCandidateShift<Dim>(padded, halfWidths, l, fixed.sizes());
+    if (!masked)
     {
-      const int64_t side = 2 * halfWidths[a] + 1;
-      const int64_t offset = (rem % side) - halfWidths[a];
-      rem /= side;
-      shifted = shifted.narrow(2 + a, halfWidths[a] + offset, fixed.size(2 + a));
+      cost[l] += weight * CoarseLayerCost<Dim>(distance, fixed, shifted).squeeze(0).squeeze(0);
+      continue;
     }
-    cost[l] += weight * CoarseLayerCost<Dim>(distance, fixed, shifted).squeeze(0).squeeze(0);
+    const torch::Tensor cellWeight = CoarseMaskWeight(
+      fixedShare,
+      paddedShare.defined() ? CoarseCandidateShift<Dim>(paddedShare, halfWidths, l, fixed.sizes()) : paddedShare);
+    cost[l] += weight * CoarseLayerCost<Dim>(distance, fixed, shifted, cellWeight).squeeze(0).squeeze(0);
   }
+}
+
+/** Where each candidate leaves the cell window around each coarse voxel some mask weight, {L, coarse...} bool: the
+ * coarse voxels and candidates a masked cost has data for (see AccumulateCoarseCost). */
+template <unsigned int Dim>
+torch::Tensor
+CoarseMaskSupport(const torch::Tensor &        fixedShare,
+                  const torch::Tensor &        movingShare,
+                  const std::vector<int64_t> & halfWidths,
+                  c10::IntArrayRef             coarse,
+                  int64_t                      candidates)
+{
+  const torch::Tensor paddedShare =
+    movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths, false) : movingShare;
+  std::vector<int64_t> shape{ candidates };
+  shape.insert(shape.end(), coarse.begin() + 2, coarse.end());
+  torch::Tensor support = torch::empty(
+    shape,
+    torch::TensorOptions().dtype(torch::kBool).device((fixedShare.defined() ? fixedShare : movingShare).device()));
+  for (int64_t l = 0; l < candidates; ++l)
+  {
+    const torch::Tensor cellWeight = CoarseMaskWeight(
+      fixedShare, paddedShare.defined() ? CoarseCandidateShift<Dim>(paddedShare, halfWidths, l, coarse) : paddedShare);
+    support[l] = (CoarseBoxWindow<Dim>(cellWeight) > 0.0).squeeze(0).squeeze(0);
+  }
+  return support;
+}
+
+/** A masked cost volume ({L, coarse...}) where `support` says it has no data: a candidate without data costs as much as
+ * the worst candidate with data at that coarse voxel, and a coarse voxel with no data at all costs 0 whatever the
+ * candidate, so that the coupling alone places it. */
+inline torch::Tensor
+FillCoarseCostWithoutData(const torch::Tensor & cost, const torch::Tensor & support)
+{
+  const torch::Tensor worst =
+    torch::where(support, cost, -std::numeric_limits<float>::infinity()).amax(0, /*keepdim=*/true);
+  return torch::where(support, cost, torch::where(support.any(0, /*keepdim=*/true), worst, 0.0));
 }
 
 } // namespace Impact
@@ -235,6 +353,10 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
 
     torch::Tensor fixedT = Impact::ImageToBatchTensor(m_FixedImage.GetPointer()).to(device);
     torch::Tensor movingT = Impact::ImageToBatchTensor(movingOnFixed.GetPointer()).to(device);
+    // The masks on the fixed grid, bool; undefined when absent, and then nothing below costs anything.
+    const torch::Tensor fixedMask = Impact::MaskOnGrid(m_FixedMask.GetPointer(), m_FixedImage.GetPointer(), device);
+    const torch::Tensor movingMask = Impact::MaskOnGrid(m_MovingMask.GetPointer(), m_FixedImage.GetPointer(), device);
+    const bool          masked = fixedMask.defined() || movingMask.defined();
 
     // Full-resolution spatial sizes in torch (z, y, x) order.
     const auto &         fixedSize = m_FixedImage->GetLargestPossibleRegion().GetSize();
@@ -373,13 +495,29 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     std::vector<torch::Tensor>                 movingCoarse;
     std::vector<std::unique_ptr<Impact::Loss>> distances;
     std::vector<double>                        weights;
+    // With a mask, a cell's features are its masked voxels' mean (a ratio of two pooled sums, the mask brought to the
+    // source's grid as its share), and each cell carries its share of the mask.
+    auto toMaskedCoarseGrid = [&](const torch::Tensor & t, const torch::Tensor & mask) -> torch::Tensor {
+      if (!mask.defined())
+      {
+        return toCoarseGrid(t);
+      }
+      const std::vector<int64_t> ts(t.sizes().begin() + 2, t.sizes().end());
+      const torch::Tensor        share = Impact::MaskShare<ImageDimension>(mask, ts);
+      const torch::Tensor        count = toCoarseGrid(share);
+      return torch::where(count > 0.0, toCoarseGrid(t * share) / torch::where(count > 0.0, count, 1.0), 0.0);
+    };
+    const torch::Tensor fixedShare =
+      fixedMask.defined() ? toCoarseGrid(fixedMask.to(torch::kFloat32)) : torch::Tensor();
+    const torch::Tensor movingShare =
+      movingMask.defined() ? toCoarseGrid(movingMask.to(torch::kFloat32)) : torch::Tensor();
     if (featureMode)
     {
       Impact::LossNormalization normalization;
       for (size_t l = 0; l < fixedLayers.size(); ++l)
       {
-        fixedCoarse.push_back(toCoarseGrid(fixedLayers[l]));
-        movingCoarse.push_back(toCoarseGrid(movingLayers[l]));
+        fixedCoarse.push_back(toMaskedCoarseGrid(fixedLayers[l], fixedMask));
+        movingCoarse.push_back(toMaskedCoarseGrid(movingLayers[l], movingMask));
         distances.push_back(Impact::LossFactory::Instance().Create(
           m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)]));
         double weight = l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0;
@@ -388,15 +526,29 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
           // At zero displacement: a point-wise distance latches the mean of its terms before the window averages
           // them (for L2 the value latched so far), NCC and LNCC the mean of their windowed cost.
           const Impact::Loss & distance = *distances.back();
-          const double         value =
-            distance.IsPerPointMean()
+          double               value;
+          if (!masked)
+          {
+            value = distance.IsPerPointMean()
                       ? distance.forwardPoints(fixedCoarse.back(), movingCoarse.back())
-                  .nan_to_num(1.0)
-                  .mean()
-                  .template item<double>()
+                          .nan_to_num(1.0)
+                          .mean()
+                          .template item<double>()
                       : Impact::CoarseLayerCost<ImageDimension>(distance, fixedCoarse.back(), movingCoarse.back())
-                  .mean()
-                  .template item<double>();
+                          .mean()
+                          .template item<double>();
+          }
+          else
+          {
+            // The same, weighed by the cells' mask shares at zero displacement.
+            const torch::Tensor cellWeight = Impact::CoarseMaskWeight(fixedShare, movingShare);
+            const torch::Tensor terms =
+              distance.IsPerPointMean()
+                ? distance.forwardPoints(fixedCoarse.back(), movingCoarse.back()).nan_to_num(1.0).unsqueeze(1)
+                : Impact::CoarseLayerCost<ImageDimension>(
+                    distance, fixedCoarse.back(), movingCoarse.back(), cellWeight);
+            value = ((terms * cellWeight).sum() / cellWeight.sum().clamp_min(1e-12)).template item<double>();
+          }
           weight *= normalization.Latch(l, value);
         }
         weights.push_back(weight);
@@ -404,8 +556,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     }
     else
     {
-      fixedCoarse.push_back(toCoarseGrid(fixedT));
-      movingCoarse.push_back(toCoarseGrid(movingT));
+      fixedCoarse.push_back(toMaskedCoarseGrid(fixedT, fixedMask));
+      movingCoarse.push_back(toMaskedCoarseGrid(movingT, movingMask));
       distances.push_back(Impact::LossFactory::Instance().Create("L2"));
       weights.push_back(1.0);
     }
@@ -474,9 +626,23 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     // layer is in. The backward problem reuses the weights.
     m_LayerSpreads.clear();
     const bool balance = featureMode && m_BalanceLosses;
-    auto       solveCoarse = [&](const std::vector<torch::Tensor> & reference,
-                           const std::vector<torch::Tensor> & toShift) -> torch::Tensor {
-      torch::Tensor ssd = torch::zeros(ssdShape, reference[0].options());
+    // With masks, the cells weigh by their shares (the moving one shifted with the features) and the volume is then
+    // filled where it has no data (Impact::FillCoarseCostWithoutData); a coarse voxel with none starts at zero
+    // displacement and follows its neighbours through the coupling.
+    int64_t zeroCandidate = 0; // the candidate of zero displacement, in the table's order (x fastest)
+    for (unsigned int a = 0; a < ImageDimension; ++a)
+    {
+      zeroCandidate = zeroCandidate * (2 * halfWidths[a] + 1) + halfWidths[a];
+    }
+    auto solveCoarse = [&](const std::vector<torch::Tensor> & reference,
+                           const std::vector<torch::Tensor> & toShift,
+                           const torch::Tensor &              referenceShare,
+                           const torch::Tensor &              shiftShare) -> torch::Tensor {
+      torch::Tensor       ssd = torch::zeros(ssdShape, reference[0].options());
+      const torch::Tensor support =
+        masked
+          ? Impact::CoarseMaskSupport<ImageDimension>(referenceShare, shiftShare, halfWidths, reference[0].sizes(), L)
+          : torch::Tensor();
       if (balance && m_LayerSpreads.empty())
       {
         torch::Tensor layerCost = torch::empty_like(ssd);
@@ -491,9 +657,10 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
           }
           layerCost.zero_();
           Impact::AccumulateCoarseCost<ImageDimension>(
-            layerCost, *distances[l], reference[l], toShift[l], halfWidths, 1.0);
-          const double spread =
-            (std::get<0>(layerCost.max(0)) - std::get<0>(layerCost.min(0))).mean().template item<double>();
+            layerCost, *distances[l], reference[l], toShift[l], halfWidths, 1.0, referenceShare, shiftShare);
+          const torch::Tensor measured = masked ? Impact::FillCoarseCostWithoutData(layerCost, support) : layerCost;
+          const double        spread =
+            (std::get<0>(measured.max(0)) - std::get<0>(measured.min(0))).mean().template item<double>();
           m_LayerSpreads[l] = spread;
           if (spread > 0.0 && std::isfinite(spread))
           {
@@ -517,11 +684,17 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
           if (weights[l] != 0.0) // a layer weighed 0 drops out exactly
           {
             Impact::AccumulateCoarseCost<ImageDimension>(
-              ssd, *distances[l], reference[l], toShift[l], halfWidths, weights[l]);
+              ssd, *distances[l], reference[l], toShift[l], halfWidths, weights[l], referenceShare, shiftShare);
           }
         }
       }
-      torch::Tensor disp = smoothBox(gather(torch::argmin(ssd, 0)));
+      torch::Tensor initial = torch::argmin(ssd, 0);
+      if (masked)
+      {
+        ssd = Impact::FillCoarseCostWithoutData(ssd, support);
+        initial = torch::where(support.any(0), torch::argmin(ssd, 0), zeroCandidate);
+      }
+      torch::Tensor disp = smoothBox(gather(initial));
       for (double coeff : coeffs)
       {
         // Tiled over the first coarse axis so the (L x grid) penalty transient stays bounded.
@@ -540,14 +713,14 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       return disp;
     };
 
-    torch::Tensor disp = solveCoarse(fixedCoarse, movingCoarse); // forward: fixed -> moving
+    torch::Tensor disp = solveCoarse(fixedCoarse, movingCoarse, fixedShare, movingShare); // forward: fixed -> moving
 
     // ---- Optional inverse consistency: also solve the backward (moving->fixed) problem and
     // symmetrize the two fields toward mutual inverses in normalized [-1,1] grid coordinates
     // (ConvexAdam-style), for a more diffeomorphic coarse initialization. ----
     if (m_InverseConsistency)
     {
-      torch::Tensor dispBack = solveCoarse(movingCoarse, fixedCoarse); // backward: moving -> fixed
+      torch::Tensor dispBack = solveCoarse(movingCoarse, fixedCoarse, movingShare, fixedShare); // backward
 
       // Per-channel normalization (coarse_size - 1)/2, in z,y,x channel order.
       std::vector<float> scaleVals(ImageDimension);

@@ -167,15 +167,19 @@ public:
   }
 
   /** The loss between two feature maps on one grid, {1, C, spatial...}, for a spatial distance; `kernel` is the
-   * side of its window in voxels along each spatial axis, odd, in the maps' axis order. */
+   * side of its window in voxels along each spatial axis, odd, in the maps' axis order. `mask` ({1, 1, spatial...},
+   * bool), when given, keeps the voxels whose terms are averaged (0 when it keeps none); the windows still read every
+   * voxel. */
   virtual torch::Tensor
   forwardSpatial(const torch::Tensor &        fixedMap,
                  const torch::Tensor &        movingMap,
-                 const std::vector<int64_t> & kernel) const
+                 const std::vector<int64_t> & kernel,
+                 const torch::Tensor &        mask = {}) const
   {
     (void)fixedMap;
     (void)movingMap;
     (void)kernel;
+    (void)mask;
     throw std::runtime_error("forwardSpatial() is not implemented for this loss");
   }
 
@@ -900,7 +904,8 @@ public:
   torch::Tensor
   forwardSpatial(const torch::Tensor &        fixedMap,
                  const torch::Tensor &        movingMap,
-                 const std::vector<int64_t> & kernel) const override
+                 const std::vector<int64_t> & kernel,
+                 const torch::Tensor &        mask = {}) const override
   {
     namespace F = torch::nn::functional;
     const int64_t        dimension = fixedMap.dim() - 2;
@@ -922,12 +927,18 @@ public:
                              .padding(torch::ExpandingArray<2>(at::IntArrayRef(padding)))
                              .count_include_pad(false));
     };
-    return 1.0 - SquaredCorrelation(mean(fixedMap),
-                                    mean(movingMap),
-                                    mean(fixedMap * fixedMap),
-                                    mean(movingMap * movingMap),
-                                    mean(fixedMap * movingMap))
-                   .mean();
+    const torch::Tensor correlation = SquaredCorrelation(mean(fixedMap),
+                                                         mean(movingMap),
+                                                         mean(fixedMap * fixedMap),
+                                                         mean(movingMap * movingMap),
+                                                         mean(fixedMap * movingMap));
+    if (!mask.defined())
+    {
+      return 1.0 - correlation.mean();
+    }
+    // The masked mean of the local terms, as a ratio of two sums (no host sync); 0 when the mask keeps nothing.
+    const torch::Tensor count = mask.sum() * correlation.size(1);
+    return (1.0 - torch::where(mask, correlation, 0.0).sum() / count.clamp_min(1.0)) * (count > 0);
   }
 };
 

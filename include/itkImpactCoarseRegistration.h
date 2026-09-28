@@ -95,6 +95,18 @@ public:
   SetMovingImage(const MovingImageType * image);
   itkGetConstObjectMacro(MovingImage, MovingImageType);
 
+  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid; absent, the whole image
+   * counts, at no cost. A cell's features are averaged over its masked voxels, and its cost at a coarse voxel for a
+   * candidate is averaged over the cell window weighed by the fixed cell's share of the fixed mask times the share of
+   * the moving mask in the moving cell the candidate shifts it to (moved like the features). A candidate that leaves
+   * the window no weight costs as much as the worst candidate with some; a coarse voxel no candidate gives any weight
+   * has no data cost and follows its neighbours through the coupling. */
+  using MaskImageType = Image<unsigned char, ImageDimension>;
+  itkSetConstObjectMacro(FixedMask, MaskImageType);
+  itkGetConstObjectMacro(FixedMask, MaskImageType);
+  itkSetConstObjectMacro(MovingMask, MaskImageType);
+  itkGetConstObjectMacro(MovingMask, MaskImageType);
+
   /** \name Optional IMPACT feature configuration. With no model the cost volume is built on
    * raw intensities; with model(s) it is built on their (concatenated) feature channels. */
   /** @{ */
@@ -222,6 +234,8 @@ protected:
 private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer m_MovingImage{ nullptr };
+  typename MaskImageType::ConstPointer   m_FixedMask{ nullptr };
+  typename MaskImageType::ConstPointer   m_MovingMask{ nullptr };
 
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
   std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
