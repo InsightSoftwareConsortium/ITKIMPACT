@@ -162,13 +162,16 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
     return AllocateFeatureImage<ImageDimension>(this->GetInput(0), shape, output);
   };
 
+  // A 2D model is swept along the image axis closest to head-feet, whatever the acquisition plane.
+  const unsigned int               sweepAxis = Impact::HeadFeetAxis(this->GetInput(0)->GetDirection(), ImageDimension);
   const std::vector<torch::Tensor> maps =
     RunTiledModel(m_ModelConfiguration,
                   m_Internals->inputsTensor[0],
                   device,
                   torch::Device(torch::kCPU), // the map ends up in an ITK buffer, which is on the host
                   Impact::PatchCombineModeFromString(m_ModelConfiguration.GetPatchCombine()),
-                  makeDestination);
+                  makeDestination,
+                  static_cast<int>(sweepAxis));
 
   const std::string & normalization = m_ModelConfiguration.GetFeatureNormalization();
   if (blendInPlace)
@@ -184,11 +187,10 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
     return;
   }
 
-  if (m_ModelConfiguration.GetDimension() != ImageDimension)
-  {
-    itkGenericExceptionMacro("ImageToFeaturesMap: PCA needs the whole map as one tensor, which a model of lower "
-                             "dimension than the image never forms -- it is run slice by slice.");
-  }
+  // A swept model's basis is read on slices along its sweep axis (Impact::PcaSlices): tensor
+  // dimension 1 + (D - 1 - axis) of the {C, spatial...} map.
+  const int64_t sweepDimension =
+    m_ModelConfiguration.GetDimension() < ImageDimension ? static_cast<int64_t>(ImageDimension - sweepAxis) : 0;
   if (m_Internals->principalComponents.size() < maps.size())
   {
     m_Internals->principalComponents.resize(maps.size());
@@ -203,11 +205,7 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
     // the moving image) so both share the same basis.
     // Normalized before the PCA, as every IMPACT consumer orders them.
     const torch::Tensor map = Impact::NormalizeFeatureChannels(maps[i], normalization, 0);
-    if (!m_Internals->principalComponents[i].defined())
-    {
-      m_Internals->principalComponents[i] = Impact::PcaFit(map, m_PCA);
-    }
-    tensorToImageFilter->SetTensor(Impact::PcaTransform(map, m_Internals->principalComponents[i]));
+    tensorToImageFilter->SetTensor(Impact::PcaReduce(map, m_Internals->principalComponents[i], m_PCA, sweepDimension));
     tensorToImageFilter->Update();
     this->ProcessObject::GetOutput(i)->Graft(tensorToImageFilter->GetOutput());
   }

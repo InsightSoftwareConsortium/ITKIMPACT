@@ -175,16 +175,21 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       {
         fixedSpacing[d] = m_FixedImage->GetSpacing()[d];
       }
-      fixedLayers =
-        Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing);
+      // A 2D model sweeps the axis closest to head-feet; both images are on the fixed grid.
+      const unsigned int sweepAxis = Impact::HeadFeetAxis(m_FixedImage->GetDirection(), ImageDimension);
+      fixedLayers = Impact::ExtractFeatureLayers<ImageDimension>(
+        m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing, static_cast<int>(sweepAxis));
       for (const auto & cfg : movingConfigs)
         SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
-      movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, {}, false, fixedSpacing);
+      movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(
+        movingConfigs, movingT, device, {}, false, fixedSpacing, static_cast<int>(sweepAxis));
       if (fixedLayers.empty() || fixedLayers.size() != movingLayers.size())
       {
         itkExceptionMacro("ImpactCoarseRegistration: fixed/moving produced "
                           << fixedLayers.size() << " and " << movingLayers.size() << " feature layers.");
       }
+      const std::vector<int64_t> pcaSweep =
+        Impact::PcaSweepDimensions<ImageDimension>(m_FixedModelsConfiguration, sweepAxis);
       for (size_t l = 0; l < fixedLayers.size(); ++l)
       {
         // PCA as the fine stage does it: the basis fitted on the fixed features, both projected onto it, so the
@@ -192,9 +197,12 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
         const int64_t components = l < m_PCA.size() ? static_cast<int64_t>(m_PCA[l]) : 0;
         if (components > 0 && components < fixedLayers[l].size(1))
         {
-          const torch::Tensor basis = Impact::PcaFit(fixedLayers[l].squeeze(0), components);
-          fixedLayers[l] = Impact::PcaTransform(fixedLayers[l].squeeze(0), basis).unsqueeze(0).contiguous();
-          movingLayers[l] = Impact::PcaTransform(movingLayers[l].squeeze(0), basis).unsqueeze(0).contiguous();
+          torch::Tensor basis;
+          const int64_t sweep = l < pcaSweep.size() ? pcaSweep[l] : 0;
+          fixedLayers[l] =
+            Impact::PcaReduce(fixedLayers[l].squeeze(0), basis, components, sweep).unsqueeze(0).contiguous();
+          movingLayers[l] =
+            Impact::PcaReduce(movingLayers[l].squeeze(0), basis, components, sweep).unsqueeze(0).contiguous();
         }
         // SubsetFeatures: that many of the layer's channels, drawn at random (from the seeded generator) once,
         // since the coarse search runs once.

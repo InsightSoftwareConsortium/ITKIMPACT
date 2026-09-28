@@ -49,8 +49,10 @@
 #include "itkRegistrationParameterScalesFromPhysicalShift.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -1985,6 +1987,217 @@ TEST(ImpactBackend, TwoDimensionalModelIsSweptOverAVolume)
   // The 4-channel convolution layer keeps the same grid.
   EXPECT_EQ(f->GetOutput(0)->GetLargestPossibleRegion().GetSize(), size);
   EXPECT_EQ(f->GetOutput(0)->GetNumberOfComponentsPerPixel(), 4u);
+}
+
+namespace
+{
+// Uniform noise on `size`, with `direction`: every voxel differs, so any axis mix-up shows.
+ImageType::Pointer
+MakeNoiseImage(const ImageType::SizeType & size, const ImageType::DirectionType & direction, unsigned int seed)
+{
+  auto image = ImageType::New();
+  image->SetRegions(ImageType::RegionType(size));
+  image->SetDirection(direction);
+  image->Allocate();
+  std::mt19937                                 generator(seed);
+  std::uniform_real_distribution<float>        uniform(0.0f, 1.0f);
+  itk::ImageRegionIteratorWithIndex<ImageType> it(image, image->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    it.Set(uniform(generator));
+  }
+  return image;
+}
+
+// A feature map as a [channels, z, y, x] tensor (a copy).
+torch::Tensor
+FeatureMapTensor(const itk::VectorImage<float, 3> * map)
+{
+  const auto size = map->GetLargestPossibleRegion().GetSize();
+  return torch::from_blob(const_cast<float *>(map->GetBufferPointer()),
+                          { static_cast<int64_t>(size[2]),
+                            static_cast<int64_t>(size[1]),
+                            static_cast<int64_t>(size[0]),
+                            static_cast<int64_t>(map->GetNumberOfComponentsPerPixel()) },
+                          torch::kFloat32)
+    .permute({ 3, 0, 1, 2 })
+    .clone();
+}
+
+// Directions whose image axis j points head-feet (row 2 is the S component of each image axis).
+ImageType::DirectionType
+HeadFeetAlong(unsigned int axis)
+{
+  ImageType::DirectionType direction;
+  direction.Fill(0.0);
+  // A cyclic permutation: image axis `axis` -> S, the next -> L, the one after -> P.
+  direction[2][axis] = 1.0;
+  direction[0][(axis + 1) % 3] = 1.0;
+  direction[1][(axis + 2) % 3] = 1.0;
+  return direction;
+}
+} // namespace
+
+// A 2D model is swept along the image axis closest to head-feet, argmax_j |Direction[2][j]|, a tie going to the
+// larger j, whatever the acquisition plane: on a sagittal or coronal image it is not the last axis. A voxel changed
+// in the input then changes the map in its own slice across that axis only -- the model's 3x3 convolution mixes
+// the two other axes. Checked through ImageToFeaturesMap (elastix Static), and through the registration stages'
+// extraction with and without the autograd graph.
+TEST(ImpactBackend, TwoDimensionalModelSweepsTheHeadFeetAxis)
+{
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  EXPECT_EQ(itk::Impact::HeadFeetAxis(identity, 3), 2u);
+  for (unsigned int axis = 0; axis < 3; ++axis)
+  {
+    EXPECT_EQ(itk::Impact::HeadFeetAxis(HeadFeetAlong(axis), 3), axis);
+  }
+  ImageType::DirectionType oblique = identity; // 45 degrees about x: axes 1 and 2 tie
+  const double             c = std::sqrt(0.5);
+  oblique[1][1] = c;
+  oblique[1][2] = -c;
+  oblique[2][1] = c;
+  oblique[2][2] = c;
+  EXPECT_EQ(itk::Impact::HeadFeetAxis(oblique, 3), 2u) << "a tie goes to the larger axis";
+  itk::Matrix<double, 2, 2> planar;
+  planar.SetIdentity();
+  EXPECT_EQ(itk::Impact::HeadFeetAxis(planar, 2), 1u);
+
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  const std::string             model2d = std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt";
+  const ImageType::SizeType     size = { { 9, 8, 7 } };
+  const ImageType::IndexType    marked = { { 4, 3, 3 } };
+  itk::ImpactModelConfiguration config(
+    model2d, 2, 1, { 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0 }, { true, false }, /*mixedPrecision*/ false);
+  auto interpolator = InterpolatorType::New();
+  interpolator->SetSplineOrder(3);
+
+  // The voxels (ITK index) where two feature tensors [C, z, y, x] differ.
+  auto changed = [](const torch::Tensor & a, const torch::Tensor & b) {
+    const torch::Tensor                 where = ((a - b).abs().amax(0) > 1e-4).nonzero(); // rows (z, y, x)
+    std::vector<std::array<int64_t, 3>> voxels;
+    for (int64_t r = 0; r < where.size(0); ++r)
+    {
+      voxels.push_back({ where[r][2].item<int64_t>(), where[r][1].item<int64_t>(), where[r][0].item<int64_t>() });
+    }
+    return voxels;
+  };
+  // The change stays in the marked voxel's slice across `axis` and spreads along both other axes.
+  auto expectSliceOf = [&](const std::vector<std::array<int64_t, 3>> & voxels, unsigned int axis, const char * what) {
+    ASSERT_FALSE(voxels.empty()) << what;
+    std::array<bool, 3> spread{ false, false, false };
+    for (const auto & v : voxels)
+    {
+      EXPECT_EQ(v[axis], marked[axis]) << what << ": a change left the slice across axis " << axis;
+      for (unsigned int d = 0; d < 3; ++d)
+      {
+        spread[d] = spread[d] || v[d] != marked[d];
+      }
+    }
+    for (unsigned int d = 0; d < 3; ++d)
+    {
+      if (d != axis)
+      {
+        EXPECT_TRUE(spread[d]) << what << ": the model did not span axis " << d;
+      }
+    }
+  };
+
+  for (unsigned int axis = 0; axis < 3; ++axis)
+  {
+    const ImageType::DirectionType direction = HeadFeetAlong(axis);
+    auto                           image = MakeNoiseImage(size, direction, 3);
+    auto                           touched = MakeNoiseImage(size, direction, 3);
+    touched->SetPixel(marked, touched->GetPixel(marked) + 5.0f);
+
+    auto mapOf = [&](ImageType::Pointer input) {
+      auto filter = FeatMapType::New();
+      filter->SetModelConfiguration(config);
+      filter->SetInterpolator(interpolator);
+      filter->AddInput(input);
+      filter->SetDevice("cpu");
+      filter->Update();
+      return FeatureMapTensor(filter->GetOutput(0));
+    };
+    expectSliceOf(changed(mapOf(image), mapOf(touched)), axis, "ImageToFeaturesMap");
+
+    const std::vector<itk::ImpactModelConfiguration> configs{ config };
+    for (const bool withGrad : { false, true })
+    {
+      auto layerOf = [&](ImageType::Pointer input) {
+        const torch::Tensor tensor = itk::Impact::ImageToBatchTensor(input.GetPointer());
+        return itk::Impact::ExtractFeatureLayers<3>(
+                 configs, tensor, torch::kCPU, {}, withGrad, {}, static_cast<int>(axis))[0]
+          .squeeze(0)
+          .detach();
+      };
+      expectSliceOf(changed(layerOf(image), layerOf(touched)),
+                    axis,
+                    withGrad ? "ExtractFeatureLayers with the graph" : "ExtractFeatureLayers");
+    }
+  }
+}
+
+// A 2D model's PCA, FireANTs' rule: the basis is fitted on the FIXED features of at most 32 slices along the sweep
+// axis, at round(linspace(0, n - 1, min(n, 32))), each image centred by its own mean over those slices, and every
+// slice projected. Here 40 slices lie along image axis 0, which the direction points head-feet.
+TEST(ImpactBackend, TwoDimensionalModelPcaReadsSlicesAlongTheSweepAxis)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  const std::string             model2d = std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel2D.pt";
+  const ImageType::SizeType     size = { { 40, 6, 5 } };
+  const auto                    direction = HeadFeetAlong(0);
+  auto                          fixed = MakeNoiseImage(size, direction, 1);
+  auto                          moving = MakeNoiseImage(size, direction, 2);
+  itk::ImpactModelConfiguration config(
+    model2d, 2, 1, { 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0 }, { true, false }, /*mixedPrecision*/ false);
+  auto interpolator = InterpolatorType::New();
+  interpolator->SetSplineOrder(3);
+  auto run = [&](ImageType::Pointer image, unsigned int pca, const std::vector<torch::Tensor> * basis) {
+    auto filter = FeatMapType::New();
+    filter->SetModelConfiguration(config);
+    filter->SetInterpolator(interpolator);
+    filter->AddInput(image);
+    filter->SetPCA(pca);
+    filter->SetDevice("cpu");
+    if (basis)
+    {
+      itk::SetPrincipalComponents(*filter, *basis);
+    }
+    filter->Update();
+    return std::make_pair(FeatureMapTensor(filter->GetOutput(0)), itk::GetPrincipalComponents(*filter));
+  };
+
+  const torch::Tensor fixedMap = run(fixed, 0, nullptr).first; // [4, z, y, x]
+  const torch::Tensor movingMap = run(moving, 0, nullptr).first;
+  const auto [fixedReduced, basis] = run(fixed, 2, nullptr);
+  const torch::Tensor movingReduced = run(moving, 2, &basis).first;
+
+  // The reference, written as the FireANTs engine computes it: the sweep axis (x) is tensor dimension 3.
+  const torch::Tensor index = torch::linspace(0, 39, 32).round().to(torch::kLong);
+  auto sampleOf = [&](const torch::Tensor & map) { return map.index_select(3, index).reshape({ 4, -1 }); };
+  const torch::Tensor centred = sampleOf(fixedMap) - sampleOf(fixedMap).mean(1, true);
+  const torch::Tensor covariance = centred.matmul(centred.t()) / (centred.size(1) - 1);
+  const torch::Tensor reference = std::get<1>(torch::linalg_eigh(covariance)).narrow(1, 2, 2);
+  auto                project = [&](const torch::Tensor & map) {
+    return torch::einsum("cn,ck->kn", { map.reshape({ 4, -1 }) - sampleOf(map).mean(1, true), reference });
+  };
+  const torch::Tensor expectedFixed = project(fixedMap);
+  const torch::Tensor expectedMoving = project(movingMap);
+  for (int64_t k = 0; k < 2; ++k)
+  {
+    // An eigenvector is defined up to its sign.
+    const double sign = (basis[0].select(1, k) * reference.select(1, k)).sum().item<double>() < 0 ? -1.0 : 1.0;
+    EXPECT_LT((fixedReduced.select(0, k).flatten() - sign * expectedFixed.select(0, k)).abs().max().item<double>(),
+              1e-4)
+      << "fixed component " << k;
+    EXPECT_LT((movingReduced.select(0, k).flatten() - sign * expectedMoving.select(0, k)).abs().max().item<double>(),
+              1e-4)
+      << "moving component " << k << " (the fixed basis, the moving image's own mean)";
+  }
+  // Centred by its own mean over the sampled slices: each image's projection averages to zero there.
+  EXPECT_LT(fixedReduced.index_select(3, index).mean({ 1, 2, 3 }).abs().max().item<double>(), 1e-4);
+  EXPECT_LT(movingReduced.index_select(3, index).mean({ 1, 2, 3 }).abs().max().item<double>(), 1e-4);
 }
 
 // The in-place blend gives the output image its geometry directly; it must agree with what

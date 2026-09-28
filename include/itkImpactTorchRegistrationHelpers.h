@@ -214,15 +214,18 @@ ResampleToVoxelSize(const torch::Tensor & image, const std::vector<double> & spa
  * (the fine filter resamples its sampling grid to the layer; the coarse stage pools each layer to
  * the common coarse grid), so features are never upsampled to full res here. Given the image's
  * `imageSpacing` (ITK order), each model sees the image resampled to its configured voxel size
- * (ResampleToVoxelSize); without it, or with no voxel size set, it sees the image as it is. */
+ * (ResampleToVoxelSize); without it, or with no voxel size set, it sees the image as it is.
+ * A model of lower dimension is swept along ITK axis `sweepAxis` (-1: the last one; see
+ * HeadFeetAxis), and its layers keep that axis at the image's resolution. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
 ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
-                     const torch::Tensor &                   imageTensor, // {1,1,spatial...} on device
-                     const torch::Device &                   device,
-                     const std::vector<unsigned int> &       subset,
-                     bool                                    withGrad = false,
-                     const std::vector<double> &             imageSpacing = {})
+                     const torch::Tensor &                         imageTensor, // {1,1,spatial...} on device
+                     const torch::Device &                         device,
+                     const std::vector<unsigned int> &             subset,
+                     bool                                          withGrad = false,
+                     const std::vector<double> &                   imageSpacing = {},
+                     int                                           sweepAxis = -1)
 {
   // withGrad=false (default): inference, features are constants (coarse stage, frozen-feature fine).
   // withGrad=true: keep the autograd graph so a caller can backpropagate a loss THROUGH the network to
@@ -279,7 +282,9 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
                                                modelInput.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
                                                device,
                                                device, // stays on the device; no host round-trip
-                                               PatchCombineModeFromString(config.GetPatchCombine())))
+                                               PatchCombineModeFromString(config.GetPatchCombine()),
+                                               {},
+                                               sweepAxis))
       {
         layers.push_back(
           keepSubset(Impact::NormalizeFeatureChannels(map.unsqueeze(0), config.GetFeatureNormalization(), 1)).contiguous());
@@ -310,7 +315,9 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
     std::vector<torch::jit::IValue> outputs;
     if (modelDim < Dim)
     {
-      const int64_t                           sliceAxis = 2; // first spatial axis in {1,C,z,y,x}
+      // Tensor dimension of the sweep axis in {1,C,z,y,x}: 2 for the last ITK axis.
+      const int64_t sliceAxis =
+        2 + static_cast<int64_t>(Dim) - 1 - (sweepAxis < 0 ? static_cast<int64_t>(Dim) - 1 : sweepAxis);
       const int64_t                           nSlices = input.size(sliceAxis);
       std::vector<std::vector<torch::Tensor>> perLayer; // [layer][slice], native model resolution
       for (int64_t s = 0; s < nSlices; ++s)
@@ -352,6 +359,22 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
   return layers;
 }
 
+/** Per kept layer of `configs`, in their flat order, the dimension PcaReduce reads a {C, spatial...}
+ * layer's slices along: `Dim - sweepAxis` for a model swept along ITK axis `sweepAxis`, 0 for a
+ * model of the image's dimension. */
+template <unsigned int Dim>
+std::vector<int64_t>
+PcaSweepDimensions(const std::vector<ImpactModelConfiguration> & configs, unsigned int sweepAxis)
+{
+  std::vector<int64_t> dimensions;
+  for (const auto & config : configs)
+  {
+    dimensions.insert(dimensions.end(),
+                      NumberOfKeptLayers(config),
+                      config.GetDimension() < Dim ? static_cast<int64_t>(Dim - sweepAxis) : 0);
+  }
+  return dimensions;
+}
 
 /** Channel-first {1, Dim, z,y,x} -> channel-last {z,y,x, Dim} permutation (drops batch). */
 template <unsigned int Dim>

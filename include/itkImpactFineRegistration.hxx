@@ -452,15 +452,23 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       resamples = resamples || (voxel[d] > 0.0f && std::abs(voxel[d] - fixedSpacing[d]) > 1e-6 * fixedSpacing[d]);
     }
   }
+  // A 2D model sweeps the axis closest to head-feet (every tensor here is on the fixed grid); the dense Jacobian
+  // mode chunks the leading one.
+  const int                  sweepAxis = jacSliced
+                                           ? static_cast<int>(ImageDimension) - 1
+                                           : static_cast<int>(Impact::HeadFeetAxis(m_FixedImage->GetDirection(), ImageDimension));
+  const std::vector<int64_t> pcaSweep =
+    Impact::PcaSweepDimensions<ImageDimension>(m_FixedModelsConfiguration, static_cast<unsigned int>(sweepAxis));
   // Extract the moving feature layers from an image tensor and project them onto the stored PCA
   // bases (used for the initial extraction and for the FeatureMapUpdateInterval re-extraction).
   auto extractMovingFeatures = [&](const torch::Tensor & imageTensor) -> std::vector<torch::Tensor> {
-    auto layers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, imageTensor, device, {}, false, fixedSpacing);
+    auto layers = Impact::ExtractFeatureLayers<ImageDimension>(
+      movingConfigs, imageTensor, device, {}, false, fixedSpacing, sweepAxis);
     for (size_t l = 0; l < layers.size() && l < pcaBasis.size(); ++l)
     {
       if (pcaBasis[l].defined())
       {
-        layers[l] = Impact::PcaTransform(layers[l].squeeze(0), pcaBasis[l]).unsqueeze(0).contiguous();
+        layers[l] = Impact::PcaReduce(layers[l].squeeze(0), pcaBasis[l], 0, pcaSweep[l]).unsqueeze(0).contiguous();
       }
     }
     return layers;
@@ -474,11 +482,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     // member for the next image does not touch the tensor the completed forward already captured.
     for (const auto & cfg : m_FixedModelsConfiguration)
       SetupImageMetadata<FixedImageType>(cfg, m_FixedImage);
-    fixedLayers =
-      Impact::ExtractFeatureLayers<ImageDimension>(m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing);
+    fixedLayers = Impact::ExtractFeatureLayers<ImageDimension>(
+      m_FixedModelsConfiguration, fixedT, device, {}, false, fixedSpacing, sweepAxis);
     for (const auto & cfg : movingConfigs)
       SetupImageMetadata<MovingImageType>(cfg, movingOnFixed);
-    movingLayers = Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, {}, false, fixedSpacing);
+    movingLayers =
+      Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingT, device, {}, false, fixedSpacing, sweepAxis);
     if (fixedLayers.size() != movingLayers.size() || fixedLayers.empty())
     {
       itkExceptionMacro("ImpactFineRegistration: fixed and moving produced "
@@ -495,9 +504,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       {
         continue;
       }
-      pcaBasis[l] = Impact::PcaFit(fixedLayers[l].squeeze(0), components);
-      fixedLayers[l] = Impact::PcaTransform(fixedLayers[l].squeeze(0), pcaBasis[l]).unsqueeze(0).contiguous();
-      movingLayers[l] = Impact::PcaTransform(movingLayers[l].squeeze(0), pcaBasis[l]).unsqueeze(0).contiguous();
+      fixedLayers[l] =
+        Impact::PcaReduce(fixedLayers[l].squeeze(0), pcaBasis[l], components, pcaSweep[l]).unsqueeze(0).contiguous();
+      movingLayers[l] =
+        Impact::PcaReduce(movingLayers[l].squeeze(0), pcaBasis[l], components, pcaSweep[l]).unsqueeze(0).contiguous();
     }
     for (size_t l = 0; l < fixedLayers.size(); ++l)
     {
