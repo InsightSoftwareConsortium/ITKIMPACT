@@ -52,7 +52,9 @@ namespace Impact
  * readback reads (size / 2) is the point itself. A model of the image's dimension spans the image axes, step_d its
  * voxel size along axis d (the image's spacing when unset). A 2D model in a volume spans the plane drawn for each point
  * (PatchPlaneRotation's first two columns, from `seed` and `modelIndex`, as the metric's PatchPlane), its steps its
- * voxel sizes (the finest spacing when unset). `voxels`, when given, keeps those patch voxels only (P of them). */
+ * voxel sizes (the finest spacing when unset). `voxels`, when given, keeps those patch voxels only (P of them).
+ * `points` stay on the host; the positions are formed with `options` (dtype and device), so that a registration on
+ * the GPU places its patches there: only the per-point planes of a 2D model are drawn on the host. */
 template <unsigned int Dim>
 torch::Tensor
 SampledPatchPositions(const ImpactModelConfiguration & config,
@@ -60,7 +62,8 @@ SampledPatchPositions(const ImpactModelConfiguration & config,
                       const std::vector<double> &      spacing,
                       unsigned int                     seed,
                       size_t                           modelIndex,
-                      const std::vector<int64_t> &     voxels = {})
+                      const std::vector<int64_t> &     voxels = {},
+                      const torch::TensorOptions &     options = torch::TensorOptions().dtype(torch::kFloat64))
 {
   const std::vector<int64_t> & patchSize = config.GetPatchSize();
   const std::vector<float> &   voxelSize = config.GetVoxelSize();
@@ -93,11 +96,11 @@ SampledPatchPositions(const ImpactModelConfiguration & config,
       offset[k][d] = static_cast<double>(index - patchSize[d] / 2) * step;
     }
   }
-  const torch::Tensor centres = points.to(torch::kFloat64).unsqueeze(1); // {N, 1, Dim}
+  const torch::Tensor centres = points.to(options).unsqueeze(1); // {N, 1, Dim}
   const torch::Tensor perVoxel = 1.0 / torch::tensor(spacing, torch::kFloat64);
   if (modelDimension == Dim)
   {
-    return centres + (offsets * perVoxel).unsqueeze(0);
+    return centres + (offsets * perVoxel).to(options).unsqueeze(0);
   }
   if (modelDimension != 2 || Dim != 3)
   {
@@ -119,7 +122,7 @@ SampledPatchPositions(const ImpactModelConfiguration & config,
       axis[n][j][1] = plane[j][1];
     }
   }
-  return centres + torch::einsum("njd,pd->npj", { axes, offsets }) * perVoxel;
+  return centres + torch::einsum("njd,pd->npj", { axes.to(options), offsets.to(options) }) * perVoxel.to(options);
 }
 
 /** The corners of model `config`'s patch, as patch voxel numbers (model axis 0 running fastest): a patch is the image
@@ -1050,21 +1053,24 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           lastIndex[d] = static_cast<double>(spatial[ImageDimension - 1 - d] - 1);
           gridScale[d] = lastIndex[d] > 0.0 ? lastIndex[d] / 2.0 : 1.0;
         }
-        const torch::Tensor upper = torch::tensor(lastIndex, torch::kFloat64);
-        torch::Tensor       fits = torch::ones({ count }, torch::kBool);
+        // The patches are placed on the device, in single precision.
+        const auto          onDevice = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        const torch::Tensor upper = torch::tensor(lastIndex, torch::kFloat64).to(onDevice);
+        torch::Tensor       fits = torch::ones({ count }, torch::TensorOptions().dtype(torch::kBool).device(device));
         for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
         {
           const ImpactModelConfiguration & config = m_FixedModelsConfiguration[i];
           const torch::Tensor              corners = Impact::SampledPatchPositions<ImageDimension>(
-            config, points, fixedSpacing, m_Seed, i, Impact::PatchCorners(config));
+            config, points, fixedSpacing, m_Seed, i, Impact::PatchCorners(config), onDevice);
           fits = fits & ((corners >= 0.0) & (corners <= upper)).flatten(1).all(1);
         }
         if (fixedMask.defined()) // the points drawn in the fixed mask
         {
-          fits = fits & fixedMask.flatten().index_select(0, flat.to(device)).to(torch::kCPU);
+          fits = fits & fixedMask.flatten().index_select(0, flat.to(device));
         }
-        torch::Tensor       kept = points.index_select(0, fits.nonzero().flatten());
+        torch::Tensor       kept = points.index_select(0, fits.nonzero().flatten().to(torch::kCPU));
         const torch::Tensor toGrid = torch::tensor(gridScale, torch::kFloat64);
+        const torch::Tensor toGridOnDevice = toGrid.to(onDevice);
         if (movingMask.defined() && kept.size(0) > 0)
         {
           // ... that the moving mask, warped by the field, holds at their centre.
@@ -1095,13 +1101,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           // moving image as the field warps it (differentiable, so the gradient reaches the control grid). The patch
           // voxels are placed a batch at a time, as grid_sample coordinates (x, y, z: ITK order).
           auto patchesOf = [&](size_t i, int64_t begin, int64_t end, bool moving) {
-            const torch::Tensor grid =
-              (Impact::SampledPatchPositions<ImageDimension>(
-                 m_FixedModelsConfiguration[i], kept.narrow(0, begin, end - begin), fixedSpacing, m_Seed, i) /
-                 toGrid -
-               1.0)
-                .to(torch::kFloat32)
-                .to(device);
+            const torch::Tensor grid = Impact::SampledPatchPositions<ImageDimension>(m_FixedModelsConfiguration[i],
+                                                                                     kept.narrow(0, begin, end - begin),
+                                                                                     fixedSpacing,
+                                                                                     m_Seed,
+                                                                                     i,
+                                                                                     {},
+                                                                                     onDevice) /
+                                         toGridOnDevice -
+                                       1.0;
             const int64_t        samples = grid.size(0) * grid.size(1);
             std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, samples, Dim}
             where[ImageDimension] = samples;
