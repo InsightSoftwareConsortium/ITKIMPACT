@@ -1852,6 +1852,35 @@ TEST(ImpactBackend, BatchBudgetIsMeasuredAndABatchOutOfMemoryIsHalved)
 
 // A whole-image (0) axis that does not fit on the device is halved, largest first, until the
 // model fits; declared axes are never touched (itkImpactPatchTiling.h RunTiledModel).
+// The linear budget is checked by running that batch once: a network whose cost per patch grows with the batch, or
+// that runs out of memory above some size, gets the largest batch that fits instead of the estimate.
+TEST(ImpactBackend, BatchBudgetIsProbedAtItsSize)
+{
+  const double         usable = 1000.0;
+  std::vector<int64_t> probed;
+  auto                 superlinear = [&](int64_t batch) {
+    probed.push_back(batch);
+    return static_cast<int64_t>(10.0 * batch * (1.0 + batch / 100.0)); // 10 per patch at 1, more at 100
+  };
+  const int64_t fitted = itk::Impact::FitBatchToDevice(100, usable, superlinear);
+  EXPECT_LE(10.0 * fitted * (1.0 + fitted / 100.0), usable);
+  EXPECT_GE(fitted, 50) << "not halved blindly";
+  EXPECT_EQ(probed.front(), 100);
+  EXPECT_EQ(itk::Impact::FitBatchToDevice(40, usable, superlinear), 40) << "a batch that fits is kept";
+  auto oom = [](int64_t batch) -> int64_t {
+    if (batch > 30)
+    {
+      TORCH_CHECK_WITH(OutOfMemoryError, false, "simulated");
+    }
+    return batch;
+  };
+  const int64_t survived = itk::Impact::FitBatchToDevice(100, usable, oom);
+  EXPECT_LE(survived, 30);
+  EXPECT_GE(survived, 20);
+  auto other = [](int64_t) -> int64_t { throw std::runtime_error("shape mismatch"); };
+  EXPECT_THROW(itk::Impact::FitBatchToDevice(10, usable, other), std::runtime_error);
+}
+
 TEST(ImpactBackend, WholeImagePatchShrinksLargestZeroAxisFirst)
 {
   const std::vector<int64_t> configured{ 0, 64, 0 };

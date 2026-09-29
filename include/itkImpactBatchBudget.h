@@ -73,6 +73,42 @@ IsDeviceOutOfMemory(const std::exception & error)
   return what.find("out of memory") != std::string::npos || what.find("alloc_failed") != std::string::npos;
 }
 
+/** The batch that fits in `usable` bytes, starting from the linear `estimate`: the batch is run once at that size
+ * (`peakOf` returns the bytes it takes, or throws on device out-of-memory), and while it takes more than `usable`, or
+ * runs out, it is scaled down to what the measured peak says fits (3/4 of it after an out-of-memory). The cost measured
+ * at 1 and 2 patches is linear, and a large network at a few hundred patches takes more per patch (workspaces,
+ * fragmentation): the estimate alone overflowed, and halving after the out-of-memory left a smaller batch than needed.
+ */
+template <typename TPeakOf>
+inline int64_t
+FitBatchToDevice(int64_t estimate, double usable, TPeakOf && peakOf)
+{
+  int64_t batch = std::max<int64_t>(estimate, 1);
+  for (int attempt = 0; attempt < 8 && batch > 1; ++attempt)
+  {
+    int64_t next;
+    try
+    {
+      const auto peak = static_cast<double>(peakOf(batch));
+      if (peak <= usable)
+      {
+        return batch;
+      }
+      next = static_cast<int64_t>(static_cast<double>(batch) * usable / peak);
+    }
+    catch (const std::exception & error)
+    {
+      if (!IsDeviceOutOfMemory(error))
+      {
+        throw;
+      }
+      next = batch * 3 / 4;
+    }
+    batch = std::max<int64_t>(std::min(next, batch - 1), 1);
+  }
+  return batch;
+}
+
 /** Patches of `configuration` that fit on `device`, forward and backward; 0 if not measurable
  * (CPU, CPU-only LibTorch, or no strictly positive patch size). Moves the model to the device. */
 inline int64_t
@@ -124,7 +160,18 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration, const torch::
   const auto    stats = c10::cuda::CUDACachingAllocator::getDeviceStats(index);
   const int64_t cached = stats.reserved_bytes[aggregate].current - stats.allocated_bytes[aggregate].current;
   const double  usable = static_cast<double>(static_cast<int64_t>(freeBytes) + std::max<int64_t>(cached, 0)) * safety;
-  return std::max<int64_t>(static_cast<int64_t>(usable / static_cast<double>(perPatch)), 1);
+  return FitBatchToDevice(
+    std::max<int64_t>(static_cast<int64_t>(usable / static_cast<double>(perPatch)), 1), usable, [&](int64_t batch) {
+      try
+      {
+        return peakOf(batch);
+      }
+      catch (...)
+      {
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        throw;
+      }
+    });
 #else
   (void)configuration;
   (void)device;
