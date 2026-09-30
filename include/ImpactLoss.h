@@ -223,7 +223,8 @@ public:
 
 /** Each voxel's (or point's) feature vector along `channelDim` scaled as a model configuration's
  * FeatureNormalization says: `l2` to unit length, `standardized` to zero mean and unit (unbiased) standard deviation
- * over its channels, `none` unchanged. Applied to every kept layer before PCA, the channel subset and the distance. */
+ * over its channels, `none` unchanged. Applied to every kept layer before PCA, the channel subset and the distance.
+ * A one-channel feature has no deviation to standardize by, and is refused. */
 inline torch::Tensor
 NormalizeFeatureChannels(const torch::Tensor & features, const std::string & mode, int64_t channelDim)
 {
@@ -237,6 +238,10 @@ NormalizeFeatureChannels(const torch::Tensor & features, const std::string & mod
   }
   if (mode == "standardized")
   {
+    if (features.size(channelDim) == 1)
+    {
+      throw std::runtime_error("A one-channel feature cannot be standardized over its channels: use none or l2.");
+    }
     return (features - features.mean(channelDim, /*keepdim=*/true)) /
            features.std(channelDim, /*unbiased=*/true, /*keepdim=*/true).clamp_min(1e-6);
   }
