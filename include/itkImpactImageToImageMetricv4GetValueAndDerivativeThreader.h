@@ -21,6 +21,7 @@
 
 #include <itkImageToImageMetricv4GetValueAndDerivativeThreader.h>
 #include "ImpactLoss.h"
+#include "itkImpactLossNormalization.h"
 #include <algorithm>
 #include <random>
 
