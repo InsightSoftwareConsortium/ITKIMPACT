@@ -43,8 +43,8 @@ itkImageToFeaturesMapTest(int argc, char * argv[])
   using InterpolatorType = itk::BSplineInterpolateImageFunction<ImageType, double>;
   using ImageToFeaturesMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
 
-  auto                  image = ImageType::New();
-  ImageType::SizeType   size;
+  auto                image = ImageType::New();
+  ImageType::SizeType size;
   size.Fill(8);
   ImageType::RegionType region;
   region.SetSize(size);

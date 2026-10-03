@@ -303,18 +303,18 @@ private:
   int                       m_FeaturesMapUpdateInterval{ 0 };
   /** Derivative evaluations since Initialize(), the metric's stand-in for an iteration count.
    * Mutable because GetValueAndDerivative() is const, as the base metric declares it. */
-  mutable unsigned long     m_CurrentIteration{ 0 };
-  std::string               m_Mode;
-  std::string               m_FeatureMapsPath;
-  bool                      m_NormalizeLosses{ true };
+  mutable unsigned long m_CurrentIteration{ 0 };
+  std::string           m_Mode;
+  std::string           m_FeatureMapsPath;
+  bool                  m_NormalizeLosses{ true };
   /** Latched at the first evaluation after Initialize(); mutable because the evaluation is const. */
   mutable Impact::LossNormalization m_LossNormalization;
-  std::string               m_Device = "cpu";
+  std::string                       m_Device = "cpu";
   // Zero means "seed from the clock", which is what the per-work-unit generator does with it.
   // It must have a value even when the user never calls SetSeed(): it is read on every
   // evaluation, and an indeterminate one would make the metric unreproducible at random.
-  unsigned int              m_Seed{ 0 };
-  unsigned int              m_BatchSize{ 64 };
+  unsigned int m_Seed{ 0 };
+  unsigned int m_BatchSize{ 64 };
 
   std::vector<std::vector<unsigned int>> m_features_indexes;
 };

@@ -360,10 +360,9 @@ MakePatchGrid(const std::vector<int64_t> & shape,
     const int64_t stride = patchSize[d] - overlaps[d];
     if (stride <= 0)
     {
-      itkGenericExceptionMacro("ImageToFeaturesMap: overlap (" << overlaps[d]
-                                                               << ") must be smaller than the patch size ("
-                                                               << patchSize[d] << ") along dimension " << d
-                                                               << "; otherwise consecutive patches never advance.");
+      itkGenericExceptionMacro("ImageToFeaturesMap: overlap ("
+                               << overlaps[d] << ") must be smaller than the patch size (" << patchSize[d]
+                               << ") along dimension " << d << "; otherwise consecutive patches never advance.");
     }
     int64_t count = 1;
     if (extent > patchSize[d])
@@ -726,13 +725,14 @@ private:
  * the blend. A caller that needs the graph must run the model whole.
  */
 inline std::vector<torch::Tensor>
-RunTiledModelOnce(const ImpactModelConfiguration &                                                config,
-                  const torch::Tensor &                                                           input,
-                  const torch::Device &                                                           device,
-                  const torch::Device &                                                           accumulateOn,
-                  PatchCombineMode                                                                combine,
-                  const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination,
-                  const std::vector<int64_t> & patchOverride) // ITK order; a whole-extent axis cut down by RunTiledModel
+RunTiledModelOnce(
+  const ImpactModelConfiguration &                                                config,
+  const torch::Tensor &                                                           input,
+  const torch::Device &                                                           device,
+  const torch::Device &                                                           accumulateOn,
+  PatchCombineMode                                                                combine,
+  const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination,
+  const std::vector<int64_t> & patchOverride) // ITK order; a whole-extent axis cut down by RunTiledModel
 {
   torch::NoGradGuard noGrad;
 
@@ -741,7 +741,8 @@ RunTiledModelOnce(const ImpactModelConfiguration &                              
   if (dimension == 0 || dimension > imageDimension)
   {
     itkGenericExceptionMacro("IMPACT: the model " << config.GetModelPath() << " is configured for " << dimension
-                             << " dimension(s), which a " << imageDimension << "D image cannot be tiled for.");
+                                                  << " dimension(s), which a " << imageDimension
+                                                  << "D image cannot be tiled for.");
   }
   const unsigned int sweptAxes = imageDimension - dimension;
 
@@ -826,16 +827,17 @@ RunTiledModelOnce(const ImpactModelConfiguration &                              
         }
         catch (const std::exception & e)
         {
-          itkGenericExceptionMacro(
-            "IMPACT: the model " << config.GetModelPath()
-            << " rejected its input. Check the number of channels (" << config.GetNumberOfChannels()
-            << "), the patch size " << GetStringFromVector<int64_t>(config.GetPatchSize()) << " and the dimension ("
-            << config.GetDimension() << ").\nDetails: " << e.what());
+          itkGenericExceptionMacro("IMPACT: the model "
+                                   << config.GetModelPath() << " rejected its input. Check the number of channels ("
+                                   << config.GetNumberOfChannels() << "), the patch size "
+                                   << GetStringFromVector<int64_t>(config.GetPatchSize()) << " and the dimension ("
+                                   << config.GetDimension() << ").\nDetails: " << e.what());
         }
         if (config.GetLayersMask().size() != outputsList.size())
         {
           itkGenericExceptionMacro("IMPACT: " << config.GetModelPath() << " declares " << config.GetLayersMask().size()
-                                   << " layer mask entries but returned " << outputsList.size() << " layers.");
+                                              << " layer mask entries but returned " << outputsList.size()
+                                              << " layers.");
         }
       }
       else
@@ -850,8 +852,7 @@ RunTiledModelOnce(const ImpactModelConfiguration &                              
         {
           continue;
         }
-        const torch::Tensor layerPatch =
-          outputsList[it].toTensor().squeeze(0).to(accumulateOn).to(torch::kFloat32);
+        const torch::Tensor layerPatch = outputsList[it].toTensor().squeeze(0).to(accumulateOn).to(torch::kFloat32);
 
         if (layerIndex == accumulators.size())
         {
@@ -874,11 +875,10 @@ RunTiledModelOnce(const ImpactModelConfiguration &                              
               layerOverlaps[d] = std::llround(overlaps[d] * scales[d]);
               if (layerOverlaps[d] >= layerPatchSize[d])
               {
-                itkGenericExceptionMacro("IMPACT: the overlap (" << overlaps[d]
-                                         << ") scaled to this layer's resolution (" << layerOverlaps[d]
-                                         << ") is not smaller than the layer's patch extent ("
-                                         << layerPatchSize[d] << ") along dimension " << d
-                                         << ". Reduce the overlap or keep a finer layer.");
+                itkGenericExceptionMacro("IMPACT: the overlap ("
+                                         << overlaps[d] << ") scaled to this layer's resolution (" << layerOverlaps[d]
+                                         << ") is not smaller than the layer's patch extent (" << layerPatchSize[d]
+                                         << ") along dimension " << d << ". Reduce the overlap or keep a finer layer.");
               }
             }
             layerGrid = ScalePatchGrid(grid, scales);
@@ -902,8 +902,7 @@ RunTiledModelOnce(const ImpactModelConfiguration &                              
             assembled.push_back(destination);
           }
 
-          accumulators.emplace_back(
-            layerShape, layerPatchSize, layerOverlaps, layerGrid, MakePatchCombine(combine));
+          accumulators.emplace_back(layerShape, layerPatchSize, layerOverlaps, layerGrid, MakePatchCombine(combine));
 
           // This slice's own sub-view of the layer's buffer.
           torch::Tensor destination = assembled[layerIndex];
@@ -924,7 +923,8 @@ RunTiledModelOnce(const ImpactModelConfiguration &                              
       // A layer that did not see every patch would be handed back as a valid map of size zero.
       if (!accumulators[i].IsFull())
       {
-        itkGenericExceptionMacro("IMPACT: layer " << i << " of " << config.GetModelPath()
+        itkGenericExceptionMacro("IMPACT: layer "
+                                 << i << " of " << config.GetModelPath()
                                  << " was never assembled: the accumulator expected more patches than the tiling "
                                     "produced. This is an internal inconsistency, not a configuration error.");
       }

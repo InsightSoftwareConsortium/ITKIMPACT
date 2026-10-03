@@ -74,7 +74,8 @@ public:
   using OutputImagePixelType = float;
 
   /** Get the tensor that will be wrapped as the output image. */
-  torch::Tensor GetTensor();
+  torch::Tensor
+  GetTensor();
 
   /** Set the tensor to wrap. Layout is (channels, spatial...); the channel axis becomes the
    * pixel vector length and the trailing axes the spatial grid. */
@@ -105,7 +106,8 @@ public:
     return m_Region;
   }
 
-  void SetReferenceImage(ReferenceImageTypeConstPointer referenceImage)
+  void
+  SetReferenceImage(ReferenceImageTypeConstPointer referenceImage)
   {
     m_Origin = referenceImage->GetOrigin();
     m_Spacing = referenceImage->GetSpacing();
@@ -132,7 +134,7 @@ public:
   itkSetVectorMacro(Size, const float, VImageDimension);
 
   using DirectionType = Matrix<SpacePrecisionType, VImageDimension, VImageDimension>;
-  
+
   /** Set the direction of the image
    * \sa GetDirection() */
   virtual void
@@ -162,11 +164,10 @@ protected:
 private:
   RegionType    m_Region{};
   SpacingType   m_Spacing{ MakeFilled<SpacingType>(1.0) };
-  OriginType    m_Origin{MakeFilled<SpacingType>(0)};
+  OriginType    m_Origin{ MakeFilled<SpacingType>(0) };
   DirectionType m_Direction{ DirectionType::GetIdentity() };
   SizeType      m_Size{};
   torch::Tensor m_tensor;
-  
 };
 } // end namespace itk
 

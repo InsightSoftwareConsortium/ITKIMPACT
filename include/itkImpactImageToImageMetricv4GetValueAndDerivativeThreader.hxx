@@ -35,19 +35,16 @@ namespace itk
 {
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
-  TDomainPartitioner,
-  TImageToImageMetric,
-  TImpactMetric>::ImpactImageToImageMetricv4GetValueAndDerivativeThreader()
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  ImpactImageToImageMetricv4GetValueAndDerivativeThreader()
   : m_LossThreadStruct(nullptr)
   , m_ImpactAssociate(nullptr)
 {}
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 void
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
-                                                        TImageToImageMetric,
-                                                        TImpactMetric>::BeforeThreadedExecution()
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  BeforeThreadedExecution()
 {
   Superclass::BeforeThreadedExecution();
 
@@ -93,9 +90,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 void
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
-                                                        TImageToImageMetric,
-                                                        TImpactMetric>::AfterThreadedExecution()
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  AfterThreadedExecution()
 {
   // Let the base reduce the valid-point count (and per-point derivative contributions,
   // if any). It also sets m_Value from the per-point measures, which we leave at zero
@@ -133,12 +129,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 std::vector<unsigned int>
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
-  TDomainPartitioner,
-  TImageToImageMetric,
-  TImpactMetric>::GetSubsetOfFeatures(const std::vector<unsigned int> & features_index,
-                                      std::mt19937 &                    randomGenerator,
-                                      int                               n) const
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  GetSubsetOfFeatures(const std::vector<unsigned int> & features_index, std::mt19937 & randomGenerator, int n) const
 {
   if (features_index.size() == static_cast<size_t>(n))
     return features_index;
@@ -404,7 +396,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     {
       continue;
     }
-    const double movingValue = static_cast<double>(this->m_ImpactAssociate->m_MovingInterpolator->Evaluate(movingPoint));
+    const double movingValue =
+      static_cast<double>(this->m_ImpactAssociate->m_MovingInterpolator->Evaluate(movingPoint));
     movingAccessor[row][flat] = static_cast<float>(movingValue);
     if (!computeDerivative)
     {
@@ -440,9 +433,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 {
   constexpr unsigned int movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
 
-  const auto          batchSize = static_cast<int64_t>(std::distance(first, last));
-  const bool          computeDerivative = this->GetComputeDerivative();
-  const torch::Device device(this->m_ImpactAssociate->GetDevice());
+  const auto                   batchSize = static_cast<int64_t>(std::distance(first, last));
+  const bool                   computeDerivative = this->GetComputeDerivative();
+  const torch::Device          device(this->m_ImpactAssociate->GetDevice());
   std::unique_lock<std::mutex> deviceLock(Impact::DeviceForwardMutex(), std::defer_lock);
 
   // d(moving coordinate)/d(parameter) at every point of the batch, and the global parameter
@@ -527,7 +520,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   {
     const ImpactModelConfiguration & fixedConfig = fixedConfigs[i];
     const ImpactModelConfiguration & movingConfig = movingConfigs[i];
-    const auto                 channels = static_cast<int64_t>(fixedConfig.GetNumberOfChannels());
+    const auto                       channels = static_cast<int64_t>(fixedConfig.GetNumberOfChannels());
 
     const std::vector<int64_t> & patchSize = fixedConfig.GetPatchSize();
     const int64_t voxelCount = std::accumulate(patchSize.begin(), patchSize.end(), int64_t{ 1 }, std::multiplies<>());
@@ -675,20 +668,18 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 bool
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
-  TDomainPartitioner,
-  TImageToImageMetric,
-  TImpactMetric>::ProcessPoint(const VirtualIndexType & virtualIndex,
-                               const VirtualPointType & virtualPoint,
-                               const FixedImagePointType &  mappedFixedPoint,
-                               const FixedImagePixelType &,
-                               const FixedImageGradientType &,
-                               const MovingImagePointType & mappedMovingPoint,
-                               const MovingImagePixelType &,
-                               const MovingImageGradientType &,
-                               MeasureType &      metricValueReturn,
-                               DerivativeType &,
-                               const ThreadIdType threadId) const
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  ProcessPoint(const VirtualIndexType &    virtualIndex,
+               const VirtualPointType &    virtualPoint,
+               const FixedImagePointType & mappedFixedPoint,
+               const FixedImagePixelType &,
+               const FixedImageGradientType &,
+               const MovingImagePointType & mappedMovingPoint,
+               const MovingImagePixelType &,
+               const MovingImageGradientType &,
+               MeasureType & metricValueReturn,
+               DerivativeType &,
+               const ThreadIdType threadId) const
 {
   // Static mode only: interpolate the (optionally subsampled) per-layer feature vector at the
   // mapped fixed/moving point and accumulate the per-layer loss. When a derivative is
@@ -699,8 +690,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
 
   const bool computeDerivative = this->GetComputeDerivative();
 
-  torch::Tensor transformJacobian;        // [1, MovingDim, P]
-  torch::Tensor nonZeroJacobianIndices;   // [1, P]
+  torch::Tensor transformJacobian;      // [1, MovingDim, P]
+  torch::Tensor nonZeroJacobianIndices; // [1, P]
   if (computeDerivative)
   {
     using JacobianType = typename TImageToImageMetric::JacobianType;
@@ -712,11 +703,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
     this->m_ImpactAssociate->GetMovingTransform()->ComputeJacobianWithRespectToParametersCachedTemporaries(
       virtualPoint, jacobian, jacobianPositional);
 
-    constexpr unsigned int      movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
+    constexpr unsigned int       movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
     const NumberOfParametersType numberOfLocalParameters = this->GetCachedNumberOfLocalParameters();
-    transformJacobian =
-      torch::empty({ 1, static_cast<int64_t>(movingDimension), static_cast<int64_t>(numberOfLocalParameters) },
-                   torch::kFloat32);
+    transformJacobian = torch::empty(
+      { 1, static_cast<int64_t>(movingDimension), static_cast<int64_t>(numberOfLocalParameters) }, torch::kFloat32);
     auto jacobianAccessor = transformJacobian.accessor<float, 3>();
     for (unsigned int dimension = 0; dimension < movingDimension; ++dimension)
     {
@@ -760,19 +750,19 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
                                 loss.m_randomGenerator,
                                 this->m_ImpactAssociate->GetSubsetFeatures()[i]);
 
-    torch::Tensor fixedFeatures =
-      this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps[i].m_FeaturesMapInterpolator->Evaluate(mappedFixedPoint, subsetOfFeatures)
-        .unsqueeze(0);
-    torch::Tensor movingFeatures =
-      this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i].m_FeaturesMapInterpolator->Evaluate(movingReadPoint, subsetOfFeatures)
-        .unsqueeze(0);
+    torch::Tensor fixedFeatures = this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps[i]
+                                    .m_FeaturesMapInterpolator->Evaluate(mappedFixedPoint, subsetOfFeatures)
+                                    .unsqueeze(0);
+    torch::Tensor movingFeatures = this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i]
+                                     .m_FeaturesMapInterpolator->Evaluate(movingReadPoint, subsetOfFeatures)
+                                     .unsqueeze(0);
 
     if (computeDerivative)
     {
       // d(feature)/d(moving coordinate) : [1, C, MovingDim]
       torch::Tensor movingFeatureDerivative =
-        this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i].m_FeaturesMapInterpolator
-          ->EvaluateDerivative(movingReadPoint, subsetOfFeatures)
+        this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i]
+          .m_FeaturesMapInterpolator->EvaluateDerivative(movingReadPoint, subsetOfFeatures)
           .unsqueeze(0);
       // chain with d(moving coordinate)/d(parameter) : [1, C, P]
       torch::Tensor featureParameterJacobian = torch::bmm(movingFeatureDerivative, transformJacobian);

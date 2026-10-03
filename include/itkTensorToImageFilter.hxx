@@ -77,9 +77,9 @@ TensorToImageFilter<VImageDimension>::GenerateOutputInformation()
   OutputImagePointer outputPtr = this->GetOutput();
 
   SpacingType spacing;
-  RegionType region;
-  SizeType size;
-  
+  RegionType  region;
+  SizeType    size;
+
   for (int s = 0; s < VImageDimension; ++s)
   {
     size[s] = m_tensor.size(VImageDimension - s);
@@ -87,16 +87,19 @@ TensorToImageFilter<VImageDimension>::GenerateOutputInformation()
   region.SetSize(size);
   outputPtr->SetRegions(region);
   outputPtr->SetVectorLength(m_tensor.size(0));
-  if (m_Size[0] > 0){
+  if (m_Size[0] > 0)
+  {
     for (int i = 0; i < VImageDimension; ++i)
     {
       spacing[i] = m_Size[i] * m_Spacing[i] / size[i];
     }
     outputPtr->SetSpacing(spacing);
-  } else {
+  }
+  else
+  {
     outputPtr->SetSpacing(m_Spacing);
   }
-  
+
   outputPtr->SetOrigin(m_Origin);
   outputPtr->SetDirection(m_Direction);
   outputPtr->Allocate();
@@ -107,7 +110,7 @@ void
 TensorToImageFilter<VImageDimension>::GenerateData()
 {
   OutputImagePointer outputPtr = this->GetOutput();
-  SizeType size = outputPtr->GetLargestPossibleRegion().GetSize();
+  SizeType           size = outputPtr->GetLargestPossibleRegion().GetSize();
 
   std::vector<int64_t> dims;
   for (int64_t i = 1; i < m_tensor.dim(); ++i)
@@ -118,8 +121,8 @@ TensorToImageFilter<VImageDimension>::GenerateData()
 
   torch::Tensor layers = m_tensor.permute(dims).contiguous().to(torch::kFloat32);
 
-  
-  unsigned int numberOfChannels = outputPtr->GetVectorLength();
+
+  unsigned int       numberOfChannels = outputPtr->GetVectorLength();
   const float *      layersData = layers.data_ptr<float>();
   const unsigned int rowStride = size[0] * numberOfChannels;
   const unsigned int sliceStride = size[0] * size[1] * numberOfChannels;
@@ -154,7 +157,7 @@ TensorToImageFilter<VImageDimension>::GenerateData()
       {
         for (int z = 0; z < size[0]; ++z)
         {
-          const float * pixelPtr = layersData + x * sliceStride + y * rowStride + z * numberOfChannels;
+          const float *               pixelPtr = layersData + x * sliceStride + y * rowStride + z * numberOfChannels;
           VariableLengthVector<float> variableLengthVector(numberOfChannels);
           for (unsigned int i = 0; i < numberOfChannels; ++i)
           {

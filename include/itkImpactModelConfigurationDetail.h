@@ -97,7 +97,7 @@ inline std::vector<torch::jit::IValue>
 Forward(const ImpactModelConfiguration & configuration, torch::Tensor inputPatch, const ImpactImageMetadata & metadata)
 {
   detail::ImpactModelConfigurationImpl * impl = configuration.GetImpl();
-  std::vector<torch::jit::IValue>  args;
+  std::vector<torch::jit::IValue>        args;
   args.reserve(impl->nArgs);
   args.emplace_back(inputPatch);
   if (impl->nArgs >= 2)

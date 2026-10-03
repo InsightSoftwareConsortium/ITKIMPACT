@@ -53,14 +53,13 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::ImageToFeaturesMap()
 
 template <typename TInputImage, typename TInterpolator>
 void
-ImageToFeaturesMap<TInputImage, TInterpolator>
-::PrintSelf(std::ostream & os, Indent indent) const
+ImageToFeaturesMap<TInputImage, TInterpolator>::PrintSelf(std::ostream & os, Indent indent) const
 {
   Superclass::PrintSelf(os, indent);
 }
 
 template <typename TInputImage, typename TInterpolator>
-void 
+void
 ImageToFeaturesMap<TInputImage, TInterpolator>::AddInput(const TInputImage * input)
 {
   if (!m_Interpolator)

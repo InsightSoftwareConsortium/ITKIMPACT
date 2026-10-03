@@ -276,8 +276,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GetDisplacementField() -> D
 
 template <typename TFixedImage, typename TMovingImage>
 auto
-ImpactCoarseRegistration<TFixedImage, TMovingImage>::GetDisplacementFieldTransform()
-  -> DisplacementFieldTransformType *
+ImpactCoarseRegistration<TFixedImage, TMovingImage>::GetDisplacementFieldTransform() -> DisplacementFieldTransformType *
 {
   return m_DisplacementFieldTransform.GetPointer();
 }
@@ -421,7 +420,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
         if (kept > 0 && kept < fixedLayers[l].size(1))
         {
           const torch::Tensor channels =
-            torch::randperm(fixedLayers[l].size(1), torch::TensorOptions().dtype(torch::kLong)).narrow(0, 0, kept).to(device);
+            torch::randperm(fixedLayers[l].size(1), torch::TensorOptions().dtype(torch::kLong))
+              .narrow(0, 0, kept)
+              .to(device);
           fixedLayers[l] = fixedLayers[l].index_select(1, channels).contiguous();
           movingLayers[l] = movingLayers[l].index_select(1, channels).contiguous();
         }
@@ -741,8 +742,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       torch::Tensor f2 = (dispBack / scaleT).flip(1);
 
       // Identity sampling grid at coarse resolution, channel-first {1, Dim, coarse...}, x,y,z.
-      torch::Tensor idAffine =
-        torch::eye(ImageDimension, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+      torch::Tensor idAffine = torch::eye(ImageDimension, torch::TensorOptions().dtype(torch::kFloat32).device(device));
       idAffine =
         torch::cat({ idAffine, torch::zeros({ static_cast<int64_t>(ImageDimension), 1 }, idAffine.options()) }, 1)
           .unsqueeze(0);
@@ -753,7 +753,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       {
         gridSize.push_back(c);
       }
-      torch::Tensor idGrid = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true);
+      torch::Tensor        idGrid = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true);
       std::vector<int64_t> toChannelFirst;
       toChannelFirst.push_back(0);
       toChannelFirst.push_back(idGrid.dim() - 1);
@@ -803,7 +803,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     std::vector<int64_t> componentShape(ImageDimension + 2, 1); // {1, Dim, 1, ...}: one factor per component
     componentShape[1] = static_cast<int64_t>(ImageDimension);
     const torch::Tensor cellsToVoxels = torch::tensor(cellVoxels, torch::kLong).to(disp.options()).view(componentShape);
-    torch::Tensor dispFull;
+    torch::Tensor       dispFull;
     if constexpr (ImageDimension == 3)
       dispFull = F::interpolate(
         disp * cellsToVoxels, F::InterpolateFuncOptions().size(exactSize).mode(torch::kTrilinear).align_corners(false));

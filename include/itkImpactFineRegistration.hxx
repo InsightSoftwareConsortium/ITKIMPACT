@@ -181,8 +181,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GetDisplacementField() -> Dis
 
 template <typename TFixedImage, typename TMovingImage>
 auto
-ImpactFineRegistration<TFixedImage, TMovingImage>::GetDisplacementFieldTransform()
-  -> DisplacementFieldTransformType *
+ImpactFineRegistration<TFixedImage, TMovingImage>::GetDisplacementFieldTransform() -> DisplacementFieldTransformType *
 {
   return m_DisplacementFieldTransform.GetPointer();
 }
@@ -311,25 +310,27 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     if (coarseSpatial != spatial)
     {
       if constexpr (ImageDimension == 3)
-        initField = torch::nn::functional::interpolate(
-          initField,
-          torch::nn::functional::InterpolateFuncOptions().size(coarseSpatial).mode(torch::kTrilinear).align_corners(true));
+        initField = torch::nn::functional::interpolate(initField,
+                                                       torch::nn::functional::InterpolateFuncOptions()
+                                                         .size(coarseSpatial)
+                                                         .mode(torch::kTrilinear)
+                                                         .align_corners(true));
       else
-        initField = torch::nn::functional::interpolate(
-          initField,
-          torch::nn::functional::InterpolateFuncOptions().size(coarseSpatial).mode(torch::kBilinear).align_corners(true));
+        initField = torch::nn::functional::interpolate(initField,
+                                                       torch::nn::functional::InterpolateFuncOptions()
+                                                         .size(coarseSpatial)
+                                                         .mode(torch::kBilinear)
+                                                         .align_corners(true));
     }
     theta = initField.set_requires_grad(true);
   }
   else
   {
-    theta =
-      torch::zeros(fieldShape, torch::TensorOptions().dtype(torch::kFloat32).device(device).requires_grad(true));
+    theta = torch::zeros(fieldShape, torch::TensorOptions().dtype(torch::kFloat32).device(device).requires_grad(true));
   }
 
   // ---- 3. Base identity sampling grid (normalized [-1,1], last-dim order x,y,z), align_corners=true. ----
-  torch::Tensor idAffine =
-    torch::eye(ImageDimension, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  torch::Tensor idAffine = torch::eye(ImageDimension, torch::TensorOptions().dtype(torch::kFloat32).device(device));
   idAffine = torch::cat({ idAffine, torch::zeros({ static_cast<int64_t>(ImageDimension), 1 }, idAffine.options()) }, 1)
                .unsqueeze(0); // {1, N, N+1}
   std::vector<int64_t> gridSize;
@@ -339,8 +340,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   {
     gridSize.push_back(s);
   }
-  torch::Tensor grid0 =
-    torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true); // {1, z,y,x, N}
+  torch::Tensor grid0 = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true); // {1, z,y,x, N}
 
   // Per-component normalization in (z, y, x) order: the field units (s_min) per grid_sample unit, (size-1)/2 voxels
   // (exact for align_corners=true) of s_a / s_min units each.
@@ -394,7 +394,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       return field;
     }
     if constexpr (ImageDimension == 3)
-      return F::interpolate(field, F::InterpolateFuncOptions().size(target).mode(torch::kTrilinear).align_corners(true));
+      return F::interpolate(field,
+                            F::InterpolateFuncOptions().size(target).mode(torch::kTrilinear).align_corners(true));
     else
       return F::interpolate(field, F::InterpolateFuncOptions().size(target).mode(torch::kBilinear).align_corners(true));
   };
@@ -510,15 +511,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // Feature-mode setup: extract the fixed/moving feature layers (constants, not differentiated
   // through), optionally PCA-reduce them (fit on fixed), and build one loss per kept layer.
   // Intensity mode skips this and compares raw voxels.
-  std::vector<torch::Tensor>                    fixedLayers;
-  std::vector<torch::Tensor>                    movingLayers;
-  std::vector<torch::Tensor>                    fixedLayersOnline; // "Jacobian" mode: fixed features, pooled
-  std::vector<torch::Tensor>                    pcaBasis;          // per kept layer; undefined entry = no PCA
-  std::vector<std::unique_ptr<Impact::Loss>>    losses;
-  std::vector<float>                            layerWeights;
+  std::vector<torch::Tensor>                 fixedLayers;
+  std::vector<torch::Tensor>                 movingLayers;
+  std::vector<torch::Tensor>                 fixedLayersOnline; // "Jacobian" mode: fixed features, pooled
+  std::vector<torch::Tensor>                 pcaBasis;          // per kept layer; undefined entry = no PCA
+  std::vector<std::unique_ptr<Impact::Loss>> losses;
+  std::vector<float>                         layerWeights;
   // SubsetFeatures: per kept layer, that many of its channels drawn at random at every iteration (0 = all).
   std::vector<torch::Tensor> subsets; // per layer; an undefined entry keeps every channel
-  auto drawSubsets = [&](const std::vector<torch::Tensor> & layers) {
+  auto                       drawSubsets = [&](const std::vector<torch::Tensor> & layers) {
     subsets.assign(layers.size(), torch::Tensor());
     for (size_t l = 0; l < layers.size(); ++l)
     {
@@ -731,8 +732,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     }
     for (size_t l = 0; l < layerCount; ++l)
     {
-      const std::string name =
-        m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
+      const std::string name = m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
       losses.push_back(Impact::LossFactory::Instance().Create(name));
       layerWeights.push_back(l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0f);
       if (sampled && losses.back()->IsSpatial())
@@ -951,10 +951,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   }
 
   // ---- 4. Adam loop (entirely on device; no host copies). ----
-  torch::optim::Adam optimizer({ theta },
-                               torch::optim::AdamOptions(m_LearningRate)
-                                 .betas(std::make_tuple(m_Beta1, m_Beta2))
-                                 .eps(m_Epsilon));
+  torch::optim::Adam optimizer(
+    { theta }, torch::optim::AdamOptions(m_LearningRate).betas(std::make_tuple(m_Beta1, m_Beta2)).eps(m_Epsilon));
 
   m_MetricValuesPerIteration.clear();
   m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
@@ -962,7 +960,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // Every layer's loss divided by its value at the stage's first iteration, so each starts at 1 and
   // LayersWeight weighs comparable quantities (see Impact::LossNormalization).
   Impact::LossNormalization normalization;
-  auto normalized = [&](size_t l, const torch::Tensor & value) -> torch::Tensor {
+  auto                      normalized = [&](size_t l, const torch::Tensor & value) -> torch::Tensor {
     if (!m_NormalizeLosses)
     {
       return value;
@@ -1032,7 +1030,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         const torch::Tensor smoothedControl = smoothControl(theta); // graph to theta
         torch::Tensor       smoothed = smoothedControl.detach().requires_grad_(true);
         smoothed.mutable_grad() = torch::zeros_like(smoothed);
-        int64_t             voxels = 1;
+        int64_t voxels = 1;
         for (const int64_t extent : spatial)
         {
           voxels *= extent;
@@ -1439,9 +1437,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           if (cur != tgt)
           {
             if constexpr (ImageDimension == 3)
-              mll = F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kTrilinear).align_corners(true));
+              mll =
+                F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kTrilinear).align_corners(true));
             else
-              mll = F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kBilinear).align_corners(true));
+              mll =
+                F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kBilinear).align_corners(true));
           }
           torch::Tensor counted;
           if (masked)
@@ -1575,7 +1575,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   m_WarpedMovingImage->SetDirection(m_FixedImage->GetDirection());
   m_WarpedMovingImage->Allocate();
 
-  ImageRegionIteratorWithIndex<WarpedImageType> wit(m_WarpedMovingImage, m_WarpedMovingImage->GetLargestPossibleRegion());
+  ImageRegionIteratorWithIndex<WarpedImageType> wit(m_WarpedMovingImage,
+                                                    m_WarpedMovingImage->GetLargestPossibleRegion());
   for (wit.GoToBegin(); !wit.IsAtEnd(); ++wit)
   {
     const auto idx = wit.GetIndex();

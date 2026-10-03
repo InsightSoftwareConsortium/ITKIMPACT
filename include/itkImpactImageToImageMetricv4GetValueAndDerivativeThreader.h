@@ -97,9 +97,8 @@ protected:
                DerivativeType &                localDerivativeReturn,
                const ThreadIdType              threadId) const override;
 
-  std::vector<unsigned int> GetSubsetOfFeatures(const std::vector<unsigned int> & features_index,
-                      std::mt19937 &                    randomGenerator,
-                      int n) const; 
+  std::vector<unsigned int>
+  GetSubsetOfFeatures(const std::vector<unsigned int> & features_index, std::mt19937 & randomGenerator, int n) const;
 
   /**
    * \brief Per-work-unit accumulator of loss values and gradients, one loss object per
@@ -111,13 +110,16 @@ protected:
   struct LossPerThreadStruct
   {
     std::vector<std::unique_ptr<itk::Impact::Loss>> m_losses;
-    std::vector<float>                             m_layersWeight;
-    SizeValueType                                  m_numberOfPixelsCounted;
-    int                                            m_nb_parameters;
-    std::mt19937                                   m_randomGenerator;
+    std::vector<float>                              m_layersWeight;
+    SizeValueType                                   m_numberOfPixelsCounted;
+    int                                             m_nb_parameters;
+    std::mt19937                                    m_randomGenerator;
 
     void
-    init(std::vector<std::string> distance_name, std::vector<float> layersWeight, unsigned int seed, unsigned int nb_parameters)
+    init(std::vector<std::string> distance_name,
+         std::vector<float>       layersWeight,
+         unsigned int             seed,
+         unsigned int             nb_parameters)
     {
       if (seed > 0)
       {
@@ -226,9 +228,8 @@ protected:
 
   /** The plane a patch is cut on, as a matrix whose COLUMNS are the patch axes expressed in
    * the image's own frame. */
-  using PatchPlaneType = Matrix<double,
-                                ImageToImageMetricv4Type::FixedImageDimension,
-                                ImageToImageMetricv4Type::FixedImageDimension>;
+  using PatchPlaneType =
+    Matrix<double, ImageToImageMetricv4Type::FixedImageDimension, ImageToImageMetricv4Type::FixedImageDimension>;
 
   /** Walk this work unit's share of the domain. Online mode walks it here so it can run the
    * models on a batch of points at a time; Static mode is left to the framework's own

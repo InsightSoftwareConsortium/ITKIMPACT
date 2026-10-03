@@ -25,7 +25,7 @@
 #include "itkImageToFeaturesMapInternals.h"
 #include "itkImpactTorchRegistrationHelpers.h" // Impact::PythonGilReleaseGuard
 #include "itkImpactModelConfigurationDetail.h" // ComputeImageMetadata
-#include "itkImpactBatchBudget.h"                // ConfigureBatchSize
+#include "itkImpactBatchBudget.h"              // ConfigureBatchSize
 #include <itkImageFileWriter.h>
 
 namespace itk
@@ -46,7 +46,8 @@ struct ImpactImageToImageMetricv4<TFixedImage,
 {
   /** Interpolator for feature maps (vector-valued), using scalar B-spline interpolation. */
   using BSplineInterpolateVectorImageFunction =
-    itk::InterpolateVectorImageFunction<FeaturesImageType, itk::BSplineInterpolateImageFunction<TFixedImage, float, float>>;
+    itk::InterpolateVectorImageFunction<FeaturesImageType,
+                                        itk::BSplineInterpolateImageFunction<TFixedImage, float, float>>;
 
   /** A feature map image together with its interpolator. */
   struct FeaturesMap
@@ -80,20 +81,16 @@ template <typename TFixedImage,
           typename TVirtualImage,
           typename TInternalComputationValueType,
           typename TMetricTraits>
-ImpactImageToImageMetricv4<TFixedImage,
-                                TMovingImage,
-                                TVirtualImage,
-                                TInternalComputationValueType,
-                                TMetricTraits>::ImpactImageToImageMetricv4()
+ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalComputationValueType, TMetricTraits>::
+  ImpactImageToImageMetricv4()
   : m_Internals(std::make_shared<Internals>())
 {
   // We have our own GetValueAndDerivativeThreader's that we want
   // ImageToImageMetricv4 to use.
-  using ImpactDenseGetValueAndDerivativeThreaderType =
-    ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
-      ThreadedImageRegionPartitioner<Superclass::VirtualImageDimension>,
-      Superclass,
-      Self>;
+  using ImpactDenseGetValueAndDerivativeThreaderType = ImpactImageToImageMetricv4GetValueAndDerivativeThreader<
+    ThreadedImageRegionPartitioner<Superclass::VirtualImageDimension>,
+    Superclass,
+    Self>;
   using ImpactSparseGetValueAndDerivativeThreaderType =
     ImpactImageToImageMetricv4GetValueAndDerivativeThreader<ThreadedIndexedContainerPartitioner, Superclass, Self>;
   this->m_DenseGetValueAndDerivativeThreader = ImpactDenseGetValueAndDerivativeThreaderType::New();
@@ -106,11 +103,8 @@ template <typename TFixedImage,
           typename TInternalComputationValueType,
           typename TMetricTraits>
 void
-ImpactImageToImageMetricv4<TFixedImage,
-                                TMovingImage,
-                                TVirtualImage,
-                                TInternalComputationValueType,
-                                TMetricTraits>::PrintSelf(std::ostream & os, Indent indent) const
+ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalComputationValueType, TMetricTraits>::
+  PrintSelf(std::ostream & os, Indent indent) const
 {
   Superclass::PrintSelf(os, indent);
   os << "\nNormalizeLosses: " << (this->m_NormalizeLosses ? "on" : "off");
@@ -126,14 +120,15 @@ ImpactImageToImageMetricv4<TFixedImage,
   }
 
   os << "\nSubsetFeatures: " << GetStringFromVector<unsigned int>(this->GetSubsetFeatures())
-      << "\nPCA: " << GetStringFromVector<unsigned int>(this->GetPCA())
-      << "\nLayersWeight: " << GetStringFromVector<float>(this->GetLayersWeight())
-      << "\nDistance: " << GetStringFromVector<std::string>(this->GetDistance()) << "\nMode: " << this->GetMode()
-      << "\nDevice: " << this->GetDevice() << "\nSeed: " << this->GetSeed();
+     << "\nPCA: " << GetStringFromVector<unsigned int>(this->GetPCA())
+     << "\nLayersWeight: " << GetStringFromVector<float>(this->GetLayersWeight())
+     << "\nDistance: " << GetStringFromVector<std::string>(this->GetDistance()) << "\nMode: " << this->GetMode()
+     << "\nDevice: " << this->GetDevice() << "\nSeed: " << this->GetSeed();
 
   if (this->GetMode() == "Static")
   {
-    os << "\nFeaturesMapUpdateInterval: " << this->GetFeaturesMapUpdateInterval() << "\nFeatureMapsPath: " << this->GetFeatureMapsPath();
+    os << "\nFeaturesMapUpdateInterval: " << this->GetFeaturesMapUpdateInterval()
+       << "\nFeatureMapsPath: " << this->GetFeatureMapsPath();
   }
   else
   {
@@ -159,11 +154,12 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
   using ImageToFeaturesMapType = itk::ImageToFeaturesMap<TImage, InterpolatorType>;
 
   std::vector<TFeaturesMap> featuresMaps;
-  
+
   typename InterpolatorType::Pointer interpolator = InterpolatorType::New();
   interpolator->SetSplineOrder(3);
 
-  for(unsigned int i = 0; i <  modelsConfiguration.size(); ++i){
+  for (unsigned int i = 0; i < modelsConfiguration.size(); ++i)
+  {
     typename ImageToFeaturesMapType::Pointer imageToFeaturesMap = ImageToFeaturesMapType::New();
     imageToFeaturesMap->SetModelConfiguration(modelsConfiguration[i]);
     imageToFeaturesMap->SetInterpolator(interpolator);
@@ -196,7 +192,7 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
     if (!this->GetFeatureMapsPath().empty())
     {
       typename WriterType::Pointer writer = WriterType::New();
-      std::string filename;
+      std::string                  filename;
 
       for (int it = 0; it < modelsConfiguration[i].GetVoxelSize().size(); ++it)
       {
@@ -209,7 +205,7 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
       }
       filename += "mm";
 
-      writer->SetFileName(this->GetFeatureMapsPath() + (fct ? "/Moving_" : "/Fixed_")+ filename + ".mha");
+      writer->SetFileName(this->GetFeatureMapsPath() + (fct ? "/Moving_" : "/Fixed_") + filename + ".mha");
       typename TensorToImageFilterType::Pointer tensorToImageFilter = TensorToImageFilterType::New();
       tensorToImageFilter->SetTensor(GetTensorInput(*imageToFeaturesMap, 0));
       tensorToImageFilter->SetReferenceImage(image);
@@ -259,11 +255,8 @@ template <typename TFixedImage,
           typename TInternalComputationValueType,
           typename TMetricTraits>
 void
-ImpactImageToImageMetricv4<TFixedImage,
-                                TMovingImage,
-                                TVirtualImage,
-                                TInternalComputationValueType,
-                                TMetricTraits>::UpdateMovingFeaturesMaps()
+ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalComputationValueType, TMetricTraits>::
+  UpdateMovingFeaturesMaps()
 {
   // Only Static holds a precomputed map; the online modes extract per point and have nothing
   // to refresh.
@@ -271,14 +264,11 @@ ImpactImageToImageMetricv4<TFixedImage,
   {
     return;
   }
-  this->m_Internals->m_MovingFeaturesMaps =
-    GetFeaturesMaps<typename Internals::FeaturesMap, TMovingImage>(
-      this->m_MovingImage.GetPointer(),
-      m_MovingModelsConfiguration,
-      std::function<typename TMovingImage::PointType(const typename TMovingImage::PointType &)>(
-        [this](const typename TMovingImage::PointType & point) {
-          return this->GetTransform()->TransformPoint(point);
-        }));
+  this->m_Internals->m_MovingFeaturesMaps = GetFeaturesMaps<typename Internals::FeaturesMap, TMovingImage>(
+    this->m_MovingImage.GetPointer(),
+    m_MovingModelsConfiguration,
+    std::function<typename TMovingImage::PointType(const typename TMovingImage::PointType &)>(
+      [this](const typename TMovingImage::PointType & point) { return this->GetTransform()->TransformPoint(point); }));
   // Keep the transform this map was built through. The map holds the features of M(T_k(p)), so
   // the threader reads it at the residual point x + (T(x) - T_k(x)): x itself at the moment of
   // the refresh, which makes that moment exact, and a point that moves with the parameters
@@ -294,12 +284,9 @@ template <typename TFixedImage,
           typename TInternalComputationValueType,
           typename TMetricTraits>
 void
-ImpactImageToImageMetricv4<TFixedImage,
-                                TMovingImage,
-                                TVirtualImage,
-                                TInternalComputationValueType,
-                                TMetricTraits>::GetValueAndDerivative(typename Superclass::MeasureType &    value,
-                                                                      typename Superclass::DerivativeType & derivative) const
+ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalComputationValueType, TMetricTraits>::
+  GetValueAndDerivative(typename Superclass::MeasureType &    value,
+                        typename Superclass::DerivativeType & derivative) const
 {
   // Under a Python interpreter libtorch's autograd engine refuses to run on a thread holding the
   // GIL, and the SWIG-wrapped optimizer holds it across this call; the Jacobian mode backpropagates
@@ -323,11 +310,9 @@ template <typename TFixedImage,
           typename TInternalComputationValueType,
           typename TMetricTraits>
 void
-ImpactImageToImageMetricv4<TFixedImage,
-                                TMovingImage,
-                                TVirtualImage,
-                                TInternalComputationValueType,
-                                TMetricTraits>::Initialize(){
+ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalComputationValueType, TMetricTraits>::
+  Initialize()
+{
   Superclass::Initialize();
   this->m_LossNormalization.Reset(); // each level starts at 1 again
   this->m_features_indexes.clear();
@@ -367,8 +352,8 @@ ImpactImageToImageMetricv4<TFixedImage,
   // PCA is a property of the feature extraction, not of a layer: it is set once per model.
   if (this->m_PCA.size() != m_FixedModelsConfiguration.size())
   {
-    itkExceptionMacro("PCA has " << this->m_PCA.size() << " entries but there are "
-                                 << m_FixedModelsConfiguration.size() << " models; it carries one entry per model.");
+    itkExceptionMacro("PCA has " << this->m_PCA.size() << " entries but there are " << m_FixedModelsConfiguration.size()
+                                 << " models; it carries one entry per model.");
   }
 
   if (this->GetMode() == "Static")
@@ -379,7 +364,8 @@ ImpactImageToImageMetricv4<TFixedImage,
     movingFeaturesMaps.clear();
     this->m_Internals->m_Principal_components.clear();
 
-    fixedFeaturesMaps = GetFeaturesMaps<typename Internals::FeaturesMap, TFixedImage>(this->m_FixedImage.GetPointer(), m_FixedModelsConfiguration);
+    fixedFeaturesMaps = GetFeaturesMaps<typename Internals::FeaturesMap, TFixedImage>(this->m_FixedImage.GetPointer(),
+                                                                                      m_FixedModelsConfiguration);
     // The fixed map has to exist first: it is what fits the PCA basis the moving map reuses.
     this->m_CurrentIteration = 0;
     this->UpdateMovingFeaturesMaps();
@@ -396,10 +382,9 @@ ImpactImageToImageMetricv4<TFixedImage,
       if (fixedFeaturesMaps[i].m_FeaturesMap->GetNumberOfComponentsPerPixel() !=
           movingFeaturesMaps[i].m_FeaturesMap->GetNumberOfComponentsPerPixel())
       {
-        itkExceptionMacro(
-          "Mismatch in number of components per feature map at layer "
-          << i << ": fixed = " << fixedFeaturesMaps[i].m_FeaturesMap->GetNumberOfComponentsPerPixel()
-          << ", moving = " << movingFeaturesMaps[i].m_FeaturesMap->GetNumberOfComponentsPerPixel());
+        itkExceptionMacro("Mismatch in number of components per feature map at layer "
+                          << i << ": fixed = " << fixedFeaturesMaps[i].m_FeaturesMap->GetNumberOfComponentsPerPixel()
+                          << ", moving = " << movingFeaturesMaps[i].m_FeaturesMap->GetNumberOfComponentsPerPixel());
       }
     }
 
@@ -455,8 +440,7 @@ ImpactImageToImageMetricv4<TFixedImage,
         shape.push_back(patchSize[config.GetDimension() - 1 - d]);
       }
       torch::NoGradGuard ng;
-      torch::Tensor      dummy =
-        torch::zeros(shape, torch::TensorOptions().dtype(GetModelDtype(config)).device(device));
+      torch::Tensor dummy = torch::zeros(shape, torch::TensorOptions().dtype(GetModelDtype(config)).device(device));
       // The call the inference makes, metadata included, so a metadata-aware model is probed
       // with the arguments it will actually receive.
       auto         outputs = Forward(config, dummy, metadata);
@@ -486,7 +470,8 @@ ImpactImageToImageMetricv4<TFixedImage,
       {
         itkExceptionMacro("Jacobian mode requires a strictly positive patch size in every dimension, at least one "
                           "kept layer, and a model returning at least as many outputs as LayersMask has entries "
-                          "(model " << i << ").");
+                          "(model "
+                          << i << ").");
       }
       if (fixedChannels != movingChannels)
       {
