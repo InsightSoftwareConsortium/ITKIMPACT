@@ -137,7 +137,8 @@ public:
     }
   }
   PythonGilReleaseGuard(const PythonGilReleaseGuard &) = delete;
-  PythonGilReleaseGuard & operator=(const PythonGilReleaseGuard &) = delete;
+  PythonGilReleaseGuard &
+  operator=(const PythonGilReleaseGuard &) = delete;
 
 private:
   void * m_State{ nullptr };
@@ -181,7 +182,9 @@ ImageToBatchTensor(const TImage * image)
  * stay aligned, which is how the registration filters place a feature layer of any size over the image. */
 template <unsigned int Dim>
 torch::Tensor
-ResampleToVoxelSize(const torch::Tensor & image, const std::vector<double> & spacing, const std::vector<float> & voxelSize)
+ResampleToVoxelSize(const torch::Tensor &       image,
+                    const std::vector<double> & spacing,
+                    const std::vector<float> &  voxelSize)
 {
   namespace F = torch::nn::functional;
   if (spacing.size() != Dim || voxelSize.size() != Dim)
@@ -242,8 +245,7 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
   if (!subset.empty())
   {
     std::vector<int64_t> idx(subset.begin(), subset.end());
-    subsetIndex =
-      torch::from_blob(idx.data(), { static_cast<int64_t>(idx.size()) }, torch::kLong).clone().to(device);
+    subsetIndex = torch::from_blob(idx.data(), { static_cast<int64_t>(idx.size()) }, torch::kLong).clone().to(device);
   }
 
   // Keep only the requested channels of a layer, validating the indices first.
@@ -292,7 +294,8 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
                                                sweepAxis))
       {
         layers.push_back(
-          keepSubset(Impact::NormalizeFeatureChannels(map.unsqueeze(0), config.GetFeatureNormalization(), 1)).contiguous());
+          keepSubset(Impact::NormalizeFeatureChannels(map.unsqueeze(0), config.GetFeatureNormalization(), 1))
+            .contiguous());
       }
       continue;
     }
@@ -347,15 +350,15 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
     {
       outputs = Forward(config, input);
     }
-    const std::vector<bool> &       mask = config.GetLayersMask();
+    const std::vector<bool> & mask = config.GetLayersMask();
     for (size_t i = 0; i < outputs.size(); ++i)
     {
       if (i < mask.size() && !mask[i])
       {
         continue;
       }
-      torch::Tensor layer = keepSubset(
-        Impact::NormalizeFeatureChannels(outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1));
+      torch::Tensor layer = keepSubset(Impact::NormalizeFeatureChannels(
+        outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1));
       // Keep the layer at its NATIVE resolution (see the function doc); the consumer resamples it.
       // Detach only in the no-grad path -- withGrad must preserve the graph back to `imageTensor`.
       layers.push_back(withGrad ? layer.contiguous() : layer.detach().contiguous());
@@ -595,10 +598,10 @@ SqueezedChannelLastPermutation()
  * where voxelOffset_xyz reverses the z,y,x components. This is the fixed->moving convention. */
 template <unsigned int Dim>
 void
-WriteVoxelFieldToDisplacement(const torch::Tensor &                                            voxelField,
-                              const typename Image<Vector<float, Dim>, Dim>::SpacingType &     spacing,
-                              const typename Image<Vector<float, Dim>, Dim>::DirectionType &   direction,
-                              Image<Vector<float, Dim>, Dim> *                                 output)
+WriteVoxelFieldToDisplacement(const torch::Tensor &                                          voxelField,
+                              const typename Image<Vector<float, Dim>, Dim>::SpacingType &   spacing,
+                              const typename Image<Vector<float, Dim>, Dim>::DirectionType & direction,
+                              Image<Vector<float, Dim>, Dim> *                               output)
 {
   using FieldType = Image<Vector<float, Dim>, Dim>;
   using VectorType = Vector<float, Dim>;
@@ -639,10 +642,10 @@ WriteVoxelFieldToDisplacement(const torch::Tensor &                             
  * orthonormal). Used to ingest an initial/warm-start field. */
 template <unsigned int Dim>
 torch::Tensor
-DisplacementToVoxelField(const Image<Vector<float, Dim>, Dim> *                          field,
-                         const typename Image<Vector<float, Dim>, Dim>::SpacingType &    spacing,
-                         const typename Image<Vector<float, Dim>, Dim>::DirectionType &  direction,
-                         const torch::Device &                                           device)
+DisplacementToVoxelField(const Image<Vector<float, Dim>, Dim> *                         field,
+                         const typename Image<Vector<float, Dim>, Dim>::SpacingType &   spacing,
+                         const typename Image<Vector<float, Dim>, Dim>::DirectionType & direction,
+                         const torch::Device &                                          device)
 {
   using FieldType = Image<Vector<float, Dim>, Dim>;
   const auto size = field->GetLargestPossibleRegion().GetSize();

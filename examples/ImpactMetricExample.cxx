@@ -49,11 +49,11 @@ main(int argc, char * argv[])
     std::cerr << "  device: \"cpu\" (default), \"cuda\", \"cuda:0\", ...\n";
     return EXIT_FAILURE;
   }
-  const char * const  modelPath = argv[1];
-  const char * const  fixedPath = argv[2];
-  const char * const  movingPath = argv[3];
-  const char * const  outputPath = argv[4];
-  const std::string   device = (argc > 5) ? argv[5] : "cpu";
+  const char * const modelPath = argv[1];
+  const char * const fixedPath = argv[2];
+  const char * const movingPath = argv[3];
+  const char * const outputPath = argv[4];
+  const std::string  device = (argc > 5) ? argv[5] : "cpu";
 
   constexpr unsigned int Dimension = 3;
   using PixelType = float;
@@ -84,14 +84,14 @@ main(int argc, char * argv[])
 
   // --- 2. metric: register moving onto fixed by comparing anatomical features -------
   using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType>;
-  auto                                 metric = MetricType::New();
+  auto                                       metric = MetricType::New();
   std::vector<itk::ImpactModelConfiguration> models{ config };
   metric->SetModelsConfiguration(models);
-  metric->SetDistance({ "L2" });       // per-layer loss: L1, L2, NCC, Cosine, Dice, ...
+  metric->SetDistance({ "L2" }); // per-layer loss: L1, L2, NCC, Cosine, Dice, ...
   metric->SetLayersWeight({ 1.0f });
-  metric->SetSubsetFeatures({ 4 });    // random channel subset for speed (0 = all)
+  metric->SetSubsetFeatures({ 4 }); // random channel subset for speed (0 = all)
   metric->SetPCA({ 0 });
-  metric->SetMode("Static");           // "Static" (precomputed features) or "Jacobian"
+  metric->SetMode("Static"); // "Static" (precomputed features) or "Jacobian"
   metric->SetDevice(device);
 
   using TransformType = itk::TranslationTransform<double, Dimension>;

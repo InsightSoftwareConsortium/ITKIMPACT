@@ -287,18 +287,18 @@ protected:
   GenerateData() override;
 
 private:
-  typename FixedImageType::ConstPointer        m_FixedImage{ nullptr };
-  typename MovingImageType::ConstPointer       m_MovingImage{ nullptr };
-  typename MaskImageType::ConstPointer         m_FixedMask{ nullptr };
-  typename MaskImageType::ConstPointer         m_MovingMask{ nullptr };
-  typename DisplacementFieldType::Pointer      m_InitialDisplacementField{ nullptr };
+  typename FixedImageType::ConstPointer   m_FixedImage{ nullptr };
+  typename MovingImageType::ConstPointer  m_MovingImage{ nullptr };
+  typename MaskImageType::ConstPointer    m_FixedMask{ nullptr };
+  typename MaskImageType::ConstPointer    m_MovingMask{ nullptr };
+  typename DisplacementFieldType::Pointer m_InitialDisplacementField{ nullptr };
 
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
   std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
-  std::vector<std::string>        m_Distance;
-  std::vector<float>              m_LayersWeight;
-  std::vector<unsigned int>       m_SubsetFeatures;
-  std::vector<unsigned int>       m_PCA;
+  std::vector<std::string>              m_Distance;
+  std::vector<float>                    m_LayersWeight;
+  std::vector<unsigned int>             m_SubsetFeatures;
+  std::vector<unsigned int>             m_PCA;
 
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };

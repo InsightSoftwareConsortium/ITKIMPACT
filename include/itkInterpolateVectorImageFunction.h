@@ -38,7 +38,7 @@ namespace itk
 
 
 template <typename TImage, typename TInterpolator>
-class ITK_TEMPLATE_EXPORT InterpolateVectorImageFunction 
+class ITK_TEMPLATE_EXPORT InterpolateVectorImageFunction
   : public InterpolateImageFunction<typename TInterpolator::InputImageType, typename TInterpolator::CoordRepType>
 {
 public:
@@ -46,7 +46,8 @@ public:
 
   /** Standard class type aliases. */
   using Self = InterpolateVectorImageFunction;
-  using Superclass = InterpolateImageFunction<typename TInterpolator::InputImageType, typename TInterpolator::CoordRepType>;
+  using Superclass =
+    InterpolateImageFunction<typename TInterpolator::InputImageType, typename TInterpolator::CoordRepType>;
   using Pointer = SmartPointer<Self>;
   using ConstPointer = SmartPointer<const Self>;
 
@@ -65,9 +66,9 @@ public:
 
   /** Dimension underlying input image. */
   static constexpr unsigned int ImageDimension = Superclass::ImageDimension;
-  
+
   using CovariantVectorType = itk::CovariantVector<float, ImageDimension>;
-  
+
 
   InterpolateVectorImageFunction() = default;
 
@@ -108,15 +109,17 @@ public:
   EvaluateDerivative(ImagePointType point, std::vector<unsigned int> subsetOfFeatures) const;
 
   using OutputType = typename Superclass::OutputType;
-using ContinuousIndexType = typename Superclass::ContinuousIndexType;
-using SizeType = typename Superclass::SizeType;
+  using ContinuousIndexType = typename Superclass::ContinuousIndexType;
+  using SizeType = typename Superclass::SizeType;
 
-  OutputType EvaluateAtContinuousIndex(const ContinuousIndexType &) const override
+  OutputType
+  EvaluateAtContinuousIndex(const ContinuousIndexType &) const override
   {
     itkExceptionMacro("EvaluateAtContinuousIndex is not implemented.");
   }
 
-  SizeType GetRadius() const override
+  SizeType
+  GetRadius() const override
   {
     return SizeType{};
   }

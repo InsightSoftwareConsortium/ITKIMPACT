@@ -89,13 +89,13 @@ public:
   /** Load a TorchScript model and store its configuration. The model is loaded on the
    * CPU; move it with ModelTo() (itkImpactModelConfigurationDetail.h). */
   ImpactModelConfiguration(std::string               modelPath,
-                     unsigned int              dimension,
-                     unsigned int              numberOfChannels,
-                     std::vector<unsigned int> patchSize,
-                     std::vector<float>        voxelSize,
-                     std::vector<unsigned int> overlap,
-                     std::vector<bool>         layersMask,
-                     bool                      useMixedPrecision);
+                           unsigned int              dimension,
+                           unsigned int              numberOfChannels,
+                           std::vector<unsigned int> patchSize,
+                           std::vector<float>        voxelSize,
+                           std::vector<unsigned int> overlap,
+                           std::vector<bool>         layersMask,
+                           bool                      useMixedPrecision);
 
   /** An empty configuration with no associated model. */
   ImpactModelConfiguration() = default;
@@ -258,7 +258,7 @@ private:
   std::vector<unsigned int> m_overlaps;
   std::string               m_patchCombine{ "cosinus" };
   std::string               m_featureNormalization{ "none" };
-  std::vector<bool>    m_layersMask;
+  std::vector<bool>         m_layersMask;
   // Precomputed physical patch offsets (torch-free); see GetPatchIndex().
   std::vector<std::vector<float>> m_patchIndex;
   // shared_ptr keeps the special members usable with an incomplete impl type, so this

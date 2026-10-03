@@ -34,8 +34,8 @@ itkTensorToImageFilterTest(int, char *[])
   using TensorToImageFilterType = itk::TensorToImageFilter<Dimension>;
 
   // Reference image only supplies geometry (origin/spacing/direction).
-  auto                  reference = ImageType::New();
-  ImageType::SizeType   size;
+  auto                reference = ImageType::New();
+  ImageType::SizeType size;
   size.Fill(8);
   ImageType::RegionType region;
   region.SetSize(size);

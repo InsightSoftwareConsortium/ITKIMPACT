@@ -44,8 +44,8 @@ itkImageToTensorFilterTest(int, char *[])
   using InterpolatorType = itk::BSplineInterpolateImageFunction<ImageType, double>;
   using ImageToTensorFilterType = itk::ImageToTensorFilter<ImageType, InterpolatorType>;
 
-  auto                  image = ImageType::New();
-  ImageType::SizeType   size;
+  auto                image = ImageType::New();
+  ImageType::SizeType size;
   size.Fill(8);
   ImageType::RegionType region;
   region.SetSize(size);
@@ -94,13 +94,12 @@ itkImageToTensorFilterTest(int, char *[])
       }
     }
   }
-  const torch::Tensor expected =
-    torch::from_blob(expectedBuffer.data(), { 8, 8, 8 }, torch::kFloat32).clone();
+  const torch::Tensor expected = torch::from_blob(expectedBuffer.data(), { 8, 8, 8 }, torch::kFloat32).clone();
   if (!torch::allclose(t, expected, 1e-4, 1e-4))
   {
     std::cerr << "The tensor does not reproduce the input ramp: max |difference| "
-              << (t - expected).abs().max().item<float>() << ", non-zero voxels "
-              << t.count_nonzero().item<int64_t>() << " of " << t.numel() << std::endl;
+              << (t - expected).abs().max().item<float>() << ", non-zero voxels " << t.count_nonzero().item<int64_t>()
+              << " of " << t.numel() << std::endl;
     return EXIT_FAILURE;
   }
 
@@ -138,8 +137,8 @@ itkImageToTensorFilterTest(int, char *[])
   const torch::Tensor rotatedTensor = rotatedFilter->GetTensor();
   if (rotatedTensor.sizes() != t.sizes())
   {
-    std::cerr << "Rotating the image changed the tensor shape: " << t.sizes() << " vs "
-              << rotatedTensor.sizes() << std::endl;
+    std::cerr << "Rotating the image changed the tensor shape: " << t.sizes() << " vs " << rotatedTensor.sizes()
+              << std::endl;
     return EXIT_FAILURE;
   }
   if (!torch::allclose(rotatedTensor, t, 1e-4, 1e-4))
@@ -148,8 +147,7 @@ itkImageToTensorFilterTest(int, char *[])
                  "rotated image gave a different tensor.\n"
               << "  max |difference| : " << (rotatedTensor - t).abs().max().item<float>() << '\n'
               << "  non-zero voxels  : " << rotatedTensor.count_nonzero().item<int64_t>() << " of "
-              << rotatedTensor.numel() << " (identity image: " << t.count_nonzero().item<int64_t>() << ')'
-              << std::endl;
+              << rotatedTensor.numel() << " (identity image: " << t.count_nonzero().item<int64_t>() << ')' << std::endl;
     return EXIT_FAILURE;
   }
   std::cout << "direction is honoured: the rotated image gives the same tensor" << std::endl;

@@ -26,13 +26,13 @@ namespace itk
 {
 
 ImpactModelConfiguration::ImpactModelConfiguration(std::string               modelPath,
-                                       unsigned int              dimension,
-                                       unsigned int              numberOfChannels,
-                                       std::vector<unsigned int> patchSize,
-                                       std::vector<float>        voxelSize,
-                                       std::vector<unsigned int> overlap,
-                                       std::vector<bool>         layersMask,
-                                       bool                      useMixedPrecision)
+                                                   unsigned int              dimension,
+                                                   unsigned int              numberOfChannels,
+                                                   std::vector<unsigned int> patchSize,
+                                                   std::vector<float>        voxelSize,
+                                                   std::vector<unsigned int> overlap,
+                                                   std::vector<bool>         layersMask,
+                                                   bool                      useMixedPrecision)
   : m_modelPath(modelPath)
   , m_dimension(dimension)
   , m_numberOfChannels(numberOfChannels)
@@ -52,8 +52,8 @@ ImpactModelConfiguration::ImpactModelConfiguration(std::string               mod
   // `prim::If`): such a graph can abort the profiling executor's TensorExpr fuser on some
   // LibTorch builds. Disabling the optimization globally to tolerate that slowed all
   // inference ~2x, so it is left on.
-  m_impl->model = std::make_shared<torch::jit::script::Module>(
-    torch::jit::load(m_modelPath, torch::Device(torch::kCPU)));
+  m_impl->model =
+    std::make_shared<torch::jit::script::Module>(torch::jit::load(m_modelPath, torch::Device(torch::kCPU)));
   m_impl->model->eval();
   m_impl->model->to(m_impl->dtype);
 

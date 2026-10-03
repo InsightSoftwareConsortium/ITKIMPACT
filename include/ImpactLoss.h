@@ -537,8 +537,7 @@ public:
   }
 };
 
-inline RegisterLoss<L1Cosine> L1Cosine_reg(
-  "L1Cosine");
+inline RegisterLoss<L1Cosine> L1Cosine_reg("L1Cosine");
 
 /**
  * \class Cosine
@@ -763,8 +762,7 @@ public:
     if (N <= 0)
       return 0.0;
     torch::Tensor u = this->m_sfm - (this->m_sf * this->m_sm / N);
-    torch::Tensor v =
-      Denominator(Variance(this->m_sff, this->m_sf, N), Variance(this->m_smm, this->m_sm, N));
+    torch::Tensor v = Denominator(Variance(this->m_sff, this->m_sf, N), Variance(this->m_smm, this->m_sm, N));
     return 1.0 - (u / v).mean().item<double>();
   }
 

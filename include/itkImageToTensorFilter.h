@@ -54,10 +54,10 @@ public:
   using InputImagePointer = typename InputImageType::Pointer;
   using InputImageConstPointer = typename InputImageType::ConstPointer;
 
-  using TensorType       = torch::Tensor;
+  using TensorType = torch::Tensor;
   using TensorHandleType = std::shared_ptr<TensorType>;
   using TensorDataObject = itk::SimpleDataObjectDecorator<TensorHandleType>;
-    
+
   using InterpolatorPointer = typename TInterpolator::Pointer;
 
   using InputImagePixelType = typename InputImageType::PixelType;
@@ -89,9 +89,14 @@ public:
   itkSetMacro(OutputSpacing, InputSpacingType);
   itkGetConstReferenceMacro(OutputSpacing, InputSpacingType);
   itkSetVectorMacro(OutputSpacing, const float, ImageDimension);
-  
-  void SetInterpolator(typename TInterpolator::Pointer interp) { m_Interpolator = interp; }
-  void SetTransform(std::function<InputImagePointType(const InputImagePointType &)> fct)
+
+  void
+  SetInterpolator(typename TInterpolator::Pointer interp)
+  {
+    m_Interpolator = interp;
+  }
+  void
+  SetTransform(std::function<InputImagePointType(const InputImagePointType &)> fct)
   {
     m_Transform = fct;
   }
@@ -141,15 +146,16 @@ protected:
 
   void
   PrintSelf(std::ostream & os, Indent indent) const override;
-  
+
   void
   VerifyPreconditions() const override;
 
-  void GenerateData() override;
+  void
+  GenerateData() override;
 
 private:
-  InterpolatorPointer m_Interpolator;
-  InputSpacingType   m_OutputSpacing{ MakeFilled<InputSpacingType>(1.0) };
+  InterpolatorPointer                                             m_Interpolator;
+  InputSpacingType                                                m_OutputSpacing{ MakeFilled<InputSpacingType>(1.0) };
   std::function<InputImagePointType(const InputImagePointType &)> m_Transform;
 };
 

@@ -38,8 +38,8 @@ itkInterpolateVectorImageFunctionTest(int, char *[])
   using InterpolatorType = itk::BSplineInterpolateImageFunction<itk::Image<PixelType, Dimension>, float, float>;
   using VectorInterpolatorType = itk::InterpolateVectorImageFunction<FeaturesImageType, InterpolatorType>;
 
-  auto                          image = FeaturesImageType::New();
-  FeaturesImageType::SizeType   size;
+  auto                        image = FeaturesImageType::New();
+  FeaturesImageType::SizeType size;
   size.Fill(8);
   FeaturesImageType::RegionType region;
   region.SetSize(size);
