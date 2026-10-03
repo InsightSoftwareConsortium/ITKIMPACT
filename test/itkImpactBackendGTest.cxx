@@ -4569,14 +4569,16 @@ TEST(ImpactConvexAdam, RealLungCTCoarseInitThenAdamRefines)
   coarse->SetDisplacementHalfWidth(5);
   coarse->Update();
 
-  // Fine stage: Adam refinement on the full-resolution 32-channel M258 feature layer.
+  // Fine stage: Adam refinement on the 32-channel M258 feature layer, extracted on the shrunk grid as it is
+  // (voxel size 0). A voxel size of 1 mm is honoured now: it resampled the shrunk pair, some 4 x 4 x 7.5 mm, to
+  // over a hundred times the voxels, and the test went from 4 s to 25 minutes on macOS.
   auto fine = TorchAdamFilterType::New();
   fine->SetFixedImage(fixed);
   fine->SetMovingImage(moving);
   fine->SetDevice(device);
   fine->SetInitialDisplacementField(coarse->GetDisplacementField());
   itk::ImpactModelConfiguration cfg(
-    modelPath, 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
+    modelPath, 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false);
   fine->AddModelConfiguration(cfg);
   fine->SetDistance({ "L2" });
   fine->SetLayersWeight({ 1.f });
