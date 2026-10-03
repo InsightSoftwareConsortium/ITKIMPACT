@@ -29,6 +29,7 @@
 
 #include <torch/torch.h>
 #include <cmath>
+#include <vector>
 #include <iostream>
 
 namespace itk::Impact
@@ -135,6 +136,17 @@ public:
     throw std::runtime_error("forwardValue() is not implemented for this loss");
   }
 
+  /** The per-point terms forwardValue() averages, for a per-point-mean loss (IsPerPointMean): the feature vectors
+   * run along dimension 1, as {N, C} or {1, C, spatial...}, and dimension 1 is reduced. The coarse registration stage
+   * reads its cost volume from them. */
+  virtual torch::Tensor
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const
+  {
+    (void)fixedOutput;
+    (void)movingOutput;
+    throw std::runtime_error("forwardPoints() is not implemented for this loss");
+  }
+
   /** True if forwardValue() is a MEAN of independent per-point (per-row) terms -- i.e. the point
    * axis (dim 0) is reduced only by the final mean(). Such a loss can be evaluated on disjoint
    * subsets of points and recombined by their point-count weights (used by ImpactFineRegistration's
@@ -144,6 +156,31 @@ public:
   IsPerPointMean() const
   {
     return true;
+  }
+
+  /** True for a distance that compares whole feature maps rather than feature vectors (LNCC's windows): it is
+   * evaluated by forwardSpatial() on dense maps, and has no meaning at sampled points. */
+  virtual bool
+  IsSpatial() const
+  {
+    return false;
+  }
+
+  /** The loss between two feature maps on one grid, {1, C, spatial...}, for a spatial distance; `kernel` is the
+   * side of its window in voxels along each spatial axis, odd, in the maps' axis order. `mask` ({1, 1, spatial...},
+   * bool), when given, keeps the voxels whose terms are averaged (0 when it keeps none); the windows still read every
+   * voxel. */
+  virtual torch::Tensor
+  forwardSpatial(const torch::Tensor &        fixedMap,
+                 const torch::Tensor &        movingMap,
+                 const std::vector<int64_t> & kernel,
+                 const torch::Tensor &        mask = {}) const
+  {
+    (void)fixedMap;
+    (void)movingMap;
+    (void)kernel;
+    (void)mask;
+    throw std::runtime_error("forwardSpatial() is not implemented for this loss");
   }
 
   void
@@ -183,6 +220,33 @@ public:
     return *this;
   }
 };
+
+/** Each voxel's (or point's) feature vector along `channelDim` scaled as a model configuration's
+ * FeatureNormalization says: `l2` to unit length, `standardized` to zero mean and unit (unbiased) standard deviation
+ * over its channels, `none` unchanged. Applied to every kept layer before PCA, the channel subset and the distance.
+ * A one-channel feature has no deviation to standardize by, and is refused. */
+inline torch::Tensor
+NormalizeFeatureChannels(const torch::Tensor & features, const std::string & mode, int64_t channelDim)
+{
+  if (mode.empty() || mode == "none")
+  {
+    return features;
+  }
+  if (mode == "l2")
+  {
+    return torch::nn::functional::normalize(features, torch::nn::functional::NormalizeFuncOptions().dim(channelDim));
+  }
+  if (mode == "standardized")
+  {
+    if (features.size(channelDim) == 1)
+    {
+      throw std::runtime_error("A one-channel feature cannot be standardized over its channels: use none or l2.");
+    }
+    return (features - features.mean(channelDim, /*keepdim=*/true)) /
+           features.std(channelDim, /*unbiased=*/true, /*keepdim=*/true).clamp_min(1e-6);
+  }
+  throw std::runtime_error("Unknown feature normalization '" + mode + "': none, l2 or standardized.");
+}
 
 /**
  * \class LossFactory
@@ -263,11 +327,17 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     // Sum (not mean) over channels so the similarity scales with the channel count and its
-    // balance against the diffusion regularizer matches the reference (see L2::forwardValue).
-    return (fixedOutput - movingOutput).abs().sum(1).mean();
+    // balance against the diffusion regularizer matches the reference (see L2::forwardPoints).
+    return (fixedOutput - movingOutput).abs().sum(1);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -302,12 +372,18 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     // Sum (not mean) over channels, i.e. an SSD over feature vectors, so the similarity scales
     // with the channel count exactly like ConvexAdam's `(mov-fix)^2.mean(1)*C`. A per-channel
     // mean makes the similarity ~C times smaller, over-regularizing the Adam refinement.
-    return (fixedOutput - movingOutput).pow(2).sum(1).mean();
+    return (fixedOutput - movingOutput).pow(2).sum(1);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -317,7 +393,7 @@ inline RegisterLoss<L2> MSE_reg("L2");
 /**
  * \class Dice
  * \ingroup Impact
- * \brief Soft Dice loss over feature vectors.
+ * \brief Soft Dice loss over feature vectors: 1 - soft Dice, 0 at a perfect match.
  *
  * Operates on raw (non-thresholded) activations, does not mutate its inputs, and
  * is NaN-guarded for the degenerate empty/empty case (Dice forced to 1, gradient
@@ -344,7 +420,7 @@ public:
 
     torch::Tensor dice = 2.0 * intersectionSum / unionSumSafe;
     dice.masked_fill_(isEmpty, 1.0); // empty/empty => Dice = 1
-    this->m_value -= dice.sum().item<double>();
+    this->m_value += (1.0 - dice).sum().item<double>();
   }
 
   torch::Tensor
@@ -359,7 +435,7 @@ public:
 
     torch::Tensor dice = 2.0 * intersectionSum / unionSumSafe;
     dice.masked_fill_(isEmpty, 1.0);
-    this->m_value -= dice.sum().item<double>();
+    this->m_value += (1.0 - dice).sum().item<double>();
 
     torch::Tensor grad = -2.0 * (fixedOutput * unionSumSafe.unsqueeze(-1) - intersectionSum.unsqueeze(-1)) /
                          (unionSumSafe * unionSumSafe).unsqueeze(-1);
@@ -368,7 +444,7 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     torch::Tensor intersectionSum = (fixedOutput * movingOutput).sum(1);
     torch::Tensor unionSum = (fixedOutput + movingOutput).sum(1);
@@ -376,7 +452,13 @@ public:
     torch::Tensor unionSumSafe = unionSum + isEmpty.to(unionSum.scalar_type());
     torch::Tensor dice = 2.0 * intersectionSum / unionSumSafe;
     dice = dice.masked_fill(isEmpty, 1.0); // empty/empty => Dice = 1 (non-mutating)
-    return -dice.mean();
+    return 1.0 - dice;
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -387,7 +469,7 @@ inline RegisterLoss<Dice> Dice_reg("Dice");
  * \class L1Cosine
  * \ingroup Impact
  * \brief Combined cosine similarity and exponential L1 loss (penalizes both direction
- * and magnitude).
+ * and magnitude): 1 - mean_c(cos * exp(-lambda |f_c - m_c|)), 0 at a perfect match.
  */
 class L1Cosine : public Loss
 {
@@ -410,7 +492,7 @@ public:
     torch::Tensor norm_moving = torch::norm(movingOutput, 2, 1);
     torch::Tensor cosine = dot_product / (norm_fixed * norm_moving);
     torch::Tensor expL1 = torch::exp(-this->lambda * (fixedOutput - movingOutput).abs());
-    this->m_value -= (cosine.unsqueeze(-1) * expL1).mean(1).sum().item<double>();
+    this->m_value += (1.0 - (cosine.unsqueeze(-1) * expL1).mean(1)).sum().item<double>();
   }
 
   torch::Tensor
@@ -426,26 +508,32 @@ public:
     torch::Tensor cosine = dot_product / (v);
     torch::Tensor expL1 = torch::exp(-this->lambda * (fixedOutput - movingOutput).abs());
 
-    // The value is -(1/N) sum_c cos * g_c with g = exp(-lambda |f - m|), so by the product rule
+    // The value is 1 - (1/N) sum_c cos * g_c with g = exp(-lambda |f - m|), so by the product rule
     //   dV/dm_k = -(1/N) [ (dcos/dm_k) * sum_c g_c  +  cos * dg_k/dm_k ],   dg_k/dm_k = lambda * sign(f_k - m_k) * g_k.
     // The cosine term is weighted by the SUM of g over channels, the exponential term by cos.
     torch::Tensor minusDcos = -(fixedOutput / v.unsqueeze(-1) -
                                 (dot_product.unsqueeze(-1) * movingOutput) / (v * norm_moving.pow(2)).unsqueeze(-1));
     torch::Tensor expSum = expL1.sum(1).unsqueeze(-1);
     torch::Tensor dExpL1 = this->lambda * torch::sign(diffOutput) * expL1;
-    this->m_value -= (cosine.unsqueeze(-1) * expL1).mean(1).sum().item<double>();
+    this->m_value += (1.0 - (cosine.unsqueeze(-1) * expL1).mean(1)).sum().item<double>();
     return (minusDcos * expSum - cosine.unsqueeze(-1) * dExpL1) / fixedOutput.size(1);
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     torch::Tensor dotProduct = (fixedOutput * movingOutput).sum(1);
     torch::Tensor normFixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor normMoving = torch::norm(movingOutput, 2, 1);
     torch::Tensor cosine = dotProduct / (normFixed * normMoving);
     torch::Tensor expL1 = torch::exp(-this->lambda * (fixedOutput - movingOutput).abs());
-    return -(cosine.unsqueeze(-1) * expL1).mean(1).mean();
+    return 1.0 - (cosine.unsqueeze(1) * expL1).mean(1);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
@@ -455,7 +543,7 @@ inline RegisterLoss<L1Cosine> L1Cosine_reg(
 /**
  * \class Cosine
  * \ingroup Impact
- * \brief Cosine similarity loss (negative mean cosine between vectors).
+ * \brief Cosine similarity loss: 1 - mean cosine between vectors, 0 at a perfect match.
  */
 class Cosine : public Loss
 {
@@ -471,7 +559,7 @@ public:
     torch::Tensor dot_product = (fixedOutput * movingOutput).sum(1);
     torch::Tensor norm_fixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor norm_moving = torch::norm(movingOutput, 2, 1);
-    this->m_value -= (dot_product / (norm_fixed * norm_moving)).sum().item<double>();
+    this->m_value += (1.0 - dot_product / (norm_fixed * norm_moving)).sum().item<double>();
   }
 
   torch::Tensor
@@ -482,7 +570,7 @@ public:
     torch::Tensor norm_fixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor norm_moving = torch::norm(movingOutput, 2, 1);
     torch::Tensor v = (norm_fixed * norm_moving);
-    this->m_value -= (dot_product / v).sum().item<double>();
+    this->m_value += (1.0 - dot_product / v).sum().item<double>();
     // d(-cosine)/d(movingOutput_c) = -( f_c/v - (f.m) m_c / (v |m|^2) ). The cross term
     // uses the full dot product f.m, not the per-channel f_c m_c.
     return -(fixedOutput / v.unsqueeze(-1) -
@@ -490,59 +578,28 @@ public:
   }
 
   torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  forwardPoints(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     torch::Tensor dotProduct = (fixedOutput * movingOutput).sum(1);
     torch::Tensor normFixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor normMoving = torch::norm(movingOutput, 2, 1);
-    return -(dotProduct / (normFixed * normMoving)).mean();
+    return 1.0 - dotProduct / (normFixed * normMoving);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return this->forwardPoints(fixedOutput, movingOutput).mean();
   }
 };
 
 inline RegisterLoss<Cosine> Cosine_reg("Cosine");
 
 /**
- * \class DotProduct
- * \ingroup Impact
- * \brief Negative dot product loss (simple similarity).
- */
-class DotProduct : public Loss
-{
-public:
-  DotProduct()
-    : Loss()
-  {}
-
-  void
-  updateValue(torch::Tensor & fixedOutput, torch::Tensor & movingOutput) override
-  {
-    this->initialize(fixedOutput);
-    this->m_value -= (fixedOutput * movingOutput).sum(1).sum().item<double>();
-  }
-
-  torch::Tensor
-  updateValueAndGetGradientModulator(torch::Tensor & fixedOutput, torch::Tensor & movingOutput) override
-  {
-    this->initialize(fixedOutput);
-    this->m_value -= (fixedOutput * movingOutput).sum(1).sum().item<double>();
-    return -fixedOutput;
-  }
-
-  torch::Tensor
-  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
-  {
-    return -(fixedOutput * movingOutput).sum(1).mean();
-  }
-};
-
-
-inline RegisterLoss<DotProduct> DotProduct_reg(
-  "DotProduct");
-
-/**
  * \class NCC
  * \ingroup Impact
- * \brief Normalized Cross Correlation loss over feature vectors.
+ * \brief Normalized Cross Correlation loss over feature vectors: 1 - mean NCC over the channels, 0 at a
+ * perfect match.
  *
  * Computes NCC between fixed and moving features across batches; in static mode the
  * derivative is accumulated with full Jacobian tracking.
@@ -581,6 +638,20 @@ public:
   NCC()
     : Loss()
   {}
+
+  /** Each channel's correlation from its moments -- the means of f, m, f^2, m^2 and f*m over a window (the coarse
+   * stage's cells) --, with the same floors as the global statistic below. */
+  static torch::Tensor
+  Correlation(const torch::Tensor & meanFixed,
+              const torch::Tensor & meanMoving,
+              const torch::Tensor & meanFixedSquare,
+              const torch::Tensor & meanMovingSquare,
+              const torch::Tensor & meanProduct)
+  {
+    const torch::Tensor varianceFixed = (meanFixedSquare - meanFixed * meanFixed).clamp_min(0.0);
+    const torch::Tensor varianceMoving = (meanMovingSquare - meanMoving * meanMoving).clamp_min(0.0);
+    return (meanProduct - meanFixed * meanMoving) / Denominator(varianceFixed, varianceMoving);
+  }
 
   /** NCC is a GLOBAL statistic: forwardValue() reduces over the point axis (per-channel sums over all
    * points) before combining, so it does NOT decompose over point subsets. Blocks chunked evaluation. */
@@ -682,19 +753,19 @@ public:
     torch::Tensor sm = movingOutput.sum(0);
     torch::Tensor u = sfm - sf * sm / N;
     torch::Tensor v = Denominator(Variance(sff, sf, N), Variance(smm, sm, N));
-    return -(u / v).mean();
+    return 1.0 - (u / v).mean();
   }
 
   double
   GetValue(double N) const override
   {
-    // NCC loss from accumulated statistics: mean over channels of -NCC.
+    // NCC loss from accumulated statistics: 1 - mean over channels of NCC.
     if (N <= 0)
       return 0.0;
     torch::Tensor u = this->m_sfm - (this->m_sf * this->m_sm / N);
     torch::Tensor v =
       Denominator(Variance(this->m_sff, this->m_sf, N), Variance(this->m_smm, this->m_sm, N));
-    return -(u / v).mean().item<double>();
+    return 1.0 - (u / v).mean().item<double>();
   }
 
   torch::Tensor
@@ -761,6 +832,122 @@ public:
 };
 
 inline RegisterLoss<NCC> NCC_reg("NCC");
+
+/**
+ * \class LNCC
+ * \ingroup Impact
+ * \brief Local normalized cross-correlation of two feature maps: 1 - the mean, over channels and voxels, of each
+ * channel's squared correlation in a Kernel^Dim window, as ANTs and FireANTs compute it for images. 0 at a
+ * perfect match.
+ *
+ * A window needs the map around a voxel, so it is only defined on dense maps (ImpactFineRegistration); the
+ * point-wise entry points, which a metric sampling points calls, refuse it.
+ */
+class LNCC : public Loss
+{
+private:
+  static constexpr double s_epsilon = 1e-5;
+
+  [[noreturn]] static void
+  RefusePoints()
+  {
+    throw std::runtime_error("LNCC correlates windows of a dense feature map, which a metric sampling points does "
+                             "not have: use it with ImpactFineRegistration, or choose another distance.");
+  }
+
+public:
+  LNCC()
+    : Loss()
+  {}
+
+  /** Each channel's squared correlation from its moments over a window -- the means of f, m, f^2, m^2 and f*m --,
+   * both variances floored as ANTs does. */
+  static torch::Tensor
+  SquaredCorrelation(const torch::Tensor & meanFixed,
+                     const torch::Tensor & meanMoving,
+                     const torch::Tensor & meanFixedSquare,
+                     const torch::Tensor & meanMovingSquare,
+                     const torch::Tensor & meanProduct)
+  {
+    const torch::Tensor covariance = meanProduct - meanFixed * meanMoving;
+    const torch::Tensor varianceFixed = (meanFixedSquare - meanFixed * meanFixed).clamp_min(s_epsilon);
+    const torch::Tensor varianceMoving = (meanMovingSquare - meanMoving * meanMoving).clamp_min(s_epsilon);
+    return covariance * covariance / (varianceFixed * varianceMoving);
+  }
+
+  bool
+  IsSpatial() const override
+  {
+    return true;
+  }
+
+  /** A window crosses the boundary between two chunks of the map: the loss does not decompose over them. */
+  bool
+  IsPerPointMean() const override
+  {
+    return false;
+  }
+
+  void
+  updateValue(torch::Tensor &, torch::Tensor &) override
+  {
+    RefusePoints();
+  }
+
+  torch::Tensor
+  updateValueAndGetGradientModulator(torch::Tensor &, torch::Tensor &) override
+  {
+    RefusePoints();
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor &, const torch::Tensor &) const override
+  {
+    RefusePoints();
+  }
+
+  torch::Tensor
+  forwardSpatial(const torch::Tensor &        fixedMap,
+                 const torch::Tensor &        movingMap,
+                 const std::vector<int64_t> & kernel,
+                 const torch::Tensor &        mask = {}) const override
+  {
+    namespace F = torch::nn::functional;
+    const int64_t        dimension = fixedMap.dim() - 2;
+    std::vector<int64_t> padding;
+    for (const int64_t side : kernel)
+    {
+      padding.push_back(side / 2);
+    }
+    auto mean = [&](const torch::Tensor & x) {
+      if (dimension == 3)
+        return F::avg_pool3d(x,
+                             F::AvgPool3dFuncOptions(torch::ExpandingArray<3>(at::IntArrayRef(kernel)))
+                               .stride(1)
+                               .padding(torch::ExpandingArray<3>(at::IntArrayRef(padding)))
+                               .count_include_pad(false));
+      return F::avg_pool2d(x,
+                           F::AvgPool2dFuncOptions(torch::ExpandingArray<2>(at::IntArrayRef(kernel)))
+                             .stride(1)
+                             .padding(torch::ExpandingArray<2>(at::IntArrayRef(padding)))
+                             .count_include_pad(false));
+    };
+    const torch::Tensor correlation = SquaredCorrelation(mean(fixedMap),
+                                                         mean(movingMap),
+                                                         mean(fixedMap * fixedMap),
+                                                         mean(movingMap * movingMap),
+                                                         mean(fixedMap * movingMap));
+    if (!mask.defined())
+    {
+      return 1.0 - correlation.mean();
+    }
+    // The masked mean of the local terms, as a ratio of two sums (no host sync); 0 when the mask keeps nothing.
+    const torch::Tensor count = mask.sum() * correlation.size(1);
+    return (1.0 - torch::where(mask, correlation, 0.0).sum() / count.clamp_min(1.0)) * (count > 0);
+  }
+};
+
+inline RegisterLoss<LNCC> LNCC_reg("LNCC");
 
 } // namespace itk::Impact
 

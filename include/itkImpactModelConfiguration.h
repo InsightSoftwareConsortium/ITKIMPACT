@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -104,7 +105,8 @@ public:
   {
     return m_modelPath == rhs.m_modelPath && m_dimension == rhs.m_dimension &&
            m_numberOfChannels == rhs.m_numberOfChannels && m_patchSize == rhs.m_patchSize &&
-           m_voxelSize == rhs.m_voxelSize && m_layersMask == rhs.m_layersMask;
+           m_voxelSize == rhs.m_voxelSize && m_layersMask == rhs.m_layersMask &&
+           m_featureNormalization == rhs.m_featureNormalization;
   }
 
   friend std::ostream &
@@ -114,7 +116,8 @@ public:
        << "\n\t\tNumberOfChannels : " << config.m_numberOfChannels
        << "\n\t\tPatchSize : " << GetStringFromVector<int64_t>(config.m_patchSize)
        << "\n\t\tVoxelSize : " << GetStringFromVector<float>(config.m_voxelSize)
-       << "\n\t\tLayersMask : " << GetStringFromVector<bool>(config.m_layersMask);
+       << "\n\t\tLayersMask : " << GetStringFromVector<bool>(config.m_layersMask)
+       << "\n\t\tFeatureNormalization : " << config.m_featureNormalization;
     return os;
   }
 
@@ -204,6 +207,25 @@ public:
     return m_layersMask;
   }
 
+  /** How each voxel's feature vector is scaled, per kept layer, before PCA and the distance: `none` (the
+   * default) leaves it as the model gives it, `l2` scales it to unit length, `standardized` to zero mean and unit
+   * standard deviation over its channels. */
+  const std::string &
+  GetFeatureNormalization() const
+  {
+    return m_featureNormalization;
+  }
+  void
+  SetFeatureNormalization(const std::string & featureNormalization)
+  {
+    if (featureNormalization != "none" && featureNormalization != "l2" && featureNormalization != "standardized")
+    {
+      throw std::invalid_argument("ImpactModelConfiguration: feature normalization '" + featureNormalization +
+                                  "' is none of none, l2, standardized.");
+    }
+    m_featureNormalization = featureNormalization;
+  }
+
   /** Precomputed physical patch offsets for the online (non-Static) inference: one inner
    * vector of length Dimension per patch voxel, holding (index - patchSize/2) * voxelSize
    * along each axis (x fastest). Filled by the constructor. POD only, so it stays
@@ -235,6 +257,7 @@ private:
   // them (Elastix, which passes 0 and never blends) is unaffected.
   std::vector<unsigned int> m_overlaps;
   std::string               m_patchCombine{ "cosinus" };
+  std::string               m_featureNormalization{ "none" };
   std::vector<bool>    m_layersMask;
   // Precomputed physical patch offsets (torch-free); see GetPatchIndex().
   std::vector<std::vector<float>> m_patchIndex;

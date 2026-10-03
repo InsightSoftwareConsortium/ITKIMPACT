@@ -31,6 +31,7 @@
 #include "ImpactLoss.h"
 
 #include <itkMacro.h>
+#include <itkMath.h>
 #include <itkMatrix.h>
 #include <itkPoint.h>
 
@@ -38,6 +39,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <numeric>
 #include <random>
@@ -63,6 +65,45 @@ PatchTensorShape(const ImpactModelConfiguration & configuration)
 {
   const std::vector<int64_t> & patchSize = configuration.GetPatchSize();
   return std::vector<int64_t>(patchSize.rbegin(), patchSize.rend());
+}
+
+/** The plane a model of dimension 2 cuts its patch on in a volume, at the point of index `index` (any type with
+ * operator[] over three axes), as a rotation whose first two COLUMNS are the patch axes in the image's own frame:
+ * three angles drawn uniform in [0, 2 pi) from a generator seeded from the point, composed Rz * Ry * Rx, as the
+ * elastix metric draws them.
+ *
+ * The generator is seeded from the point itself rather than from a running generator, so the plane depends on WHERE
+ * the point is and not on how many points came before it: a metric stays a function of its parameters when a
+ * finite-difference step drops a few points, whatever the partition of its domain. Mixing the model index in keeps
+ * two models at one point from being handed the identical plane. Shared by the itkv4 metric and the fine
+ * registration stage's sampled Jacobian mode. */
+template <typename TIndex>
+Matrix<double, 3, 3>
+PatchPlaneRotation(unsigned int seed, size_t modelIndex, const TIndex & index)
+{
+  std::uint_fast32_t pointSeed = static_cast<std::uint_fast32_t>(seed) + 0x9e3779b9u * (modelIndex + 1u);
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    pointSeed = pointSeed * 2654435761u + static_cast<std::uint_fast32_t>(index[d]);
+  }
+  std::mt19937                           pointGenerator(pointSeed);
+  std::uniform_real_distribution<double> angles(0.0, 2.0 * itk::Math::pi);
+  const double                           a = angles(pointGenerator);
+  const double                           b = angles(pointGenerator);
+  const double                           c = angles(pointGenerator);
+  const double                           ca = std::cos(a), sa = std::sin(a), cb = std::cos(b), sb = std::sin(b);
+  const double                           cc = std::cos(c), sc = std::sin(c);
+  Matrix<double, 3, 3>                   plane;
+  plane[0][0] = cc * cb;
+  plane[0][1] = cc * sb * sa - sc * ca;
+  plane[0][2] = cc * sb * ca + sc * sa;
+  plane[1][0] = sc * cb;
+  plane[1][1] = sc * sb * sa + cc * ca;
+  plane[1][2] = sc * sb * ca - cc * sa;
+  plane[2][0] = -sb;
+  plane[2][1] = cb * sa;
+  plane[2][2] = cb * ca;
+  return plane;
 }
 
 /** Callback evaluating a patch of image intensities around a point (value-only path). Its third
@@ -164,69 +205,45 @@ GetModelOutputsExample(std::vector<itk::ImpactModelConfiguration> & modelsConfig
   return outputsTensor;
 } // end GetModelOutputsExample
 
-inline std::vector<std::vector<float>>
+/** The offsets, in millimetres along the image's own axes, of model `modelConfiguration`'s patch voxels around the
+ * point of fixed-grid index `index` (model axis 0 running fastest). A model of the image's dimension takes its
+ * precomputed box (GetPatchIndex of the configuration). A 2D model in a volume takes the plane PatchPlaneRotation
+ * draws from `seed`, `modelIndex` and the point, as the itkv4 metric and ImpactFineRegistration's sampled Jacobian mode
+ * do, so that the three hosts cut the same patch for the same point, seed and model. */
+template <typename TIndex>
+std::vector<std::vector<float>>
 GetPatchIndex(const itk::ImpactModelConfiguration & modelConfiguration,
-              std::mt19937 &                        randomGenerator,
+              unsigned int                          seed,
+              size_t                                modelIndex,
+              const TIndex &                        index,
               unsigned int                          dimension)
 {
   if (dimension == modelConfiguration.GetPatchSize().size())
   {
     return modelConfiguration.GetPatchIndex();
   }
-  else
+  if (dimension != 3 || modelConfiguration.GetPatchSize().size() != 2)
   {
-
-    using MatrixType = itk::Matrix<float, 3, 3>;
-    using Point3D = itk::Point<float, 3>;
-    std::uniform_real_distribution<double> angleDist(0.0, 2.0 * M_PI);
-
-    double radX = angleDist(randomGenerator);
-    double radY = angleDist(randomGenerator);
-    double radZ = angleDist(randomGenerator);
-
-    MatrixType rotationX;
-    MatrixType rotationY;
-    MatrixType rotationZ;
-
-    rotationX.SetIdentity();
-    rotationY.SetIdentity();
-    rotationZ.SetIdentity();
-
-    rotationX[1][1] = cos(radX);
-    rotationX[1][2] = -sin(radX);
-    rotationX[2][1] = sin(radX);
-    rotationX[2][2] = cos(radX);
-
-    rotationY[0][0] = cos(radY);
-    rotationY[0][2] = sin(radY);
-    rotationY[2][0] = -sin(radY);
-    rotationY[2][2] = cos(radY);
-
-    rotationZ[0][0] = cos(radZ);
-    rotationZ[0][1] = -sin(radZ);
-    rotationZ[1][0] = sin(radZ);
-    rotationZ[1][1] = cos(radZ);
-
-    MatrixType                      matrix = rotationZ * rotationY * rotationX;
-    std::vector<std::vector<float>> patchIndex;
-
-    for (int y = 0; y < modelConfiguration.GetPatchSize()[1]; ++y)
-    {
-      for (int x = 0; x < modelConfiguration.GetPatchSize()[0]; ++x)
-      {
-        Point3D point({ (x - modelConfiguration.GetPatchSize()[0] / 2) * modelConfiguration.GetVoxelSize()[0],
-                        (y - modelConfiguration.GetPatchSize()[1] / 2) * modelConfiguration.GetVoxelSize()[1],
-                        0 });
-        point = matrix * point;
-        std::vector<float> vec(3);
-        vec[0] = point[0];
-        vec[1] = point[1];
-        vec[2] = point[2];
-        patchIndex.push_back(vec);
-      }
-    }
-    return patchIndex;
+    itkGenericExceptionMacro("IMPACT: a " << modelConfiguration.GetPatchSize().size() << "D patch cannot be cut in a "
+                                          << dimension << "D image; only a 2D model in a volume is swept.");
   }
+  const Matrix<double, 3, 3>      plane = PatchPlaneRotation(seed, modelIndex, index);
+  const std::vector<int64_t> &    patchSize = modelConfiguration.GetPatchSize();
+  const std::vector<float> &      voxelSize = modelConfiguration.GetVoxelSize();
+  std::vector<std::vector<float>> patchIndex;
+  patchIndex.reserve(static_cast<size_t>(patchSize[0] * patchSize[1]));
+  for (int64_t y = 0; y < patchSize[1]; ++y)
+  {
+    for (int64_t x = 0; x < patchSize[0]; ++x)
+    {
+      const double u = static_cast<double>(x - patchSize[0] / 2) * voxelSize[0];
+      const double v = static_cast<double>(y - patchSize[1] / 2) * voxelSize[1];
+      patchIndex.push_back({ static_cast<float>(plane[0][0] * u + plane[0][1] * v),
+                             static_cast<float>(plane[1][0] * u + plane[1][1] * v),
+                             static_cast<float>(plane[2][0] * u + plane[2][1] * v) });
+    }
+  }
+  return patchIndex;
 } // end GetPatchIndex
 
 template <typename ImagePointType>
@@ -287,11 +304,14 @@ GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &              
           if (mask[it])
           {
             const size_t k = layers.size();
-            layers.push_back(outputsList[it]
-                               .toTensor()
-                               .index(itk::GetCentersIndexLayers(config)[a + k])
-                               .index_select(1, subsetsOfFeatures[a + k])
-                               .to(torch::kFloat32));
+            // The point's feature vector normalized over all its channels, before the subset keeps a few.
+            layers.push_back(Impact::NormalizeFeatureChannels(outputsList[it]
+                                                                .toTensor()
+                                                                .index(itk::GetCentersIndexLayers(config)[a + k])
+                                                                .to(torch::kFloat32),
+                                                              config.GetFeatureNormalization(),
+                                                              1)
+                               .index_select(1, subsetsOfFeatures[a + k]));
           }
         }
         for (size_t k = 0; k < layers.size(); ++k)
@@ -394,11 +414,14 @@ GenerateOutputsAndJacobian(
             continue;
           }
           const size_t  k = jacobians.size();
-          torch::Tensor layer = outputsList[it]
-                                  .toTensor()
-                                  .index(itk::GetCentersIndexLayers(config)[a + k])
-                                  .index_select(1, subsetsOfFeatures[a + k])
-                                  .to(torch::kFloat32);
+          // Normalized inside the graph, so the Jacobian below carries the normalization too.
+          torch::Tensor layer = Impact::NormalizeFeatureChannels(outputsList[it]
+                                                                   .toTensor()
+                                                                   .index(itk::GetCentersIndexLayers(config)[a + k])
+                                                                   .to(torch::kFloat32),
+                                                                 config.GetFeatureNormalization(),
+                                                                 1)
+                                  .index_select(1, subsetsOfFeatures[a + k]);
           torch::Tensor fixedLayer = fixedOutputsTensor[a + k].narrow(0, begin, n);
           torch::Tensor gradientModulator = losses[a + k]->updateValueAndGetGradientModulator(fixedLayer, layer);
           jacobians.push_back(

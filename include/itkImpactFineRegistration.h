@@ -29,6 +29,7 @@
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
 #include <itkImpactModelConfiguration.h>
+#include <itkImpactLossNormalization.h>
 
 #include <string>
 #include <vector>
@@ -100,6 +101,17 @@ public:
   SetMovingImage(const MovingImageType * image);
   itkGetConstObjectMacro(MovingImage, MovingImageType);
 
+  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid; absent, the whole image
+   * counts, at no cost. As in the FireANTs engine, a voxel counts where the fixed mask and the moving mask warped by
+   * the current field both hold (>= 0.5), on the grid each distance compares: every distance's terms are averaged
+   * over those voxels only (NCC correlates them, LNCC averages its local terms there), in Static and Jacobian mode;
+   * the sampled modes draw their points in the fixed mask and keep those the warped moving mask holds. */
+  using MaskImageType = Image<unsigned char, ImageDimension>;
+  itkSetConstObjectMacro(FixedMask, MaskImageType);
+  itkGetConstObjectMacro(FixedMask, MaskImageType);
+  itkSetConstObjectMacro(MovingMask, MaskImageType);
+  itkGetConstObjectMacro(MovingMask, MaskImageType);
+
   /** Set/Get an optional initial displacement field used as a warm start (e.g. the output
    * of an affine or a ConvexAdam-style discrete stage). Must be defined on the fixed grid. */
   itkSetObjectMacro(InitialDisplacementField, DisplacementFieldType);
@@ -129,10 +141,40 @@ public:
 
   itkSetMacro(Distance, std::vector<std::string>);
   itkGetConstReferenceMacro(Distance, std::vector<std::string>);
+  /** Divide each layer's loss by its value at the stage's first iteration, so every layer starts at 1
+   * and LayersWeight weighs comparable quantities (see Impact::LossNormalization). Default on. */
+  itkSetMacro(NormalizeLosses, bool);
+  itkGetConstMacro(NormalizeLosses, bool);
+  itkBooleanMacro(NormalizeLosses);
   itkSetMacro(LayersWeight, std::vector<float>);
   itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
+  /** Per kept layer, the number of its channels the loss compares, drawn at random at every iteration from
+   * the seeded generator (0 or a missing entry = all), as the metric's SubsetFeatures. */
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
+  /** Side of the window the "LNCC" distance correlates each channel over, in voxels of the compared feature
+   * map along its finest axis in millimetres; along each other axis the window takes the odd number of
+   * voxels nearest the same length (the map's voxel side being the fixed image's times its pooling
+   * factor), so it is (nearly) a cube in millimetres. Odd; default 5. */
+  itkSetMacro(LNCCKernel, unsigned int);
+  itkGetConstMacro(LNCCKernel, unsigned int);
+  /** Share of the voxels the feature similarity reads at every iteration, drawn anew at random from the seeded
+   * generator, as the metric draws its points (1 = every voxel, the default). In (0, 1]; point-wise distances and
+   * NCC only (LNCC reads whole maps).
+   * - Static mode: that share of each feature layer's voxels; only the drawn points are warped, so an iteration
+   *   costs that share of a full one.
+   * - Jacobian mode, elastix's scheme: that share of the fixed voxels, of which the points whose every model patch
+   *   fits in the image are kept (elastix's SampleCheck). Each model runs on its patch (PatchSize, its receptive
+   *   field: strictly positive on every model axis) around every point, cut in the fixed image and in the moving
+   *   image as the field warps it -- a 2D model on a plane drawn for each point, as the metric's PatchPlane --, and
+   *   its layers' centre voxels are compared. The whole images are never run through the network. */
+  itkSetMacro(SamplingPercentage, double);
+  itkGetConstMacro(SamplingPercentage, double);
+  /** Jacobian mode with SamplingPercentage < 1: most patches one forward takes, as the metric's BatchSize, bounded
+   * further by what the device holds (itkImpactBatchBudget.h); 0 (the default) = that bound alone, every point at
+   * once on the CPU. A batch that runs out of device memory is replayed at half the size. */
+  itkSetMacro(BatchSize, unsigned int);
+  itkGetConstMacro(BatchSize, unsigned int);
   itkSetMacro(PCA, std::vector<unsigned int>);
   itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
   /** @} */
@@ -145,12 +187,16 @@ public:
   itkSetMacro(Seed, unsigned int);
   itkGetConstMacro(Seed, unsigned int);
 
-  /** \name Adam / displacement-field optimization parameters. */
+  /** \name Adam / displacement-field optimization parameters.
+   * The control grid, its step and its smoothing are counted in voxels of the fixed image's finest axis,
+   * s_min = min_a s_a, and derived per axis, so that they are (nearly) isotropic in millimetres; on an
+   * isotropic image every axis takes the numbers as they are. */
   /** @{ */
   /** Number of Adam iterations (default 80, as in ConvexAdam). */
   itkSetMacro(NumberOfIterations, unsigned int);
   itkGetConstMacro(NumberOfIterations, unsigned int);
-  /** Adam learning rate (default 1.0). */
+  /** Adam learning rate, in units of s_min: the displacement is optimized in units of the finest voxel
+   * side, so a step moves up to LearningRate * s_min mm along every axis (default 1.0). */
   itkSetMacro(LearningRate, double);
   itkGetConstMacro(LearningRate, double);
   itkSetMacro(Beta1, double);
@@ -159,16 +205,20 @@ public:
   itkGetConstMacro(Beta2, double);
   itkSetMacro(Epsilon, double);
   itkGetConstMacro(Epsilon, double);
-  /** Weight of the diffusion (squared spatial-gradient) regularizer (default 1.25). */
+  /** Weight of the diffusion regularizer: the mean squared gradient of the (smoothed) displacement in mm
+   * per mm, summed over the axes -- on an isotropic image the gradient in voxels per voxel, as ConvexAdam's
+   * (default 1.25). */
   itkSetMacro(RegularizationWeight, double);
   itkGetConstMacro(RegularizationWeight, double);
-  /** Low-resolution control-grid shrink factor: the field is optimized at
-   * image-size / GridShrinkFactor and upsampled to full resolution each iteration
-   * (ConvexAdam-style) -- faster on large volumes and adds regularity. Default 1 (full resolution). */
+  /** Low-resolution control-grid shrink factor, in voxels of the finest axis: along axis a the field is
+   * optimized on a grid shrink_a = max(1, round(GridShrinkFactor * s_min / s_a)) times coarser than the
+   * image, and upsampled to full resolution each iteration (ConvexAdam-style) -- faster on large volumes
+   * and adds regularity. Default 1 (full resolution). */
   itkSetMacro(GridShrinkFactor, unsigned int);
   itkGetConstMacro(GridShrinkFactor, unsigned int);
   /** Number of 3x3x3 average-pool smoothing passes applied to the control grid each iteration
-   * (B-spline-like control-point smoothing). Default 0. */
+   * (B-spline-like control-point smoothing), in control cells, which GridShrinkFactor makes (nearly)
+   * isotropic in millimetres. Default 0. */
   itkSetMacro(ControlGridSmoothingIterations, unsigned int);
   itkGetConstMacro(ControlGridSmoothingIterations, unsigned int);
   /** In feature mode, re-extract the moving feature maps from the currently-warped moving image
@@ -189,9 +239,12 @@ public:
    * whole warped image -- same principle, differentiating the similarity through the model.) */
   itkSetMacro(Mode, std::string);
   itkGetConstReferenceMacro(Mode, std::string);
-  /** "Jacobian" mode only: number of z-slices (leading spatial axis) extracted per autograd chunk, to
-   * bound peak memory -- the per-voxel feature loss decomposes over z, so chunk gradients accumulate
-   * into the field. 0 = whole volume in one graph. Default 32. */
+  /** "Jacobian" mode with a model of lower dimension than the image (a 2D model on a volume): number of
+   * slices extracted per autograd chunk, to bound peak memory -- the per-voxel feature loss decomposes
+   * over the slices, so chunk gradients accumulate into the field. The slices run along one image axis
+   * drawn at random (from Seed) at every iteration, the fixed features of each axis extracted once, so
+   * the network sees the anatomy in the three orientations over the iterations. 0 = whole volume in one
+   * graph. Default 32. */
   itkSetMacro(FeatureChunkSize, unsigned int);
   itkGetConstMacro(FeatureChunkSize, unsigned int);
   /** @} */
@@ -236,6 +289,8 @@ protected:
 private:
   typename FixedImageType::ConstPointer        m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer       m_MovingImage{ nullptr };
+  typename MaskImageType::ConstPointer         m_FixedMask{ nullptr };
+  typename MaskImageType::ConstPointer         m_MovingMask{ nullptr };
   typename DisplacementFieldType::Pointer      m_InitialDisplacementField{ nullptr };
 
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
@@ -257,6 +312,10 @@ private:
   unsigned int m_GridShrinkFactor{ 1 };
   unsigned int m_ControlGridSmoothingIterations{ 0 };
   int          m_FeatureMapUpdateInterval{ -1 };
+  bool         m_NormalizeLosses{ true };
+  unsigned int m_LNCCKernel{ 5 };
+  double       m_SamplingPercentage{ 1.0 };
+  unsigned int m_BatchSize{ 0 };
   std::string  m_Mode{ "Static" };
   unsigned int m_FeatureChunkSize{ 32 };
 

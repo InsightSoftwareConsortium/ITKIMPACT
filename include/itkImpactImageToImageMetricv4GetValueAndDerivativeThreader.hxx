@@ -111,7 +111,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
 
   if (this->m_ImpactAssociate->GetNumberOfValidPoints() > 0)
   {
-    this->m_ImpactAssociate->m_Value = this->m_LossThreadStruct[0].GetValue();
+    itk::Impact::LossNormalization * normalization =
+      this->m_ImpactAssociate->m_NormalizeLosses ? &this->m_ImpactAssociate->m_LossNormalization : nullptr;
+    this->m_ImpactAssociate->m_Value = this->m_LossThreadStruct[0].GetValue(normalization);
     if (this->GetComputeDerivative())
     {
       // The losses accumulate the true gradient d(value)/dp. ITKv4 optimizers *add* the
@@ -119,7 +121,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
       // the descent direction -d(value)/dp. This matches the built-in v4 metrics: e.g.
       // MeanSquares accumulates +2*(fixed-moving)*dMoving/dp, which is -d(MSE)/dp. Hence
       // we write the negated IMPACT loss gradient here.
-      const DerivativeType gradient = this->m_LossThreadStruct[0].GetDerivative();
+      const DerivativeType gradient = this->m_LossThreadStruct[0].GetDerivative(normalization);
       DerivativeType &     result = *(this->m_ImpactAssociate->m_DerivativeResult);
       for (SizeValueType parameter = 0; parameter < gradient.GetSize(); ++parameter)
       {
@@ -300,47 +302,17 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   // A model of the image's own dimension spans every axis, so each patch axis is one image
   // axis and the plane is the identity. Only a plane in a volume is rotated: that is the case
   // a lower-dimensional model actually occurs in, and the one elastix rotates.
-  if (modelDimension != 2 || fixedDimension != 3)
+  if constexpr (fixedDimension == 3)
   {
-    return plane;
+    if (modelDimension == 2)
+    {
+      // Taking the same plane at every point would only ever show the network one orientation of
+      // the anatomy, so it is drawn afresh for each sampled point and the metric integrates over
+      // orientations as the sampler walks the image. This is what the elastix metric does through
+      // Impact::GetPatchIndex. The plane is a function of the point (see Impact::PatchPlaneRotation).
+      plane = Impact::PatchPlaneRotation(this->m_PlaneSeed, modelIndex, virtualIndex);
+    }
   }
-
-  // Taking the same plane at every point would only ever show the network one orientation of
-  // the anatomy, so it is drawn afresh for each sampled point and the metric integrates over
-  // orientations as the sampler walks the image. This is what the elastix metric does through
-  // Impact::GetPatchIndex.
-  //
-  // The generator is seeded from the sampled point itself rather than from the work unit's
-  // running generator, so the plane depends on WHERE the point is and not on how many points
-  // came before it. That is what keeps the metric a function of its parameters: a transform
-  // perturbed by a finite-difference step pushes a few points out of the moving buffer, which
-  // drops them from the sequence, and a running generator would then hand every later point a
-  // different plane -- the two arms of the difference would sample different anatomy and the
-  // derivative would mean nothing. It also makes the value independent of the work-unit
-  // partition. Mixing the model index in keeps two models configured at the same point from
-  // being handed the identical plane, as elastix draws one per (point, model).
-  std::uint_fast32_t pointSeed = static_cast<std::uint_fast32_t>(this->m_PlaneSeed) + 0x9e3779b9u * (modelIndex + 1u);
-  for (unsigned int d = 0; d < fixedDimension; ++d)
-  {
-    pointSeed = pointSeed * 2654435761u + static_cast<std::uint_fast32_t>(virtualIndex[d]);
-  }
-  std::mt19937                           pointGenerator(pointSeed);
-  std::uniform_real_distribution<double> angles(0.0, 2.0 * itk::Math::pi);
-  const double                           a = angles(pointGenerator);
-  const double                           b = angles(pointGenerator);
-  const double                           c = angles(pointGenerator);
-  const double                           ca = std::cos(a), sa = std::sin(a), cb = std::cos(b), sb = std::sin(b);
-  const double                           cc = std::cos(c), sc = std::sin(c);
-  // Rz * Ry * Rx, as elastix composes them.
-  plane[0][0] = cc * cb;
-  plane[0][1] = cc * sb * sa - sc * ca;
-  plane[0][2] = cc * sb * ca + sc * sa;
-  plane[1][0] = sc * cb;
-  plane[1][1] = sc * sb * sa + cc * ca;
-  plane[1][2] = sc * sb * ca - cc * sa;
-  plane[2][0] = -sb;
-  plane[2][1] = cb * sa;
-  plane[2][2] = cb * ca;
   return plane;
 }
 

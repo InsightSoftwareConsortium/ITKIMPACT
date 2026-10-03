@@ -26,6 +26,7 @@
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
 #include <itkImpactModelConfiguration.h>
+#include <itkImpactLossNormalization.h>
 
 #include <string>
 #include <vector>
@@ -43,7 +44,7 @@ namespace itk
  *   fixed + moving -> ImpactCoarseRegistration -> initial field
  *                  -> ImpactFineRegistration (SetInitialDisplacementField) -> refined field
  *
- * Follows the ConvexAdam strategy (Siebert/Hansen/Heinrich): build a discrete SSD cost
+ * Follows the ConvexAdam strategy (Siebert/Hansen/Heinrich): build a discrete cost
  * volume over a dense displacement search window on a coarse grid, then run a coupled-convex
  * global regularization (an increasing-coupling argmin/smoothing schedule) to obtain a smooth
  * coarse field, finally upsampled to full resolution. All heavy computation uses LibTorch. The
@@ -94,6 +95,18 @@ public:
   SetMovingImage(const MovingImageType * image);
   itkGetConstObjectMacro(MovingImage, MovingImageType);
 
+  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid; absent, the whole image
+   * counts, at no cost. A cell's features are averaged over its masked voxels, and its cost at a coarse voxel for a
+   * candidate is averaged over the cell window weighed by the fixed cell's share of the fixed mask times the share of
+   * the moving mask in the moving cell the candidate shifts it to (moved like the features). A candidate that leaves
+   * the window no weight costs as much as the worst candidate with some; a coarse voxel no candidate gives any weight
+   * has no data cost and follows its neighbours through the coupling. */
+  using MaskImageType = Image<unsigned char, ImageDimension>;
+  itkSetConstObjectMacro(FixedMask, MaskImageType);
+  itkGetConstObjectMacro(FixedMask, MaskImageType);
+  itkSetConstObjectMacro(MovingMask, MaskImageType);
+  itkGetConstObjectMacro(MovingMask, MaskImageType);
+
   /** \name Optional IMPACT feature configuration. With no model the cost volume is built on
    * raw intensities; with model(s) it is built on their (concatenated) feature channels. */
   /** @{ */
@@ -114,8 +127,54 @@ public:
     m_MovingModelsConfiguration.push_back(configuration);
     this->Modified();
   }
+  /** Per kept layer, the number of its channels the cost compares, drawn at random once from the seeded
+   * generator (0 or a missing entry = all), as ImpactFineRegistration draws them at every iteration. */
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
+  /** Per kept layer, the number of principal components its channels are reduced to, fitted on the fixed
+   * features (0 or a missing entry = all), as ImpactFineRegistration::SetPCA. */
+  itkSetMacro(PCA, std::vector<unsigned int>);
+  itkGetConstReferenceMacro(PCA, std::vector<unsigned int>);
+  /** Per kept layer, the distance its cost compares with, as ImpactFineRegistration::SetDistance: L1,
+   * L2 (the default, ConvexAdam's squared differences), Cosine, L1Cosine, Dice, NCC or LNCC, a missing
+   * entry repeating the last one. The cost at a coarse voxel is the distance over the cell window around
+   * it -- the two 3^Dim box passes ConvexAdam smooths its cost with, a triangular 5^Dim window of coarse
+   * voxels: a point-wise distance is averaged over it, and NCC and LNCC both correlate each channel over
+   * it (neither the whole image nor LNCCKernel: one window per coarse voxel and candidate). Unused on
+   * intensities, which keep the squared differences. */
+  itkSetMacro(Distance, std::vector<std::string>);
+  itkGetConstReferenceMacro(Distance, std::vector<std::string>);
+  /** Weight of each kept feature layer in the cost volume, one entry per layer kept across the
+   * models, as ImpactFineRegistration::SetLayersWeight (a missing entry weighs 1). The cost sums
+   * the layers' distances, so without a weight a layer with larger features or more channels
+   * outweighs the others, and the coupling schedule, whose coefficients are absolute, regularises
+   * it too little. Non-negative; unused on intensities. */
+  itkSetMacro(LayersWeight, std::vector<float>);
+  itkGetConstReferenceMacro(LayersWeight, std::vector<float>);
+  /** Divide each layer's cost by its value at zero displacement, so every layer starts at 1 and
+   * LayersWeight weighs comparable quantities (see Impact::LossNormalization). Default on; unused
+   * while BalanceLosses is on. */
+  itkSetMacro(NormalizeLosses, bool);
+  itkGetConstMacro(NormalizeLosses, bool);
+  itkBooleanMacro(NormalizeLosses);
+  /** Balance the layers on how much each moves the argmin: layer l's spread S_l, the mean over the
+   * coarse cells of max_d C_l(x, d) - min_d C_l(x, d) over the candidate box, is measured on the first
+   * cost volume (fixed onto moving), and the layer is weighed by (sum_k S_k / L) / S_l times its
+   * LayersWeight, the sum and L running over the layers LayersWeight keeps with a spread above 0 (a
+   * layer of spread 0 moves nothing and adds nothing). Every layer then spreads alike, and their total
+   * spread is the raw one, the scale the coupling schedule's absolute coefficients are calibrated on --
+   * where NormalizeLosses divides a layer with a small cost at zero displacement into a spread that
+   * swamps the coupling. Takes the place of NormalizeLosses. Default off. */
+  itkSetMacro(BalanceLosses, bool);
+  itkGetConstMacro(BalanceLosses, bool);
+  itkBooleanMacro(BalanceLosses);
+  /** Per kept layer, the spread S_l the last run measured (see BalanceLosses), before any weight; empty
+   * while BalanceLosses is off. */
+  const std::vector<double> &
+  GetLayerSpreads() const
+  {
+    return m_LayerSpreads;
+  }
   /** @} */
 
   /** Set/Get the torch device ("cpu", "cuda", "cuda:0", ...). */
@@ -125,15 +184,22 @@ public:
   itkSetMacro(Seed, unsigned int);
   itkGetConstMacro(Seed, unsigned int);
 
-  /** \name Coarse search parameters. */
+  /** \name Coarse search parameters.
+   * Counted in voxels of the fixed image's finest axis, s_min = min_a s_a, and derived per axis, so that
+   * the cells and the capture range are (nearly) isotropic in millimetres; on an isotropic image every
+   * axis takes the numbers as they are. */
   /** @{ */
-  /** Coarse-grid downsample factor (avg-pool stride); the cost volume runs on the
-   * image-size / GridSpacing grid. Default 4. */
+  /** Cell size of the coarse grid the cost volume runs on, in voxels of the finest axis: along axis a a
+   * cell spans gs_a = max(1, round(GridSpacing * s_min / s_a)) voxels (avg-pool kernel and stride), a
+   * cell of about GridSpacing * s_min mm. The cost smoothing, the NCC/LNCC window and the displacement
+   * smoothing are counted in cells. Default 4. */
   itkSetMacro(GridSpacing, unsigned int);
   itkGetConstMacro(GridSpacing, unsigned int);
-  /** Displacement search half-width, in coarse-grid voxels: the candidate set is the dense cube
-   * [-hw, hw]^Dim, so the captured range is +/- DisplacementHalfWidth * GridSpacing full-resolution
-   * voxels. Default 3. */
+  /** Displacement search half-width, in cells of the finest axis: the capture range is R =
+   * DisplacementHalfWidth * GridSpacing * s_min mm each way, which axis a covers with hw_a = ceil(R /
+   * (gs_a * s_a)) cells, so the candidates are the box prod_a (2 hw_a + 1). The coupling penalty
+   * weighs a move of one cell along axis a by (gs_a * s_a / (GridSpacing * s_min))^2, so that a
+   * distance in millimetres costs the same along every axis. Default 3. */
   itkSetMacro(DisplacementHalfWidth, unsigned int);
   itkGetConstMacro(DisplacementHalfWidth, unsigned int);
   /** Also solve the backward (moving->fixed) coarse problem and symmetrize the two fields
@@ -168,10 +234,18 @@ protected:
 private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer m_MovingImage{ nullptr };
+  typename MaskImageType::ConstPointer   m_FixedMask{ nullptr };
+  typename MaskImageType::ConstPointer   m_MovingMask{ nullptr };
 
   std::vector<ImpactModelConfiguration> m_FixedModelsConfiguration;
   std::vector<ImpactModelConfiguration> m_MovingModelsConfiguration;
-  std::vector<unsigned int>       m_SubsetFeatures;
+  std::vector<unsigned int>             m_SubsetFeatures;
+  std::vector<unsigned int>             m_PCA;
+  std::vector<std::string>              m_Distance;
+  std::vector<float>                    m_LayersWeight;
+  bool                                  m_NormalizeLosses{ true };
+  bool                                  m_BalanceLosses{ false };
+  std::vector<double>                   m_LayerSpreads;
 
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };

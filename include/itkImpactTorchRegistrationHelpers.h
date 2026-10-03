@@ -31,15 +31,21 @@
 
 #include "itkImpactPatchTiling.h"
 #include "itkImpactModelConfigurationDetail.h"
+#include "ImpactLoss.h"
 
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkImageRegionConstIterator.h>
 #include <itkImageRegionIteratorWithIndex.h>
 #include <itkMacro.h>
+#include <itkIdentityTransform.h>
+#include <itkNearestNeighborInterpolateImageFunction.h>
+#include <itkResampleImageFilter.h>
 
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 #if defined(_WIN32)
@@ -168,20 +174,63 @@ ImageToBatchTensor(const TImage * image)
   return torch::from_blob(buffer.data(), shape, torch::kFloat32).clone().unsqueeze(0).unsqueeze(0);
 }
 
+/** `image` ({1, C, spatial...}, spatial in tensor order, on a grid of `spacing` in ITK order) resampled to a model's
+ * `voxelSize` (ITK order) before the model sees it, by linear interpolation and without smoothing: a Gaussian before
+ * the downsampling was measured (elastix Static on MR/CT) to leave the Dice unchanged and fold more. Unchanged when no
+ * voxel size is set (fewer than Dim entries, or one not positive) or when it gives the image's own size. The corners
+ * stay aligned, which is how the registration filters place a feature layer of any size over the image. */
+template <unsigned int Dim>
+torch::Tensor
+ResampleToVoxelSize(const torch::Tensor & image, const std::vector<double> & spacing, const std::vector<float> & voxelSize)
+{
+  namespace F = torch::nn::functional;
+  if (spacing.size() != Dim || voxelSize.size() != Dim)
+  {
+    return image;
+  }
+  std::vector<int64_t> size(Dim);
+  bool                 same = true;
+  for (unsigned int i = 0; i < Dim; ++i) // tensor axis 2 + i holds ITK axis Dim - 1 - i
+  {
+    const double voxel = voxelSize[Dim - 1 - i];
+    if (!(voxel > 0.0))
+    {
+      return image;
+    }
+    const int64_t extent = image.size(2 + static_cast<int64_t>(i));
+    size[i] = std::max<int64_t>(1, std::llround(static_cast<double>(extent - 1) * spacing[Dim - 1 - i] / voxel) + 1);
+    same = same && size[i] == extent;
+  }
+  if (same)
+  {
+    return image;
+  }
+  if constexpr (Dim == 3)
+    return F::interpolate(image, F::InterpolateFuncOptions().size(size).mode(torch::kTrilinear).align_corners(true));
+  else
+    return F::interpolate(image, F::InterpolateFuncOptions().size(size).mode(torch::kBilinear).align_corners(true));
+}
+
 /** Run the configured TorchScript models on a whole-volume image tensor and return the
  * selected (layersMask) feature-map layers, each {1, C, spatial...} float32 on `device`,
  * detached (the model is not differentiated through; only the warp is). Optionally selects a
  * channel subset. Layers are returned at their NATIVE model resolution -- a segmentation-style
  * backbone may emit downsampled deeper layers -- and the caller brings each to the grid it needs
  * (the fine filter resamples its sampling grid to the layer; the coarse stage pools each layer to
- * the common coarse grid), so features are never upsampled to full res here. */
+ * the common coarse grid), so features are never upsampled to full res here. Given the image's
+ * `imageSpacing` (ITK order), each model sees the image resampled to its configured voxel size
+ * (ResampleToVoxelSize); without it, or with no voxel size set, it sees the image as it is.
+ * A model of lower dimension is swept along ITK axis `sweepAxis` (-1: the last one; see
+ * HeadFeetAxis), and its layers keep that axis at the image's resolution. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
 ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
-                     const torch::Tensor &                   imageTensor, // {1,1,spatial...} on device
-                     const torch::Device &                   device,
-                     const std::vector<unsigned int> &       subset,
-                     bool                                    withGrad = false)
+                     const torch::Tensor &                         imageTensor, // {1,1,spatial...} on device
+                     const torch::Device &                         device,
+                     const std::vector<unsigned int> &             subset,
+                     bool                                          withGrad = false,
+                     const std::vector<double> &                   imageSpacing = {},
+                     int                                           sweepAxis = -1)
 {
   // withGrad=false (default): inference, features are constants (coarse stage, frozen-feature fine).
   // withGrad=true: keep the autograd graph so a caller can backpropagate a loss THROUGH the network to
@@ -224,6 +273,7 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
   for (const auto & config : configs)
   {
     ModelTo(config, device);
+    const torch::Tensor modelInput = ResampleToVoxelSize<Dim>(imageTensor, imageSpacing, config.GetVoxelSize());
 
     // A declared patch size means the model is meant to see the volume in pieces -- its trained
     // field of view, and bounded memory on a volume that does not fit whole. The tiling and its
@@ -234,19 +284,22 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
     if (!withGrad)
     {
       for (torch::Tensor & map : RunTiledModel(config,
-                                               imageTensor.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
+                                               modelInput.squeeze(0), // {1,C,spatial...} -> {C,spatial...}
                                                device,
                                                device, // stays on the device; no host round-trip
-                                               PatchCombineModeFromString(config.GetPatchCombine())))
+                                               PatchCombineModeFromString(config.GetPatchCombine()),
+                                               {},
+                                               sweepAxis))
       {
-        layers.push_back(keepSubset(map.unsqueeze(0)).contiguous());
+        layers.push_back(
+          keepSubset(Impact::NormalizeFeatureChannels(map.unsqueeze(0), config.GetFeatureNormalization(), 1)).contiguous());
       }
       continue;
     }
 
     const int64_t numberOfChannels = static_cast<int64_t>(config.GetNumberOfChannels());
 
-    torch::Tensor input = imageTensor.to(GetModelDtype(config));
+    torch::Tensor input = modelInput.to(GetModelDtype(config));
     if (numberOfChannels > 1)
     {
       std::vector<int64_t> repeats(Dim + 2, 1);
@@ -267,7 +320,9 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
     std::vector<torch::jit::IValue> outputs;
     if (modelDim < Dim)
     {
-      const int64_t                           sliceAxis = 2; // first spatial axis in {1,C,z,y,x}
+      // Tensor dimension of the sweep axis in {1,C,z,y,x}: 2 for the last ITK axis.
+      const int64_t sliceAxis =
+        2 + static_cast<int64_t>(Dim) - 1 - (sweepAxis < 0 ? static_cast<int64_t>(Dim) - 1 : sweepAxis);
       const int64_t                           nSlices = input.size(sliceAxis);
       std::vector<std::vector<torch::Tensor>> perLayer; // [layer][slice], native model resolution
       for (int64_t s = 0; s < nSlices; ++s)
@@ -299,7 +354,8 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
       {
         continue;
       }
-      torch::Tensor layer = keepSubset(outputs[i].toTensor().to(torch::kFloat32));
+      torch::Tensor layer = keepSubset(
+        Impact::NormalizeFeatureChannels(outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1));
       // Keep the layer at its NATIVE resolution (see the function doc); the consumer resamples it.
       // Detach only in the no-grad path -- withGrad must preserve the graph back to `imageTensor`.
       layers.push_back(withGrad ? layer.contiguous() : layer.detach().contiguous());
@@ -308,6 +364,216 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
   return layers;
 }
 
+/** Per kept layer of `configs`, in their flat order, the dimension PcaReduce reads a {C, spatial...}
+ * layer's slices along: `Dim - sweepAxis` for a model swept along ITK axis `sweepAxis`, 0 for a
+ * model of the image's dimension. */
+template <unsigned int Dim>
+std::vector<int64_t>
+PcaSweepDimensions(const std::vector<ImpactModelConfiguration> & configs, unsigned int sweepAxis)
+{
+  std::vector<int64_t> dimensions;
+  for (const auto & config : configs)
+  {
+    dimensions.insert(dimensions.end(),
+                      NumberOfKeptLayers(config),
+                      config.GetDimension() < Dim ? static_cast<int64_t>(Dim - sweepAxis) : 0);
+  }
+  return dimensions;
+}
+
+/** \name Voxel counts read in units of the finest voxel side
+ * The registration stages count their cells, windows and steps in voxels of the fixed image's finest axis, s_min, and
+ * derive each axis's own count from it, so that they are (nearly) isotropic in millimetres. On an isotropic image the
+ * derived counts are the given ones on every axis. Every vector here runs in tensor order (z, y, x). */
+/** @{ */
+/** The voxel sides of `spacing` (ITK order, x first) in tensor order (z, y, x). */
+template <unsigned int Dim, typename TSpacing>
+std::vector<double>
+TensorVoxelSides(const TSpacing & spacing)
+{
+  std::vector<double> sides(Dim);
+  for (unsigned int a = 0; a < Dim; ++a)
+  {
+    sides[a] = spacing[Dim - 1 - a];
+  }
+  return sides;
+}
+
+/** Per axis, `count` voxels of the finest axis in voxels of axis a, max(1, round(count * s_min / s_a)). */
+inline std::vector<int64_t>
+IsotropicVoxelCounts(const std::vector<double> & sides, double count)
+{
+  const double         finest = *std::min_element(sides.begin(), sides.end());
+  std::vector<int64_t> counts(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    counts[a] = std::max<int64_t>(1, std::llround(count * finest / sides[a]));
+  }
+  return counts;
+}
+
+/** Per axis, the number of cells of `cells[a]` voxels a search of `halfWidth` cells of `cellSize` voxels of the finest
+ * axis reaches each way: ceil(R / (cells[a] * s_a)), R = halfWidth * cellSize * s_min mm. */
+inline std::vector<int64_t>
+CaptureHalfWidths(const std::vector<double> &  sides,
+                  const std::vector<int64_t> & cells,
+                  int64_t                      cellSize,
+                  int64_t                      halfWidth)
+{
+  const double         finest = *std::min_element(sides.begin(), sides.end());
+  std::vector<int64_t> halfWidths(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    // cell_ref / cell_a, exactly 1 on an isotropic image; the tolerance keeps 1 from rounding up.
+    const double ratio = (static_cast<double>(cellSize) * finest) / (static_cast<double>(cells[a]) * sides[a]);
+    halfWidths[a] = static_cast<int64_t>(std::ceil(static_cast<double>(halfWidth) * ratio - 1e-9));
+  }
+  return halfWidths;
+}
+
+/** Per axis, a window of `kernel` voxels along the finest axis in millimetres of a map of shape `mapShape` ({1, C,
+ * spatial...}) over an image of `spatial` voxels of `sides` mm: along each axis the odd number of voxels nearest the
+ * same length, the map's voxel side being the image's times its rounded pooling factor. `kernel` on every axis of an
+ * isotropic map. */
+inline std::vector<int64_t>
+IsotropicWindow(const std::vector<double> &  sides,
+                const std::vector<int64_t> & spatial,
+                c10::IntArrayRef             mapShape,
+                int64_t                      kernel)
+{
+  std::vector<double> side(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    const int64_t pooling =
+      std::max<int64_t>(1, std::llround(static_cast<double>(spatial[a]) / static_cast<double>(mapShape[2 + a])));
+    side[a] = sides[a] * static_cast<double>(pooling);
+  }
+  const double         smallest = *std::min_element(side.begin(), side.end());
+  std::vector<int64_t> window(sides.size());
+  for (size_t a = 0; a < sides.size(); ++a)
+  {
+    window[a] = 2 * static_cast<int64_t>(std::floor(static_cast<double>(kernel) * (smallest / side[a]) / 2.0)) + 1;
+  }
+  return window;
+}
+/** @} */
+
+/** \name Masks
+ * A voxel counts where the fixed mask and the moving mask warped by the current field both hold (>= 0.5), as the
+ * FireANTs engine counts it. Masks travel as bool tensors {1, 1, spatial...}; the shares of a mask a coarser grid
+ * pools are floats. */
+/** @{ */
+/** A mask image as a bool tensor {1, 1, spatial...} (tensor axis order) on `device`: in where the image is not 0. */
+template <typename TMask>
+torch::Tensor
+MaskToTensor(const TMask * mask, const torch::Device & device)
+{
+  constexpr unsigned int Dim = TMask::ImageDimension;
+  const auto             size = mask->GetLargestPossibleRegion().GetSize();
+  std::vector<int64_t>   shape(Dim);
+  int64_t                voxels = 1;
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    shape[d] = static_cast<int64_t>(size[Dim - 1 - d]);
+    voxels *= shape[d];
+  }
+  std::vector<uint8_t>            buffer(static_cast<size_t>(voxels));
+  ImageRegionConstIterator<TMask> it(mask, mask->GetLargestPossibleRegion());
+  size_t                          i = 0;
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it) // raster order, ITK x fastest
+  {
+    buffer[i++] = it.Get() != 0;
+  }
+  // to() copies, so the tensor owns its memory once `buffer` is gone.
+  return torch::from_blob(buffer.data(), shape, torch::kUInt8).to(device, torch::kBool).unsqueeze(0).unsqueeze(0);
+}
+
+/** `mask` as MaskToTensor gives it on `reference`'s grid, resampled there by nearest neighbour through the identity
+ * when its own grid differs; undefined for no mask. */
+template <typename TMask, typename TReference>
+torch::Tensor
+MaskOnGrid(const TMask * mask, const TReference * reference, const torch::Device & device)
+{
+  if (mask == nullptr)
+  {
+    return {};
+  }
+  if (mask->GetLargestPossibleRegion().GetSize() == reference->GetLargestPossibleRegion().GetSize() &&
+      mask->GetSpacing() == reference->GetSpacing() && mask->GetOrigin() == reference->GetOrigin() &&
+      mask->GetDirection() == reference->GetDirection())
+  {
+    return MaskToTensor(mask, device);
+  }
+  auto resample = ResampleImageFilter<TMask, TMask, double>::New();
+  resample->SetInput(mask);
+  resample->SetTransform(IdentityTransform<double, TMask::ImageDimension>::New());
+  resample->SetInterpolator(NearestNeighborInterpolateImageFunction<TMask, double>::New());
+  resample->SetUseReferenceImage(true);
+  resample->SetReferenceImage(reference);
+  resample->Update();
+  return MaskToTensor(resample->GetOutput(), device);
+}
+
+/** The share of `mask` ({1, 1, spatial...}, bool) in each voxel of a grid of `size` voxels over the same extent
+ * (adaptive average pooling), as floats; the mask itself, as floats, on its own grid. */
+template <unsigned int Dim>
+torch::Tensor
+MaskShare(const torch::Tensor & mask, const std::vector<int64_t> & size)
+{
+  namespace F = torch::nn::functional;
+  const torch::Tensor share = mask.to(torch::kFloat32);
+  if (std::equal(size.begin(), size.end(), share.sizes().begin() + 2))
+  {
+    return share;
+  }
+  if constexpr (Dim == 3)
+    return F::adaptive_avg_pool3d(share, F::AdaptiveAvgPool3dFuncOptions({ size[0], size[1], size[2] }));
+  else
+    return F::adaptive_avg_pool2d(share, F::AdaptiveAvgPool2dFuncOptions({ size[0], size[1] }));
+}
+
+/** `loss` between two feature maps on one grid ({1, C, spatial...}) over the voxels `mask` ({1, 1, spatial...}, bool)
+ * keeps: a point-wise distance's terms averaged over them (a ratio of two sums), NCC's correlation over them, LNCC's
+ * local terms averaged over them. 0 when the mask keeps none. Without a mask, the loss over every voxel. */
+template <unsigned int Dim>
+torch::Tensor
+MapLoss(const Loss &                 loss,
+        const torch::Tensor &        fixedMap,
+        const torch::Tensor &        movingMap,
+        const torch::Tensor &        mask,
+        const std::vector<int64_t> & kernel)
+{
+  if (loss.IsSpatial())
+  {
+    return loss.forwardSpatial(fixedMap, movingMap, kernel, mask);
+  }
+  const int64_t channels = fixedMap.size(1);
+  if (!mask.defined())
+  {
+    std::vector<int64_t> toChannelLast{ 0 };
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      toChannelLast.push_back(2 + static_cast<int64_t>(d));
+    }
+    toChannelLast.push_back(1);
+    return loss.forwardValue(fixedMap.permute(toChannelLast).reshape({ -1, channels }),
+                             movingMap.permute(toChannelLast).reshape({ -1, channels }));
+  }
+  if (loss.IsPerPointMean())
+  {
+    const torch::Tensor keep = mask.squeeze(1);
+    return torch::where(keep, loss.forwardPoints(fixedMap, movingMap), 0.0).sum() / keep.sum().clamp_min(1);
+  }
+  // A statistic over the points (NCC): the rows of the kept voxels.
+  const torch::Tensor rows = mask.flatten().nonzero().flatten();
+  if (rows.numel() == 0)
+  {
+    return (movingMap * 0.0).sum();
+  }
+  return loss.forwardValue(fixedMap.reshape({ channels, -1 }).index_select(1, rows).t(),
+                           movingMap.reshape({ channels, -1 }).index_select(1, rows).t());
+}
+/** @} */
 
 /** Channel-first {1, Dim, z,y,x} -> channel-last {z,y,x, Dim} permutation (drops batch). */
 template <unsigned int Dim>

@@ -710,7 +710,8 @@ private:
  *
  * `input` is [1, spatial...]; the number of spatial axes is the IMAGE dimension, which may exceed
  * the model's. A model that spans fewer axes is swept over the ones it does not: a 2D network on
- * a volume is run slice by slice along the leading tensor axes, which are the last ITK ones.
+ * a volume is run slice by slice along the leading tensor axes, which are the last ITK ones
+ * (RunTiledModel brings another sweep axis to the front first).
  *
  * Each patch is repeated to the model's channel count, moved to `device` and run; every kept
  * layer is blended back on `accumulateOn`, at its own resolution -- a /2 encoder yields a
@@ -965,17 +966,95 @@ ShrinkWholeImagePatch(const std::vector<int64_t> & configured, std::vector<int64
   return true;
 }
 
+/** The image axis a model of one dimension less than the image is swept along: the one most aligned
+ * with the head-feet axis, argmax_j |direction[2][j]| (the S component of image axis j in ITK's LPS
+ * frame), a tie going to the larger j. An axial image gives its last axis. A 2D image has no S row
+ * and keeps its last axis. */
+template <typename TDirection>
+unsigned int
+HeadFeetAxis(const TDirection & direction, unsigned int dimension)
+{
+  if (dimension < 3)
+  {
+    return dimension - 1;
+  }
+  unsigned int axis = 0;
+  for (unsigned int j = 1; j < dimension; ++j)
+  {
+    if (std::abs(direction[2][j]) >= std::abs(direction[2][axis]))
+    {
+      axis = j;
+    }
+  }
+  return axis;
+}
+
+/** The permutation of a {C, spatial...} tensor that brings spatial index `leading` (tensor
+ * dimension 1 + leading) to the front, the other axes kept in order. */
+inline std::vector<int64_t>
+LeadingAxisOrder(int64_t spatialDimension, int64_t leading)
+{
+  std::vector<int64_t> order{ 0, 1 + leading };
+  for (int64_t s = 0; s < spatialDimension; ++s)
+  {
+    if (s != leading)
+    {
+      order.push_back(1 + s);
+    }
+  }
+  return order;
+}
+
 /** RunTiledModelOnce, with the whole-extent axes cut down until the model fits on the device:
  * a patch size of 0 asks for the whole image, and a whole image that runs out of memory is
- * retried with its largest axis halved (overlap a quarter of the patch), as many times as needed. */
+ * retried with its largest axis halved (overlap a quarter of the patch), as many times as needed.
+ *
+ * `sweepAxis` is the ITK axis a model of one dimension less than the image is swept along (see
+ * HeadFeetAxis); -1 keeps the last one. The model spans the other axes in their order, its patch
+ * axis 0 being the first of them. The layers returned, and the shapes `makeDestination` is asked
+ * for, keep the image's own axis order. */
 inline std::vector<torch::Tensor>
 RunTiledModel(const ImpactModelConfiguration &                                                config,
               const torch::Tensor &                                                           input,
               const torch::Device &                                                           device,
               const torch::Device &                                                           accumulateOn,
               PatchCombineMode                                                                combine,
-              const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination = {})
+              const std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> & makeDestination = {},
+              int                                                                             sweepAxis = -1)
 {
+  const auto imageDimension = static_cast<int64_t>(input.dim()) - 1;
+  if (sweepAxis >= 0 && sweepAxis < imageDimension - 1 && config.GetDimension() + 1 == imageDimension)
+  {
+    // Bring the sweep axis to the front, run, and turn every layer (and every destination the
+    // caller owns, as a view) back.
+    const std::vector<int64_t> order = LeadingAxisOrder(imageDimension, imageDimension - 1 - sweepAxis);
+    std::vector<int64_t>       inverse(order.size());
+    for (std::size_t k = 0; k < order.size(); ++k)
+    {
+      inverse[order[k]] = static_cast<int64_t>(k);
+    }
+    std::function<torch::Tensor(std::size_t, const std::vector<int64_t> &)> permuted;
+    if (makeDestination)
+    {
+      permuted = [&](std::size_t layer, const std::vector<int64_t> & shape) {
+        std::vector<int64_t> own(shape.size());
+        for (std::size_t k = 0; k < order.size(); ++k)
+        {
+          own[order[k]] = shape[k];
+        }
+        const torch::Tensor destination = makeDestination(layer, own);
+        return destination.defined() ? destination.permute(order) : destination;
+      };
+    }
+    std::vector<torch::Tensor> layers =
+      RunTiledModel(config, input.permute(order), device, accumulateOn, combine, permuted);
+    for (torch::Tensor & layer : layers)
+    {
+      layer = layer.permute(inverse);
+    }
+    return layers;
+  }
+
   const std::vector<int64_t> & configured = config.GetPatchSize();
   const unsigned int           dimension = config.GetDimension();
   const auto                   sweptAxes = static_cast<unsigned int>(input.dim()) - 1 - dimension;
@@ -1021,14 +1100,16 @@ PcaFit(const torch::Tensor & input, int64_t newC)
 }
 
 /** Project a feature tensor {C, spatial...} onto a PCA basis {C, K} -> {K, spatial...}.
- * The input is centred by its own channel mean, as PcaFit centred the data it fitted on. */
+ * The input is centred by `mean` ({C, 1}) when given, by its own channel mean otherwise, as PcaFit
+ * centred the data it fitted on. */
 inline torch::Tensor
-PcaTransform(const torch::Tensor & input, const torch::Tensor & basis)
+PcaTransform(const torch::Tensor & input, const torch::Tensor & basis, const torch::Tensor & mean = {})
 {
   const int64_t C = input.size(0);
   const int64_t N = input.numel() / C;
   torch::Tensor reshaped = input.reshape({ C, N });
-  torch::Tensor projected = torch::matmul(basis.t(), reshaped - reshaped.mean(1, /*keepdim=*/true)); // {K, N}
+  torch::Tensor projected =
+    torch::matmul(basis.t(), reshaped - (mean.defined() ? mean : reshaped.mean(1, /*keepdim=*/true))); // {K, N}
   std::vector<int64_t> shape;
   shape.push_back(basis.size(1));
   for (int64_t d = 1; d < input.dim(); ++d)
@@ -1036,6 +1117,44 @@ PcaTransform(const torch::Tensor & input, const torch::Tensor & basis)
     shape.push_back(input.size(d));
   }
   return projected.reshape(shape);
+}
+
+/** What a swept (2D) model's PCA reads of its feature tensor {C, spatial...}: at most 32 slices
+ * along tensor dimension `sweepDimension`, at round(linspace(0, n - 1, min(n, 32))), spread
+ * evenly over the swept axis. Its basis is fitted on the fixed image's sample (PcaFit), each image
+ * is centred by its own sample's mean (PcaSampleMean), and every slice is projected -- FireANTs'
+ * rule, so that the three engines reduce a 2D model's features alike. */
+inline torch::Tensor
+PcaSlices(const torch::Tensor & features, int64_t sweepDimension)
+{
+  const int64_t       depth = features.size(sweepDimension);
+  const torch::Tensor index = torch::linspace(0, static_cast<double>(depth - 1), std::min<int64_t>(depth, 32))
+                                .round()
+                                .to(torch::kLong)
+                                .to(features.device());
+  return features.index_select(sweepDimension, index);
+}
+
+/** The channel mean {C, 1} of a tensor {C, ...}, what an image is centred by before its projection. */
+inline torch::Tensor
+PcaSampleMean(const torch::Tensor & sample)
+{
+  return sample.reshape({ sample.size(0), -1 }).mean(1, /*keepdim=*/true);
+}
+
+/** Reduce a feature tensor {C, spatial...} to `components` principal components. A model of the
+ * image's dimension (`sweepDimension` 0) has its map fitted and centred whole; a swept model's is
+ * read through PcaSlices along tensor dimension `sweepDimension`. `basis` is fitted first when
+ * undefined -- on the fixed image, whose basis the moving image then reuses. */
+inline torch::Tensor
+PcaReduce(const torch::Tensor & features, torch::Tensor & basis, int64_t components, int64_t sweepDimension)
+{
+  const torch::Tensor sample = sweepDimension > 0 ? PcaSlices(features, sweepDimension) : features;
+  if (!basis.defined())
+  {
+    basis = PcaFit(sample, components);
+  }
+  return PcaTransform(features, basis, sweepDimension > 0 ? PcaSampleMean(sample) : torch::Tensor());
 }
 
 

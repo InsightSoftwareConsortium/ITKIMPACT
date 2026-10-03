@@ -21,6 +21,7 @@
 
 #include <itkImageToImageMetricv4GetValueAndDerivativeThreader.h>
 #include "ImpactLoss.h"
+#include "itkImpactLossNormalization.h"
 #include <algorithm>
 #include <random>
 
@@ -149,20 +150,24 @@ protected:
       }
     }
 
+    /** The weighted sum of the layers' losses; with a normalization, each layer is divided by the
+     * value it had at the first evaluation of the level, which this call latches. */
     double
-    GetValue()
+    GetValue(itk::Impact::LossNormalization * normalization)
     {
       MeasureType value = MeasureType{};
       for (int l = 0; l < this->m_layersWeight.size(); ++l)
       {
-        value +=
-          this->m_layersWeight[l] * this->m_losses[l]->GetValue(static_cast<double>(this->m_numberOfPixelsCounted));
+        const double layerValue = this->m_losses[l]->GetValue(static_cast<double>(this->m_numberOfPixelsCounted));
+        const double factor = normalization ? normalization->Latch(l, layerValue) : 1.0;
+        value += this->m_layersWeight[l] * factor * layerValue;
       }
       return value;
     }
 
+    /** The derivative of GetValue(), with the factors GetValue() latched. */
     DerivativeType
-    GetDerivative()
+    GetDerivative(const itk::Impact::LossNormalization * normalization)
     {
       DerivativeType derivative = DerivativeType(this->m_nb_parameters);
       derivative.Fill(DerivativeValueType{});
@@ -173,7 +178,8 @@ protected:
         // parameters, which a B-spline counts in the tens of thousands. The cast to float is
         // the one item<float>() applied anyway, so the values are unchanged (the loss allocates
         // its derivative in the model's dtype, half included).
-        const torch::Tensor d = (this->m_layersWeight[l] *
+        const double        factor = normalization ? normalization->Factor(l) : 1.0;
+        const torch::Tensor d = (this->m_layersWeight[l] * factor *
                                  this->m_losses[l]->GetDerivative(static_cast<double>(this->m_numberOfPixelsCounted)))
                                   .to(torch::kFloat32)
                                   .contiguous();

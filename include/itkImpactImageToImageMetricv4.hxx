@@ -113,6 +113,7 @@ ImpactImageToImageMetricv4<TFixedImage,
                                 TMetricTraits>::PrintSelf(std::ostream & os, Indent indent) const
 {
   Superclass::PrintSelf(os, indent);
+  os << "\nNormalizeLosses: " << (this->m_NormalizeLosses ? "on" : "off");
   os << "\nFixed : ";
   for (int i = 0; i < this->GetFixedModelsConfiguration().size(); ++i)
   {
@@ -328,6 +329,7 @@ ImpactImageToImageMetricv4<TFixedImage,
                                 TInternalComputationValueType,
                                 TMetricTraits>::Initialize(){
   Superclass::Initialize();
+  this->m_LossNormalization.Reset(); // each level starts at 1 again
   this->m_features_indexes.clear();
   this->m_Internals->m_RefreshTransform = nullptr; // the maps built below are read at T(x)
 
@@ -351,6 +353,17 @@ ImpactImageToImageMetricv4<TFixedImage,
   checkPerLayer("Distance", this->m_Distance.size());
   checkPerLayer("LayersWeight", this->m_LayersWeight.size());
   checkPerLayer("SubsetFeatures", this->m_SubsetFeatures.size());
+  for (const std::string & name : this->m_Distance)
+  {
+    // A spatial distance needs the map around each point, which a metric sampling points does not have: refused
+    // here rather than at the first evaluation.
+    if (Impact::LossFactory::Instance().Create(name)->IsSpatial())
+    {
+      itkExceptionMacro("Distance '" << name
+                                     << "' correlates windows of a dense feature map, which this metric, sampling "
+                                        "points, does not have; choose L1, L2, Cosine, L1Cosine, Dice or NCC.");
+    }
+  }
   // PCA is a property of the feature extraction, not of a layer: it is set once per model.
   if (this->m_PCA.size() != m_FixedModelsConfiguration.size())
   {
