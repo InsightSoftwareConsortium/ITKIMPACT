@@ -24,7 +24,9 @@
 #include <cstddef>
 #include <vector>
 
-namespace itk::Impact
+namespace itk
+{
+namespace Impact
 {
 
 /** \class LossNormalization
@@ -84,6 +86,7 @@ private:
   std::vector<double> m_Factor;
 };
 
-} // namespace itk::Impact
+} // namespace Impact
+} // namespace itk
 
 #endif // itkImpactLossNormalization_h
