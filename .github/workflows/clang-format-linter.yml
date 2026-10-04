@@ -9,6 +9,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - uses: InsightSoftwareConsortium/ITKClangFormatLinterAction@main
+    # Both pinned: the action's main and ITK's main change what the check requires without a change here (the
+    # action started to require a .gitattributes on 2026-09-29, and ITK's main sets the clang-format version).
+    - uses: InsightSoftwareConsortium/ITKClangFormatLinterAction@fc9d686932b4235bbcbd7027a24e24d68f99dccc # main, 2026-09-29
       with:
-        itk-branch: main
+        itk-branch: 5d31af3cfdf2071d14dfc331d169111487b80597 # ITK main, 2026-10-01
