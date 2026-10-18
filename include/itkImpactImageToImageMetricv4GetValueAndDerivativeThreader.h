@@ -23,6 +23,7 @@
 #include "ImpactLoss.h"
 #include "itkImpactLossNormalization.h"
 #include <algorithm>
+#include <functional>
 #include <random>
 
 namespace itk
@@ -218,8 +219,7 @@ protected:
 
   /** Walk this work unit's share of the domain and evaluate its points in batches: Static, the
    * losses take a batch of feature vectors at a time instead of a few small tensor operations
-   * per point; online, the models a batch of patches. On a GPU the online work units only collect
-   * their points, for EvaluateOnline(). */
+   * per point. Online, the work units only collect their points, for EvaluateOnline(). */
   void
   ThreadedExecution(const DomainType & domain, const ThreadIdType threadId) override;
 
@@ -265,19 +265,35 @@ protected:
     torch::Tensor              m_NonZeroJacobianIndices;
   };
 
-  /** Cut the patches of a batch of points, and the transform's Jacobian at each; over all the
-   * threads when \p parallel, which a work unit, already one of them, leaves off. */
+  /** Cut the patches of a batch of points, and with \p derivative the moving gradients and the
+   * transform's Jacobian at each; over all the threads when \p parallel, which a thread already
+   * running its own share leaves off. */
   PatchBatch
   SampleBatch(typename std::vector<Sample>::const_iterator first,
               typename std::vector<Sample>::const_iterator last,
-              bool                                         parallel) const;
+              bool                                         parallel,
+              bool                                         derivative) const;
 
-  /** Run the models on one batch, accumulating the layer losses and, when a derivative is
-   * requested, their gradient. */
-  void
-  EvaluatePatchBatch(const PatchBatch & batch, LossPerThreadStruct & loss) const;
+  /** A batch of patch values, [B, nVox], as model \p model of the moving or the fixed image takes
+   * them: [B, C, s...] on the device. */
+  torch::Tensor
+  ModelPatches(const torch::Tensor & values, size_t model, bool moving) const;
 
-  /** Online mode on a GPU: evaluate the points every work unit collected, into work unit 0's losses. */
+  /** Run model \p model of the moving or the fixed image on \p patches: the central feature vector
+   * of every kept layer, at the channels its comparison samples, [B, C] each on the device.
+   * \p comparison is the first of the model's comparisons. */
+  std::vector<torch::Tensor>
+  Features(size_t model, bool moving, const torch::Tensor & patches, size_t comparison) const;
+
+  /** d(loss)/d(parameter) of a batch at every comparison, [B, 1, P] each, to be added at the
+   * batch's NonZeroJacobianIndices. The moving models run with gradient, and each comparison's
+   * backward pass is seeded with `modulator(comparison, movingFeatures)`: d(loss)/d(feature) at
+   * the batch's points, [B, C]. */
+  std::vector<torch::Tensor>
+  Backpropagate(const PatchBatch &                                            batch,
+                const std::function<torch::Tensor(size_t, torch::Tensor &)> & modulator) const;
+
+  /** Online mode: run the models on the points every work unit collected. */
   void
   EvaluateOnline();
 
@@ -289,9 +305,8 @@ protected:
                       const ThreadIdType                           threadId,
                       LossPerThreadStruct &                        loss) const;
 
-  /** The points each work unit collected, online on a GPU. */
+  /** The points each work unit collected, online. */
   std::vector<std::vector<Sample>> m_OnlineSamples;
-
 
   /** One accumulator per work unit, allocated in BeforeThreadedExecution. */
   mutable std::unique_ptr<AlignedLossPerThreadStruct[]> m_LossThreadStruct{ nullptr };
