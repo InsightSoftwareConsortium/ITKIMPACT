@@ -48,8 +48,9 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::SetInputImage(ImagePointe
  */
 template <typename TImage, typename TInterpolator>
 torch::Tensor
-InterpolateVectorImageFunction<TImage, TInterpolator>::Evaluate(ImagePointType            point,
-                                                                std::vector<unsigned int> subsetOfFeatures) const
+InterpolateVectorImageFunction<TImage, TInterpolator>::Evaluate(
+  const ImagePointType &            point,
+  const std::vector<unsigned int> & subsetOfFeatures) const
 {
   std::vector<float> result;
   for (const unsigned int feature : subsetOfFeatures)
@@ -65,8 +66,8 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::Evaluate(ImagePointType  
 template <typename TImage, typename TInterpolator>
 torch::Tensor
 InterpolateVectorImageFunction<TImage, TInterpolator>::EvaluateDerivative(
-  ImagePointType            point,
-  std::vector<unsigned int> subsetOfFeatures) const
+  const ImagePointType &            point,
+  const std::vector<unsigned int> & subsetOfFeatures) const
 {
 
 

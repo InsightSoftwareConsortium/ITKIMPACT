@@ -92,7 +92,7 @@ public:
    * \return A 1D torch::Tensor containing interpolated values for the requested channels.
    */
   torch::Tensor
-  Evaluate(ImagePointType point, std::vector<unsigned int> subsetOfFeatures) const;
+  Evaluate(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures) const;
 
   /**
    * \brief Evaluates the spatial derivative of selected features at a given point.
@@ -106,7 +106,7 @@ public:
    * \return A 2D torch::Tensor (Channels × SpatialDimension) with spatial gradients per feature.
    */
   torch::Tensor
-  EvaluateDerivative(ImagePointType point, std::vector<unsigned int> subsetOfFeatures) const;
+  EvaluateDerivative(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures) const;
 
   using OutputType = typename Superclass::OutputType;
   using ContinuousIndexType = typename Superclass::ContinuousIndexType;
