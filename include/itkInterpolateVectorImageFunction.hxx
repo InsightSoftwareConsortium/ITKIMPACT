@@ -52,13 +52,46 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::Evaluate(
   const ImagePointType &            point,
   const std::vector<unsigned int> & subsetOfFeatures) const
 {
-  std::vector<float> result;
+  torch::Tensor values = torch::empty({ static_cast<int64_t>(subsetOfFeatures.size()) }, torch::kFloat32);
+  this->Evaluate(point, subsetOfFeatures, values.data_ptr<float>());
+  return values;
+} // end Evaluate
+
+template <typename TImage, typename TInterpolator>
+void
+InterpolateVectorImageFunction<TImage, TInterpolator>::Evaluate(const ImagePointType &            point,
+                                                                const std::vector<unsigned int> & subsetOfFeatures,
+                                                                float *                           values) const
+{
   for (const unsigned int feature : subsetOfFeatures)
   {
-    result.push_back(this->m_Interpolators[feature]->Evaluate(point));
+    *values++ = static_cast<float>(this->m_Interpolators[feature]->Evaluate(point));
   }
-  return torch::from_blob(result.data(), { static_cast<int64_t>(result.size()) }, torch::kFloat32).clone();
 } // end Evaluate
+
+/**
+ * ******************* EvaluateValueAndDerivative ***********************
+ */
+template <typename TImage, typename TInterpolator>
+void
+InterpolateVectorImageFunction<TImage, TInterpolator>::EvaluateValueAndDerivative(
+  const ImagePointType &            point,
+  const std::vector<unsigned int> & subsetOfFeatures,
+  float *                           values,
+  float *                           derivatives) const
+{
+  typename InterpolatorType::OutputType          value;
+  typename InterpolatorType::CovariantVectorType derivative;
+  for (const unsigned int feature : subsetOfFeatures)
+  {
+    this->m_Interpolators[feature]->EvaluateValueAndDerivative(point, value, derivative);
+    *values++ = static_cast<float>(value);
+    for (unsigned int d = 0; d < TImage::ImageDimension; ++d)
+    {
+      *derivatives++ = static_cast<float>(derivative[d]);
+    }
+  }
+} // end EvaluateValueAndDerivative
 
 /**
  * ******************* EvaluateDerivative ***********************

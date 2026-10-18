@@ -83,19 +83,19 @@ protected:
   AfterThreadedExecution() override;
 
 
-  /** Compute the local, per-point contribution to the metric value and derivative. */
+  /** Never called: ThreadedExecution() evaluates the points in batches, in both modes. */
   bool
-  ProcessPoint(const VirtualIndexType &        virtualIndex,
-               const VirtualPointType &        virtualPoint,
-               const FixedImagePointType &     mappedFixedPoint,
-               const FixedImagePixelType &     fixedImageValue,
-               const FixedImageGradientType &  mappedFixedImageGradient,
-               const MovingImagePointType &    mappedMovingPoint,
-               const MovingImagePixelType &    movingImageValue,
-               const MovingImageGradientType & movingImageGradient,
-               MeasureType &                   metricValueReturn,
-               DerivativeType &                localDerivativeReturn,
-               const ThreadIdType              threadId) const override;
+  ProcessPoint(const VirtualIndexType &,
+               const VirtualPointType &,
+               const FixedImagePointType &,
+               const FixedImagePixelType &,
+               const FixedImageGradientType &,
+               const MovingImagePointType &,
+               const MovingImagePixelType &,
+               const MovingImageGradientType &,
+               MeasureType &,
+               DerivativeType &,
+               const ThreadIdType) const override;
 
   /**
    * \brief Per-work-unit accumulator of loss values and gradients, one loss object per
@@ -202,7 +202,7 @@ protected:
   itkAlignedTypedef(ITK_CACHE_LINE_ALIGNMENT, PaddedLossPerThreadStruct, AlignedLossPerThreadStruct);
 
   /** A point of the virtual domain that maps inside both images, resolved into each of them.
-   * Online mode evaluates points in batches, so it gathers them before running any model. */
+   * Both modes evaluate points in batches, so they gather them first. */
   struct Sample
   {
     VirtualIndexType     m_VirtualIndex;
@@ -216,9 +216,9 @@ protected:
   using PatchPlaneType =
     Matrix<double, ImageToImageMetricv4Type::FixedImageDimension, ImageToImageMetricv4Type::FixedImageDimension>;
 
-  /** Walk this work unit's share of the domain. Online mode walks it here so it can run the
-   * models on a batch of points at a time; Static mode is left to the framework's own
-   * per-point walk, which ends in ProcessPoint(). */
+  /** Walk this work unit's share of the domain, and evaluate its points in batches: online,
+   * the models run on a batch of patches at a time; Static, the losses take a batch of feature
+   * vectors at a time instead of a few small tensor operations per point. */
   void
   ThreadedExecution(const DomainType & domain, const ThreadIdType threadId) override;
 
@@ -258,6 +258,14 @@ protected:
                         typename std::vector<Sample>::const_iterator last,
                         const ThreadIdType                           threadId,
                         LossPerThreadStruct &                        loss) const;
+
+  /** Read the feature maps at one batch of points, accumulating the layer losses and, when a
+   * derivative is requested, their gradient (Static mode). */
+  void
+  EvaluateStaticBatch(typename std::vector<Sample>::const_iterator first,
+                      typename std::vector<Sample>::const_iterator last,
+                      const ThreadIdType                           threadId,
+                      LossPerThreadStruct &                        loss) const;
 
   /** One accumulator per work unit, allocated in BeforeThreadedExecution. */
   mutable std::unique_ptr<AlignedLossPerThreadStruct[]> m_LossThreadStruct{ nullptr };

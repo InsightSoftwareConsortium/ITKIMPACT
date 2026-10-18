@@ -108,6 +108,18 @@ public:
   torch::Tensor
   EvaluateDerivative(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures) const;
 
+  /** Evaluate() written to `values`, one float per selected channel, without allocating a tensor. */
+  void
+  Evaluate(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures, float * values) const;
+
+  /** The selected channels' values to `values` and their spatial derivatives to `derivatives` (ImageDimension
+   * floats per channel, channel after channel), sharing each channel's B-spline weights between the two. */
+  void
+  EvaluateValueAndDerivative(const ImagePointType &            point,
+                             const std::vector<unsigned int> & subsetOfFeatures,
+                             float *                           values,
+                             float *                           derivatives) const;
+
   using OutputType = typename Superclass::OutputType;
   using ContinuousIndexType = typename Superclass::ContinuousIndexType;
   using SizeType = typename Superclass::SizeType;
