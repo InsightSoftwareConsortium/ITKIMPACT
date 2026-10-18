@@ -216,9 +216,10 @@ protected:
   using PatchPlaneType =
     Matrix<double, ImageToImageMetricv4Type::FixedImageDimension, ImageToImageMetricv4Type::FixedImageDimension>;
 
-  /** Walk this work unit's share of the domain, and evaluate its points in batches: online,
-   * the models run on a batch of patches at a time; Static, the losses take a batch of feature
-   * vectors at a time instead of a few small tensor operations per point. */
+  /** Walk this work unit's share of the domain and evaluate its points in batches: Static, the
+   * losses take a batch of feature vectors at a time instead of a few small tensor operations
+   * per point; online, the models a batch of patches. On a GPU the online work units only collect
+   * their points, for EvaluateOnline(). */
   void
   ThreadedExecution(const DomainType & domain, const ThreadIdType threadId) override;
 
@@ -251,13 +252,34 @@ protected:
               torch::Tensor & movingGradients,
               bool            computeDerivative) const;
 
-  /** Run the models on one batch of points, accumulating the layer losses and, when a
-   * derivative is requested, their gradient. */
+  /** A batch of points as the models take it, sampled on the CPU: per model, the fixed and
+   * moving patches ([B, nVox]) and the moving interpolator's gradient at every patch voxel
+   * ([B, nVox, MovingDim]); the moving transform's Jacobian ([B, MovingDim, P]) and the global
+   * parameter index of each of its columns ([B, P]). */
+  struct PatchBatch
+  {
+    std::vector<torch::Tensor> m_FixedPatches;
+    std::vector<torch::Tensor> m_MovingPatches;
+    std::vector<torch::Tensor> m_MovingGradients;
+    torch::Tensor              m_TransformJacobian;
+    torch::Tensor              m_NonZeroJacobianIndices;
+  };
+
+  /** Cut the patches of a batch of points, and the transform's Jacobian at each; over all the
+   * threads when \p parallel, which a work unit, already one of them, leaves off. */
+  PatchBatch
+  SampleBatch(typename std::vector<Sample>::const_iterator first,
+              typename std::vector<Sample>::const_iterator last,
+              bool                                         parallel) const;
+
+  /** Run the models on one batch, accumulating the layer losses and, when a derivative is
+   * requested, their gradient. */
   void
-  EvaluateJacobianBatch(typename std::vector<Sample>::const_iterator first,
-                        typename std::vector<Sample>::const_iterator last,
-                        const ThreadIdType                           threadId,
-                        LossPerThreadStruct &                        loss) const;
+  EvaluatePatchBatch(const PatchBatch & batch, LossPerThreadStruct & loss) const;
+
+  /** Online mode on a GPU: evaluate the points every work unit collected, into work unit 0's losses. */
+  void
+  EvaluateOnline();
 
   /** Read the feature maps at one batch of points, accumulating the layer losses and, when a
    * derivative is requested, their gradient (Static mode). */
@@ -266,6 +288,10 @@ protected:
                       typename std::vector<Sample>::const_iterator last,
                       const ThreadIdType                           threadId,
                       LossPerThreadStruct &                        loss) const;
+
+  /** The points each work unit collected, online on a GPU. */
+  std::vector<std::vector<Sample>> m_OnlineSamples;
+
 
   /** One accumulator per work unit, allocated in BeforeThreadedExecution. */
   mutable std::unique_ptr<AlignedLossPerThreadStruct[]> m_LossThreadStruct{ nullptr };

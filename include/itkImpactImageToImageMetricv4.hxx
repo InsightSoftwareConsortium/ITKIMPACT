@@ -493,10 +493,13 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
       }
     }
 
-    // Device budget per model (itkImpactBatchBudget.h); its backward pass refuses the GIL.
+    // Device budget per model (itkImpactBatchBudget.h), up to the largest batch an evaluation can
+    // run: BatchSize, or all the points; its backward pass refuses the GIL.
+    const auto largest =
+      static_cast<int64_t>(this->m_BatchSize > 0 ? this->m_BatchSize : this->GetNumberOfDomainPoints());
     Impact::PythonGilReleaseGuard noGil;
-    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
-    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
+    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, largest);
+    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, largest);
   }
   else
   {

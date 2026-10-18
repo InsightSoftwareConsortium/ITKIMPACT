@@ -1031,6 +1031,76 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
   }
 }
 
+// On a GPU the online mode runs every point through the models in batches as large as the device
+// holds: the value and the derivative have to be the CPU's, up to the TF32 arithmetic of CUDA
+// convolutions. Skipped without a CUDA device.
+TEST(ImpactMetric, JacobianOnTheGpuMatchesTheCpu)
+{
+  if (!torch::cuda::is_available())
+  {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  auto evaluate = [&](const char * lossName, const char * device, MetricType::DerivativeType & derivative) {
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(1);
+    metric->SetDevice(device);
+
+    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+    movingInterp->SetSplineOrder(3);
+    metric->SetMovingInterpolator(movingInterp);
+    auto transform = itk::TranslationTransform<double, 3>::New();
+    transform->SetIdentity();
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType cpu, gpu;
+    const double               cpuValue = evaluate(lossName, "cpu", cpu);
+    const double               gpuValue = evaluate(lossName, "cuda", gpu);
+    EXPECT_NEAR(gpuValue, cpuValue, 1e-3 * std::abs(cpuValue));
+    ASSERT_EQ(gpu.GetSize(), cpu.GetSize());
+    double difference = 0.0, norm = 0.0;
+    for (unsigned int j = 0; j < cpu.GetSize(); ++j)
+    {
+      difference += (gpu[j] - cpu[j]) * (gpu[j] - cpu[j]);
+      norm += cpu[j] * cpu[j];
+    }
+    ASSERT_GT(norm, 1e-12);
+    EXPECT_LT(std::sqrt(difference / norm), 1e-2);
+  }
+}
+
 // The Static analogue: the points are split over the work units, and a feature subset drawn per
 // point from each work unit's own generator gave every point a subset that depended on its rank in
 // that split. All points of an evaluation now compare the same channels.
