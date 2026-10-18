@@ -99,6 +99,15 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     this->m_SubsetsOfFeaturesOnDevice.push_back(
       torch::tensor(std::vector<int64_t>(subset.begin(), subset.end()), torch::kInt64).to(device));
   }
+  // Static mode reads exactly these channels at every point: have the maps lay them side by side.
+  auto & internals = *this->m_ImpactAssociate->m_Internals;
+  for (size_t comparison = 0; comparison < internals.m_FixedFeaturesMaps.size(); ++comparison)
+  {
+    internals.m_FixedFeaturesMaps[comparison].m_FeaturesMapInterpolator->SetActiveChannels(
+      this->m_SubsetsOfFeatures[comparison]);
+    internals.m_MovingFeaturesMaps[comparison].m_FeaturesMapInterpolator->SetActiveChannels(
+      this->m_SubsetsOfFeatures[comparison]);
+  }
 }
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
