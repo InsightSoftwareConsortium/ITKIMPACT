@@ -969,9 +969,10 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
     metric->SetModelsConfiguration(configs);
     metric->SetDistance({ std::string(lossName) });
     metric->SetLayersWeight({ 1.f });
-    // All four channels: the feature subset is then drawn without consuming the generator, so a
-    // different number of batches cannot shift the random sequence and confound the comparison.
-    metric->SetSubsetFeatures({ 4 });
+    // Two of the four channels: every point of an evaluation compares the same two, whatever the
+    // batches. NCC accumulates its statistics channel by channel, so a subset drawn per batch
+    // mixed channels within one sum.
+    metric->SetSubsetFeatures({ 2 });
     metric->SetPCA({ 0 });
     metric->SetMode("Jacobian");
     metric->SetSeed(1);
@@ -1026,6 +1027,71 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
     {
       EXPECT_NEAR(ragged[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
       EXPECT_NEAR(single[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
+    }
+  }
+}
+
+// The Static analogue: the points are split over the work units, and a feature subset drawn per
+// point from each work unit's own generator gave every point a subset that depended on its rank in
+// that split. All points of an evaluation now compare the same channels.
+TEST(ImpactMetric, StaticResultIsIndependentOfTheNumberOfWorkUnits)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  auto evaluate = [&](const char * lossName, unsigned int workUnits, MetricType::DerivativeType & derivative) {
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 2, 2, 2 },
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Static");
+    metric->SetSeed(1);
+    metric->SetFeaturesMapUpdateInterval(-1);
+    metric->SetDevice("cpu");
+
+    auto affine = itk::AffineTransform<double, 3>::New();
+    affine->SetIdentity();
+
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(affine);
+    metric->SetUseFixedImageGradientFilter(false);
+    metric->SetUseMovingImageGradientFilter(false);
+    metric->SetMaximumNumberOfWorkUnits(workUnits);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  // Relative bars, as for the batches: the work units only regroup the float sums.
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType one, four;
+    const double               oneValue = evaluate(lossName, 1, one);
+    const double               fourValue = evaluate(lossName, 4, four);
+
+    EXPECT_NEAR(fourValue, oneValue, 1e-6 * std::abs(oneValue));
+    for (unsigned int j = 0; j < one.GetSize(); ++j)
+    {
+      EXPECT_NEAR(four[j], one[j], 1e-4 * std::abs(one[j]) + 1e-12) << "parameter " << j;
     }
   }
 }

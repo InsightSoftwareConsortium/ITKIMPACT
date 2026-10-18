@@ -97,9 +97,6 @@ protected:
                DerivativeType &                localDerivativeReturn,
                const ThreadIdType              threadId) const override;
 
-  std::vector<unsigned int>
-  GetSubsetOfFeatures(const std::vector<unsigned int> & features_index, std::mt19937 & randomGenerator, int n) const;
-
   /**
    * \brief Per-work-unit accumulator of loss values and gradients, one loss object per
    * kept layer, for weighted multi-layer aggregation.
@@ -113,22 +110,10 @@ protected:
     std::vector<float>                              m_layersWeight;
     SizeValueType                                   m_numberOfPixelsCounted;
     int                                             m_nb_parameters;
-    std::mt19937                                    m_randomGenerator;
 
     void
-    init(std::vector<std::string> distance_name,
-         std::vector<float>       layersWeight,
-         unsigned int             seed,
-         unsigned int             nb_parameters)
+    init(std::vector<std::string> distance_name, std::vector<float> layersWeight, unsigned int nb_parameters)
     {
-      if (seed > 0)
-      {
-        this->m_randomGenerator = std::mt19937(seed);
-      }
-      else
-      {
-        this->m_randomGenerator = std::mt19937(time(nullptr));
-      }
       this->m_layersWeight = layersWeight;
       for (std::string name : distance_name)
       {
@@ -287,6 +272,13 @@ protected:
    * than once per evaluation. Shared by every work unit, so the value cannot depend on how the
    * domain was partitioned. */
   unsigned int m_PlaneSeed{ 0 };
+
+  /** The channels every point of an evaluation compares, per comparison, and the same as index
+   * tensors on the device for the online mode. Drawn once in BeforeThreadedExecution from
+   * m_PlaneSeed: a loss such as NCC accumulates its statistics channel by channel over the points,
+   * so all of them have to compare the same channels, whatever the partition or the batches. */
+  std::vector<std::vector<unsigned int>> m_SubsetsOfFeatures;
+  std::vector<torch::Tensor>             m_SubsetsOfFeaturesOnDevice;
 };
 
 } // end namespace itk

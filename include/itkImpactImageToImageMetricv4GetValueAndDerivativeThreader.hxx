@@ -77,14 +77,27 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
   for (ThreadIdType i = 0; i < numWorkUnitsUsed; ++i)
   {
-    // The feature subset follows the same seed as the planes above: with Seed set it is that
-    // seed, with Seed zero it is the clock drawn once. Reseeding from the clock here on every
-    // evaluation made the subset change across a second boundary, so two evaluations of the
-    // same parameters did not return the same value.
-    this->m_LossThreadStruct[i].init(this->m_ImpactAssociate->GetDistance(),
-                                     this->m_ImpactAssociate->GetLayersWeight(),
-                                     this->m_PlaneSeed,
-                                     globalDerivativeSize);
+    this->m_LossThreadStruct[i].init(
+      this->m_ImpactAssociate->GetDistance(), this->m_ImpactAssociate->GetLayersWeight(), globalDerivativeSize);
+  }
+
+  // The feature subsets follow the same seed as the planes above, drawn afresh from it on every
+  // evaluation, so two evaluations of the same parameters compare the same channels.
+  std::mt19937        generator(this->m_PlaneSeed);
+  const torch::Device device(this->m_ImpactAssociate->GetDevice());
+  this->m_SubsetsOfFeatures = this->m_ImpactAssociate->m_features_indexes;
+  this->m_SubsetsOfFeaturesOnDevice.clear();
+  for (size_t comparison = 0; comparison < this->m_SubsetsOfFeatures.size(); ++comparison)
+  {
+    std::vector<unsigned int> & subset = this->m_SubsetsOfFeatures[comparison];
+    const unsigned int          kept = this->m_ImpactAssociate->GetSubsetFeatures()[comparison];
+    if (kept < subset.size())
+    {
+      std::shuffle(subset.begin(), subset.end(), generator);
+      subset.resize(kept);
+    }
+    this->m_SubsetsOfFeaturesOnDevice.push_back(
+      torch::tensor(std::vector<int64_t>(subset.begin(), subset.end()), torch::kInt64).to(device));
   }
 }
 
@@ -125,20 +138,6 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       }
     }
   }
-}
-
-template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
-std::vector<unsigned int>
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  GetSubsetOfFeatures(const std::vector<unsigned int> & features_index, std::mt19937 & randomGenerator, int n) const
-{
-  if (features_index.size() == static_cast<size_t>(n))
-    return features_index;
-
-  std::vector<unsigned int> shuffled = features_index;
-  std::shuffle(shuffled.begin(), shuffled.end(), randomGenerator);
-  shuffled.resize(n);
-  return shuffled;
 }
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
@@ -552,16 +551,6 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     auto featuresOf = [&](const torch::Tensor & layer, const torch::Tensor & subsetIndices) {
       return centerFeatures(layer).index_select(1, subsetIndices).to(torch::kFloat32);
     };
-    // Which channels of comparison `a` are compared. Drawn once per batch and per comparison,
-    // from the work unit's own generator.
-    auto subsetIndicesOf = [&](size_t a) {
-      const std::vector<unsigned int> subsetOfFeatures =
-        this->GetSubsetOfFeatures(this->m_ImpactAssociate->m_features_indexes[a],
-                                  loss.m_randomGenerator,
-                                  this->m_ImpactAssociate->GetSubsetFeatures()[a]);
-      return torch::tensor(std::vector<int64_t>(subsetOfFeatures.begin(), subsetOfFeatures.end()), torch::kInt64)
-        .to(device);
-    };
 
     // One work unit at a time on the device, so the budget holds whatever the thread count.
     if (device.is_cuda() && !deviceLock.owns_lock())
@@ -585,9 +574,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       const std::vector<torch::Tensor> movingLayers = keptLayers(outputs, movingConfig);
       for (size_t layer = 0; layer < layerCount; ++layer, ++comparison)
       {
-        const torch::Tensor subsetIndices = subsetIndicesOf(comparison);
-        torch::Tensor       fixedFeatures = featuresOf(fixedLayers[layer], subsetIndices).to(torch::kCPU);
-        torch::Tensor       movingFeatures = featuresOf(movingLayers[layer], subsetIndices).to(torch::kCPU);
+        const torch::Tensor & subsetIndices = this->m_SubsetsOfFeaturesOnDevice[comparison];
+        torch::Tensor         fixedFeatures = featuresOf(fixedLayers[layer], subsetIndices).to(torch::kCPU);
+        torch::Tensor         movingFeatures = featuresOf(movingLayers[layer], subsetIndices).to(torch::kCPU);
         loss.m_losses[comparison]->updateValue(fixedFeatures, movingFeatures);
       }
       continue;
@@ -612,11 +601,11 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
     for (size_t layer = 0; layer < layerCount; ++layer, ++comparison)
     {
-      const torch::Tensor subsetIndices = subsetIndicesOf(comparison);
-      torch::Tensor       fixedFeatures = featuresOf(fixedLayers[layer], subsetIndices).to(torch::kCPU);
-      torch::Tensor       movingFeatures = featuresOf(movingLayers[layer], subsetIndices); // [B, C], on the device
-      torch::Tensor       movingFeaturesOnCpu = movingFeatures.detach().to(torch::kCPU);
-      const bool          laterLayersFollow = layer + 1 < layerCount;
+      const torch::Tensor & subsetIndices = this->m_SubsetsOfFeaturesOnDevice[comparison];
+      torch::Tensor         fixedFeatures = featuresOf(fixedLayers[layer], subsetIndices).to(torch::kCPU);
+      torch::Tensor         movingFeatures = featuresOf(movingLayers[layer], subsetIndices); // [B, C], on the device
+      torch::Tensor         movingFeaturesOnCpu = movingFeatures.detach().to(torch::kCPU);
+      const bool            laterLayersFollow = layer + 1 < layerCount;
 
       // One backward pass over the batch, seeded by `seed`, contracted into d(.)/d(coordinate).
       auto backward = [&](const torch::Tensor & seed, bool retainGraph) {
@@ -745,10 +734,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
   for (size_t i = 0; i < this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps.size(); ++i)
   {
-    const std::vector<unsigned int> subsetOfFeatures =
-      this->GetSubsetOfFeatures(this->m_ImpactAssociate->m_features_indexes[i],
-                                loss.m_randomGenerator,
-                                this->m_ImpactAssociate->GetSubsetFeatures()[i]);
+    const std::vector<unsigned int> & subsetOfFeatures = this->m_SubsetsOfFeatures[i];
 
     torch::Tensor fixedFeatures = this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps[i]
                                     .m_FeaturesMapInterpolator->Evaluate(mappedFixedPoint, subsetOfFeatures)
