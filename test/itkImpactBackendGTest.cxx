@@ -4488,6 +4488,49 @@ TEST(ImpactConvexAdam, CoarseTakesPCAAndASeededChannelSubset)
     EXPECT_LT(error[d], 1.5) << "PCA to 2 components, axis " << d;
 }
 
+// The coarse and fine stages draw from generators of their own: running them leaves torch's global
+// generator, which a Python caller shares, where it was. Both used to call torch::manual_seed(Seed).
+TEST(ImpactConvexAdam, StagesLeaveTorchsGlobalGeneratorAlone)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto                                fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto                                moving = MakeTorchAdamPattern(24, 3.0, -2.5, 1.5, spacing, identity);
+  const itk::ImpactModelConfiguration model(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
+
+  auto coarse = itk::ImpactCoarseRegistration<ImageType>::New();
+  coarse->SetFixedImage(fixed);
+  coarse->SetMovingImage(moving);
+  coarse->AddModelConfiguration(model);
+  coarse->SetSubsetFeatures({ 2 }); // so that the stage draws
+  coarse->SetSeed(7);
+  coarse->SetGridSpacing(2);
+  coarse->SetDisplacementHalfWidth(3);
+
+  auto fine = TorchAdamFilterType::New();
+  fine->SetFixedImage(fixed);
+  fine->SetMovingImage(moving);
+  fine->AddModelConfiguration(model);
+  fine->SetSubsetFeatures({ 2 });
+  fine->SetSamplingPercentage(0.3);
+  fine->SetNumberOfIterations(1);
+  fine->SetSeed(3);
+
+  for (itk::ProcessObject * stage :
+       { static_cast<itk::ProcessObject *>(coarse), static_cast<itk::ProcessObject *>(fine) })
+  {
+    SCOPED_TRACE(stage->GetNameOfClass());
+    torch::manual_seed(123);
+    const torch::Tensor expected = torch::rand({ 4 });
+    torch::manual_seed(123);
+    stage->Update();
+    EXPECT_TRUE(torch::equal(torch::rand({ 4 }), expected)) << "the stage moved torch's global generator";
+  }
+}
+
 namespace
 {
 // NCC of two same-grid images over the interior (margin away from borders).
