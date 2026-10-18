@@ -2469,6 +2469,32 @@ TEST(ImpactLoss, LocalNCCComparesWindowsOfDenseMaps)
   EXPECT_THROW(loss->forwardValue(points, points), std::runtime_error);
 }
 
+// A loss sums its value over the batch of points it is handed. Summed in float32, the value lost
+// digits with the size of the batch, so a work unit evaluated in one batch did not give the value
+// of the same points fed one by one, and finite differences of it were mostly rounding.
+TEST(ImpactLoss, ValueOfABatchIsTheSumOfItsPoints)
+{
+  torch::manual_seed(7);
+  const int64_t N = 20000, C = 4;
+  torch::Tensor fixed = torch::rand({ N, C }) * 10; // float32, as the metric hands them over
+  torch::Tensor moving = torch::rand({ N, C }) * 10;
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice" })
+  {
+    SCOPED_TRACE(name);
+    auto batch = itk::Impact::LossFactory::Instance().Create(name);
+    batch->updateValue(fixed, moving);
+    auto pointwise = itk::Impact::LossFactory::Instance().Create(name);
+    for (int64_t i = 0; i < N; ++i)
+    {
+      torch::Tensor fixedPoint = fixed.narrow(0, i, 1);
+      torch::Tensor movingPoint = moving.narrow(0, i, 1);
+      pointwise->updateValue(fixedPoint, movingPoint);
+    }
+    const double expected = pointwise->GetValue(static_cast<double>(N));
+    EXPECT_NEAR(batch->GetValue(static_cast<double>(N)), expected, 1e-9 * std::abs(expected));
+  }
+}
+
 TEST(ImpactLoss, ForwardValueGradientFiniteDifference)
 {
   torch::manual_seed(7);
