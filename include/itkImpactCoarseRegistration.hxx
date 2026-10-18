@@ -28,6 +28,7 @@
 #include <itkIdentityTransform.h>
 
 #include <torch/torch.h>
+#include <ATen/CPUGeneratorImpl.h>
 
 #include <algorithm>
 #include <cmath>
@@ -325,7 +326,10 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     }
 
     const torch::Device device(m_Device);
-    torch::manual_seed(m_Seed);
+    // The stage's own generator, on the CPU. torch::manual_seed reseeded every generator of the
+    // process, a Python caller's included, and a draw on the device also followed whatever else draws
+    // there, such as the batch-budget probe. Draws are made here and moved to the device.
+    at::Generator      generator = at::make_generator<at::CPUGeneratorImpl>(m_Seed);
     torch::NoGradGuard noGrad; // the coarse stage is non-differentiable
 
     // ---- Fixed and moving onto the same (fixed) voxel grid; resample only if geometries differ. ----
@@ -420,9 +424,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
         if (kept > 0 && kept < fixedLayers[l].size(1))
         {
           const torch::Tensor channels =
-            torch::randperm(fixedLayers[l].size(1), torch::TensorOptions().dtype(torch::kLong))
-              .narrow(0, 0, kept)
-              .to(device);
+            torch::randperm(fixedLayers[l].size(1), generator, torch::kLong).narrow(0, 0, kept).to(device);
           fixedLayers[l] = fixedLayers[l].index_select(1, channels).contiguous();
           movingLayers[l] = movingLayers[l].index_select(1, channels).contiguous();
         }

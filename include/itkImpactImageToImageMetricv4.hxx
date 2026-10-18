@@ -95,6 +95,10 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
     ImpactImageToImageMetricv4GetValueAndDerivativeThreader<ThreadedIndexedContainerPartitioner, Superclass, Self>;
   this->m_DenseGetValueAndDerivativeThreader = ImpactDenseGetValueAndDerivativeThreaderType::New();
   this->m_SparseGetValueAndDerivativeThreader = ImpactSparseGetValueAndDerivativeThreaderType::New();
+
+  // IMPACT compares features and never reads the images' gradients: with the filter on, Initialize()
+  // smoothed the whole moving image into a gradient image that nothing used.
+  this->SetUseMovingImageGradientFilter(false);
 }
 
 template <typename TFixedImage,
@@ -489,10 +493,13 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
       }
     }
 
-    // Device budget per model (itkImpactBatchBudget.h); its backward pass refuses the GIL.
+    // Device budget per model (itkImpactBatchBudget.h), up to the largest batch an evaluation can
+    // run: BatchSize, or all the points; its backward pass refuses the GIL.
+    const auto largest =
+      static_cast<int64_t>(this->m_BatchSize > 0 ? this->m_BatchSize : this->GetNumberOfDomainPoints());
     Impact::PythonGilReleaseGuard noGil;
-    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
-    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
+    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, largest);
+    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, largest);
   }
   else
   {

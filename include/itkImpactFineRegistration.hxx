@@ -31,6 +31,7 @@
 #include <itkIdentityTransform.h>
 
 #include <torch/torch.h>
+#include <ATen/CPUGeneratorImpl.h>
 
 #include <algorithm>
 #include <array>
@@ -221,7 +222,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   const bool featureMode = !m_FixedModelsConfiguration.empty();
 
   const torch::Device device(m_Device);
-  torch::manual_seed(m_Seed);
+  // The stage's own generator, on the CPU. torch::manual_seed reseeded every generator of the
+  // process, a Python caller's included, and a draw on the device also followed whatever else draws
+  // there, such as the batch-budget probe. Draws are made here and moved to the device.
+  at::Generator generator = at::make_generator<at::CPUGeneratorImpl>(m_Seed);
 
   // Release the Python GIL for the whole torch section: the Adam loop runs loss.backward(),
   // and libtorch's Python autograd engine (active whenever we run under Python) requires the
@@ -526,8 +530,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       const int64_t kept = l < m_SubsetFeatures.size() ? static_cast<int64_t>(m_SubsetFeatures[l]) : 0;
       if (kept > 0 && kept < layers[l].size(1))
       {
-        subsets[l] =
-          torch::randperm(layers[l].size(1), torch::TensorOptions().dtype(torch::kLong)).narrow(0, 0, kept).to(device);
+        subsets[l] = torch::randperm(layers[l].size(1), generator, torch::kLong).narrow(0, 0, kept).to(device);
       }
     }
   };
@@ -588,11 +591,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       }
       count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(candidates)));
       drawn = fixedLayerCandidates[l].index_select(
-        0, torch::randint(candidates, { count }, torch::TensorOptions().dtype(torch::kLong).device(device)));
+        0, torch::randint(candidates, { count }, generator, torch::kLong).to(device));
     }
     else
     {
-      drawn = torch::randint(voxels, { count }, torch::TensorOptions().dtype(torch::kLong).device(device));
+      drawn = torch::randint(voxels, { count }, generator, torch::kLong).to(device);
     }
     const torch::Tensor  points = layerBaseGrid[l].reshape({ voxels, ImageDimension }).index_select(0, drawn);
     std::vector<int64_t> pointShape(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, n, N}
@@ -1036,7 +1039,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           voxels *= extent;
         }
         const int64_t count = std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(voxels)));
-        const torch::Tensor flat = torch::randint(voxels, { count }, torch::TensorOptions().dtype(torch::kLong));
+        const torch::Tensor flat = torch::randint(voxels, { count }, generator, torch::kLong);
         torch::Tensor       points = torch::empty({ count, static_cast<int64_t>(ImageDimension) }, torch::kLong);
         int64_t             stride = 1;
         for (unsigned int d = 0; d < ImageDimension; ++d) // ITK index, x fastest in the flat voxel number

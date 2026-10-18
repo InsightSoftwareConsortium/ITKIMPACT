@@ -314,7 +314,7 @@ public:
   updateValue(torch::Tensor & fixedOutput, torch::Tensor & movingOutput) override
   {
     this->initialize(fixedOutput);
-    this->m_value += (fixedOutput - movingOutput).abs().mean(1).sum().item<double>();
+    this->m_value += (fixedOutput - movingOutput).abs().mean(1).sum(torch::kDouble).item<double>();
   }
 
   torch::Tensor
@@ -322,7 +322,7 @@ public:
   {
     this->initialize(fixedOutput);
     torch::Tensor diffOutput = fixedOutput - movingOutput;
-    this->m_value += diffOutput.abs().mean(1).sum().item<double>();
+    this->m_value += diffOutput.abs().mean(1).sum(torch::kDouble).item<double>();
     return -torch::sign(diffOutput) / fixedOutput.size(1);
   }
 
@@ -359,7 +359,7 @@ public:
   updateValue(torch::Tensor & fixedOutput, torch::Tensor & movingOutput) override
   {
     this->initialize(fixedOutput);
-    this->m_value += (fixedOutput - movingOutput).pow(2).mean(1).sum().item<double>();
+    this->m_value += (fixedOutput - movingOutput).pow(2).mean(1).sum(torch::kDouble).item<double>();
   }
 
   torch::Tensor
@@ -367,7 +367,7 @@ public:
   {
     this->initialize(fixedOutput);
     torch::Tensor diffOutput = fixedOutput - movingOutput;
-    this->m_value += diffOutput.pow(2).mean(1).sum().item<double>();
+    this->m_value += diffOutput.pow(2).mean(1).sum(torch::kDouble).item<double>();
     return -2 * diffOutput / fixedOutput.size(1);
   }
 
@@ -420,7 +420,7 @@ public:
 
     torch::Tensor dice = 2.0 * intersectionSum / unionSumSafe;
     dice.masked_fill_(isEmpty, 1.0); // empty/empty => Dice = 1
-    this->m_value += (1.0 - dice).sum().item<double>();
+    this->m_value += (1.0 - dice).sum(torch::kDouble).item<double>();
   }
 
   torch::Tensor
@@ -435,7 +435,7 @@ public:
 
     torch::Tensor dice = 2.0 * intersectionSum / unionSumSafe;
     dice.masked_fill_(isEmpty, 1.0);
-    this->m_value += (1.0 - dice).sum().item<double>();
+    this->m_value += (1.0 - dice).sum(torch::kDouble).item<double>();
 
     torch::Tensor grad = -2.0 * (fixedOutput * unionSumSafe.unsqueeze(-1) - intersectionSum.unsqueeze(-1)) /
                          (unionSumSafe * unionSumSafe).unsqueeze(-1);
@@ -492,7 +492,7 @@ public:
     torch::Tensor norm_moving = torch::norm(movingOutput, 2, 1);
     torch::Tensor cosine = dot_product / (norm_fixed * norm_moving);
     torch::Tensor expL1 = torch::exp(-this->lambda * (fixedOutput - movingOutput).abs());
-    this->m_value += (1.0 - (cosine.unsqueeze(-1) * expL1).mean(1)).sum().item<double>();
+    this->m_value += (1.0 - (cosine.unsqueeze(-1) * expL1).mean(1)).sum(torch::kDouble).item<double>();
   }
 
   torch::Tensor
@@ -515,7 +515,7 @@ public:
                                 (dot_product.unsqueeze(-1) * movingOutput) / (v * norm_moving.pow(2)).unsqueeze(-1));
     torch::Tensor expSum = expL1.sum(1).unsqueeze(-1);
     torch::Tensor dExpL1 = this->lambda * torch::sign(diffOutput) * expL1;
-    this->m_value += (1.0 - (cosine.unsqueeze(-1) * expL1).mean(1)).sum().item<double>();
+    this->m_value += (1.0 - (cosine.unsqueeze(-1) * expL1).mean(1)).sum(torch::kDouble).item<double>();
     return (minusDcos * expSum - cosine.unsqueeze(-1) * dExpL1) / fixedOutput.size(1);
   }
 
@@ -558,7 +558,7 @@ public:
     torch::Tensor dot_product = (fixedOutput * movingOutput).sum(1);
     torch::Tensor norm_fixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor norm_moving = torch::norm(movingOutput, 2, 1);
-    this->m_value += (1.0 - dot_product / (norm_fixed * norm_moving)).sum().item<double>();
+    this->m_value += (1.0 - dot_product / (norm_fixed * norm_moving)).sum(torch::kDouble).item<double>();
   }
 
   torch::Tensor
@@ -569,7 +569,7 @@ public:
     torch::Tensor norm_fixed = torch::norm(fixedOutput, 2, 1);
     torch::Tensor norm_moving = torch::norm(movingOutput, 2, 1);
     torch::Tensor v = (norm_fixed * norm_moving);
-    this->m_value += (1.0 - dot_product / v).sum().item<double>();
+    this->m_value += (1.0 - dot_product / v).sum(torch::kDouble).item<double>();
     // d(-cosine)/d(movingOutput_c) = -( f_c/v - (f.m) m_c / (v |m|^2) ). The cross term
     // uses the full dot product f.m, not the per-channel f_c m_c.
     return -(fixedOutput / v.unsqueeze(-1) -

@@ -969,9 +969,10 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
     metric->SetModelsConfiguration(configs);
     metric->SetDistance({ std::string(lossName) });
     metric->SetLayersWeight({ 1.f });
-    // All four channels: the feature subset is then drawn without consuming the generator, so a
-    // different number of batches cannot shift the random sequence and confound the comparison.
-    metric->SetSubsetFeatures({ 4 });
+    // Two of the four channels: every point of an evaluation compares the same two, whatever the
+    // batches. NCC accumulates its statistics channel by channel, so a subset drawn per batch
+    // mixed channels within one sum.
+    metric->SetSubsetFeatures({ 2 });
     metric->SetPCA({ 0 });
     metric->SetMode("Jacobian");
     metric->SetSeed(1);
@@ -1026,6 +1027,141 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
     {
       EXPECT_NEAR(ragged[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
       EXPECT_NEAR(single[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
+    }
+  }
+}
+
+// On a GPU the online mode runs every point through the models in batches as large as the device
+// holds: the value and the derivative have to be the CPU's, up to the TF32 arithmetic of CUDA
+// convolutions. Skipped without a CUDA device.
+TEST(ImpactMetric, JacobianOnTheGpuMatchesTheCpu)
+{
+  if (!torch::cuda::is_available())
+  {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  auto evaluate = [&](const char * lossName, const char * device, MetricType::DerivativeType & derivative) {
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(1);
+    metric->SetDevice(device);
+
+    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+    movingInterp->SetSplineOrder(3);
+    metric->SetMovingInterpolator(movingInterp);
+    auto transform = itk::TranslationTransform<double, 3>::New();
+    transform->SetIdentity();
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType cpu, gpu;
+    const double               cpuValue = evaluate(lossName, "cpu", cpu);
+    const double               gpuValue = evaluate(lossName, "cuda", gpu);
+    EXPECT_NEAR(gpuValue, cpuValue, 1e-3 * std::abs(cpuValue));
+    ASSERT_EQ(gpu.GetSize(), cpu.GetSize());
+    double difference = 0.0, norm = 0.0;
+    for (unsigned int j = 0; j < cpu.GetSize(); ++j)
+    {
+      difference += (gpu[j] - cpu[j]) * (gpu[j] - cpu[j]);
+      norm += cpu[j] * cpu[j];
+    }
+    ASSERT_GT(norm, 1e-12);
+    EXPECT_LT(std::sqrt(difference / norm), 1e-2);
+  }
+}
+
+// The Static analogue: the points are split over the work units, and a feature subset drawn per
+// point from each work unit's own generator gave every point a subset that depended on its rank in
+// that split. All points of an evaluation now compare the same channels.
+TEST(ImpactMetric, StaticResultIsIndependentOfTheNumberOfWorkUnits)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  auto evaluate = [&](const char * lossName, unsigned int workUnits, MetricType::DerivativeType & derivative) {
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 2, 2, 2 },
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 2 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Static");
+    metric->SetSeed(1);
+    metric->SetFeaturesMapUpdateInterval(-1);
+    metric->SetDevice("cpu");
+
+    auto affine = itk::AffineTransform<double, 3>::New();
+    affine->SetIdentity();
+
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(affine);
+    metric->SetUseFixedImageGradientFilter(false);
+    metric->SetUseMovingImageGradientFilter(false);
+    metric->SetMaximumNumberOfWorkUnits(workUnits);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  // Relative bars, as for the batches: the work units only regroup the float sums.
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType one, four;
+    const double               oneValue = evaluate(lossName, 1, one);
+    const double               fourValue = evaluate(lossName, 4, four);
+
+    EXPECT_NEAR(fourValue, oneValue, 1e-6 * std::abs(oneValue));
+    for (unsigned int j = 0; j < one.GetSize(); ++j)
+    {
+      EXPECT_NEAR(four[j], one[j], 1e-4 * std::abs(one[j]) + 1e-12) << "parameter " << j;
     }
   }
 }
@@ -2401,6 +2537,32 @@ TEST(ImpactLoss, LocalNCCComparesWindowsOfDenseMaps)
   }
   torch::Tensor points = torch::rand({ 10, 3 }, options);
   EXPECT_THROW(loss->forwardValue(points, points), std::runtime_error);
+}
+
+// A loss sums its value over the batch of points it is handed. Summed in float32, the value lost
+// digits with the size of the batch, so a work unit evaluated in one batch did not give the value
+// of the same points fed one by one, and finite differences of it were mostly rounding.
+TEST(ImpactLoss, ValueOfABatchIsTheSumOfItsPoints)
+{
+  torch::manual_seed(7);
+  const int64_t N = 20000, C = 4;
+  torch::Tensor fixed = torch::rand({ N, C }) * 10; // float32, as the metric hands them over
+  torch::Tensor moving = torch::rand({ N, C }) * 10;
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice" })
+  {
+    SCOPED_TRACE(name);
+    auto batch = itk::Impact::LossFactory::Instance().Create(name);
+    batch->updateValue(fixed, moving);
+    auto pointwise = itk::Impact::LossFactory::Instance().Create(name);
+    for (int64_t i = 0; i < N; ++i)
+    {
+      torch::Tensor fixedPoint = fixed.narrow(0, i, 1);
+      torch::Tensor movingPoint = moving.narrow(0, i, 1);
+      pointwise->updateValue(fixedPoint, movingPoint);
+    }
+    const double expected = pointwise->GetValue(static_cast<double>(N));
+    EXPECT_NEAR(batch->GetValue(static_cast<double>(N)), expected, 1e-9 * std::abs(expected));
+  }
 }
 
 TEST(ImpactLoss, ForwardValueGradientFiniteDifference)
@@ -4420,6 +4582,49 @@ TEST(ImpactConvexAdam, CoarseTakesPCAAndASeededChannelSubset)
   const auto error = InteriorMeanError(run({}, { 2 }), expected, 8);
   for (unsigned int d = 0; d < 3; ++d)
     EXPECT_LT(error[d], 1.5) << "PCA to 2 components, axis " << d;
+}
+
+// The coarse and fine stages draw from generators of their own: running them leaves torch's global
+// generator, which a Python caller shares, where it was. Both used to call torch::manual_seed(Seed).
+TEST(ImpactConvexAdam, StagesLeaveTorchsGlobalGeneratorAlone)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto                                fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto                                moving = MakeTorchAdamPattern(24, 3.0, -2.5, 1.5, spacing, identity);
+  const itk::ImpactModelConfiguration model(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
+
+  auto coarse = itk::ImpactCoarseRegistration<ImageType>::New();
+  coarse->SetFixedImage(fixed);
+  coarse->SetMovingImage(moving);
+  coarse->AddModelConfiguration(model);
+  coarse->SetSubsetFeatures({ 2 }); // so that the stage draws
+  coarse->SetSeed(7);
+  coarse->SetGridSpacing(2);
+  coarse->SetDisplacementHalfWidth(3);
+
+  auto fine = TorchAdamFilterType::New();
+  fine->SetFixedImage(fixed);
+  fine->SetMovingImage(moving);
+  fine->AddModelConfiguration(model);
+  fine->SetSubsetFeatures({ 2 });
+  fine->SetSamplingPercentage(0.3);
+  fine->SetNumberOfIterations(1);
+  fine->SetSeed(3);
+
+  for (itk::ProcessObject * stage :
+       { static_cast<itk::ProcessObject *>(coarse), static_cast<itk::ProcessObject *>(fine) })
+  {
+    SCOPED_TRACE(stage->GetNameOfClass());
+    torch::manual_seed(123);
+    const torch::Tensor expected = torch::rand({ 4 });
+    torch::manual_seed(123);
+    stage->Update();
+    EXPECT_TRUE(torch::equal(torch::rand({ 4 }), expected)) << "the stage moved torch's global generator";
+  }
 }
 
 namespace

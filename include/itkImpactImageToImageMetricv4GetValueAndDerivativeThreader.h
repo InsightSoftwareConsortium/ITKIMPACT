@@ -23,6 +23,7 @@
 #include "ImpactLoss.h"
 #include "itkImpactLossNormalization.h"
 #include <algorithm>
+#include <functional>
 #include <random>
 
 namespace itk
@@ -83,22 +84,19 @@ protected:
   AfterThreadedExecution() override;
 
 
-  /** Compute the local, per-point contribution to the metric value and derivative. */
+  /** Never called: ThreadedExecution() evaluates the points in batches, in both modes. */
   bool
-  ProcessPoint(const VirtualIndexType &        virtualIndex,
-               const VirtualPointType &        virtualPoint,
-               const FixedImagePointType &     mappedFixedPoint,
-               const FixedImagePixelType &     fixedImageValue,
-               const FixedImageGradientType &  mappedFixedImageGradient,
-               const MovingImagePointType &    mappedMovingPoint,
-               const MovingImagePixelType &    movingImageValue,
-               const MovingImageGradientType & movingImageGradient,
-               MeasureType &                   metricValueReturn,
-               DerivativeType &                localDerivativeReturn,
-               const ThreadIdType              threadId) const override;
-
-  std::vector<unsigned int>
-  GetSubsetOfFeatures(const std::vector<unsigned int> & features_index, std::mt19937 & randomGenerator, int n) const;
+  ProcessPoint(const VirtualIndexType &,
+               const VirtualPointType &,
+               const FixedImagePointType &,
+               const FixedImagePixelType &,
+               const FixedImageGradientType &,
+               const MovingImagePointType &,
+               const MovingImagePixelType &,
+               const MovingImageGradientType &,
+               MeasureType &,
+               DerivativeType &,
+               const ThreadIdType) const override;
 
   /**
    * \brief Per-work-unit accumulator of loss values and gradients, one loss object per
@@ -113,22 +111,10 @@ protected:
     std::vector<float>                              m_layersWeight;
     SizeValueType                                   m_numberOfPixelsCounted;
     int                                             m_nb_parameters;
-    std::mt19937                                    m_randomGenerator;
 
     void
-    init(std::vector<std::string> distance_name,
-         std::vector<float>       layersWeight,
-         unsigned int             seed,
-         unsigned int             nb_parameters)
+    init(std::vector<std::string> distance_name, std::vector<float> layersWeight, unsigned int nb_parameters)
     {
-      if (seed > 0)
-      {
-        this->m_randomGenerator = std::mt19937(seed);
-      }
-      else
-      {
-        this->m_randomGenerator = std::mt19937(time(nullptr));
-      }
       this->m_layersWeight = layersWeight;
       for (std::string name : distance_name)
       {
@@ -217,7 +203,7 @@ protected:
   itkAlignedTypedef(ITK_CACHE_LINE_ALIGNMENT, PaddedLossPerThreadStruct, AlignedLossPerThreadStruct);
 
   /** A point of the virtual domain that maps inside both images, resolved into each of them.
-   * Online mode evaluates points in batches, so it gathers them before running any model. */
+   * Both modes evaluate points in batches, so they gather them first. */
   struct Sample
   {
     VirtualIndexType     m_VirtualIndex;
@@ -231,9 +217,9 @@ protected:
   using PatchPlaneType =
     Matrix<double, ImageToImageMetricv4Type::FixedImageDimension, ImageToImageMetricv4Type::FixedImageDimension>;
 
-  /** Walk this work unit's share of the domain. Online mode walks it here so it can run the
-   * models on a batch of points at a time; Static mode is left to the framework's own
-   * per-point walk, which ends in ProcessPoint(). */
+  /** Walk this work unit's share of the domain and evaluate its points in batches: Static, the
+   * losses take a batch of feature vectors at a time instead of a few small tensor operations
+   * per point. Online, the work units only collect their points, for EvaluateOnline(). */
   void
   ThreadedExecution(const DomainType & domain, const ThreadIdType threadId) override;
 
@@ -266,13 +252,61 @@ protected:
               torch::Tensor & movingGradients,
               bool            computeDerivative) const;
 
-  /** Run the models on one batch of points, accumulating the layer losses and, when a
-   * derivative is requested, their gradient. */
+  /** A batch of points as the models take it, sampled on the CPU: per model, the fixed and
+   * moving patches ([B, nVox]) and the moving interpolator's gradient at every patch voxel
+   * ([B, nVox, MovingDim]); the moving transform's Jacobian ([B, MovingDim, P]) and the global
+   * parameter index of each of its columns ([B, P]). */
+  struct PatchBatch
+  {
+    std::vector<torch::Tensor> m_FixedPatches;
+    std::vector<torch::Tensor> m_MovingPatches;
+    std::vector<torch::Tensor> m_MovingGradients;
+    torch::Tensor              m_TransformJacobian;
+    torch::Tensor              m_NonZeroJacobianIndices;
+  };
+
+  /** Cut the patches of a batch of points, and with \p derivative the moving gradients and the
+   * transform's Jacobian at each; over all the threads when \p parallel, which a thread already
+   * running its own share leaves off. */
+  PatchBatch
+  SampleBatch(typename std::vector<Sample>::const_iterator first,
+              typename std::vector<Sample>::const_iterator last,
+              bool                                         parallel,
+              bool                                         derivative) const;
+
+  /** A batch of patch values, [B, nVox], as model \p model of the moving or the fixed image takes
+   * them: [B, C, s...] on the device. */
+  torch::Tensor
+  ModelPatches(const torch::Tensor & values, size_t model, bool moving) const;
+
+  /** Run model \p model of the moving or the fixed image on \p patches: the central feature vector
+   * of every kept layer, at the channels its comparison samples, [B, C] each on the device.
+   * \p comparison is the first of the model's comparisons. */
+  std::vector<torch::Tensor>
+  Features(size_t model, bool moving, const torch::Tensor & patches, size_t comparison) const;
+
+  /** d(loss)/d(parameter) of a batch at every comparison, [B, 1, P] each, to be added at the
+   * batch's NonZeroJacobianIndices. The moving models run with gradient, and each comparison's
+   * backward pass is seeded with `modulator(comparison, movingFeatures)`: d(loss)/d(feature) at
+   * the batch's points, [B, C]. */
+  std::vector<torch::Tensor>
+  Backpropagate(const PatchBatch &                                            batch,
+                const std::function<torch::Tensor(size_t, torch::Tensor &)> & modulator) const;
+
+  /** Online mode: run the models on the points every work unit collected. */
   void
-  EvaluateJacobianBatch(typename std::vector<Sample>::const_iterator first,
-                        typename std::vector<Sample>::const_iterator last,
-                        const ThreadIdType                           threadId,
-                        LossPerThreadStruct &                        loss) const;
+  EvaluateOnline();
+
+  /** Read the feature maps at one batch of points, accumulating the layer losses and, when a
+   * derivative is requested, their gradient (Static mode). */
+  void
+  EvaluateStaticBatch(typename std::vector<Sample>::const_iterator first,
+                      typename std::vector<Sample>::const_iterator last,
+                      const ThreadIdType                           threadId,
+                      LossPerThreadStruct &                        loss) const;
+
+  /** The points each work unit collected, online. */
+  std::vector<std::vector<Sample>> m_OnlineSamples;
 
   /** One accumulator per work unit, allocated in BeforeThreadedExecution. */
   mutable std::unique_ptr<AlignedLossPerThreadStruct[]> m_LossThreadStruct{ nullptr };
@@ -287,6 +321,13 @@ protected:
    * than once per evaluation. Shared by every work unit, so the value cannot depend on how the
    * domain was partitioned. */
   unsigned int m_PlaneSeed{ 0 };
+
+  /** The channels every point of an evaluation compares, per comparison, and the same as index
+   * tensors on the device for the online mode. Drawn once in BeforeThreadedExecution from
+   * m_PlaneSeed: a loss such as NCC accumulates its statistics channel by channel over the points,
+   * so all of them have to compare the same channels, whatever the partition or the batches. */
+  std::vector<std::vector<unsigned int>> m_SubsetsOfFeatures;
+  std::vector<torch::Tensor>             m_SubsetsOfFeaturesOnDevice;
 };
 
 } // end namespace itk

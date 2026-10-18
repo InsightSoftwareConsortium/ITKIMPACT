@@ -19,11 +19,14 @@
 /**
  * \class InterpolateVectorImageFunction
  * \ingroup Impact
- * \brief Interpolate each channel of a VectorImage with its own B-Spline interpolator.
+ * \brief Interpolate the channels of a VectorImage with cubic B-splines.
  *
- * ITK's BSplineInterpolateImageFunction does not support VectorImages, so one interpolator is
- * built per channel. Evaluation at arbitrary physical points returns the interpolated values or
- * spatial derivatives as torch tensors.
+ * ITK's BSplineInterpolateImageFunction does not support VectorImages. This class computes each
+ * channel's B-spline coefficients as TInterpolator (a BSplineInterpolateImageFunction of order 3)
+ * does, and evaluates them as it does, to the bit. But the support, the weights and the boundary
+ * mirroring are the same for every channel, so they are computed once per point, and the
+ * coefficients of a voxel are stored channel after channel. Evaluation at arbitrary physical
+ * points returns the interpolated values or spatial derivatives as torch tensors or into buffers.
  */
 #ifndef itkInterpolateVectorImageFunction_h
 #define itkInterpolateVectorImageFunction_h
@@ -32,6 +35,10 @@
 #include <torch/torch.h>
 #include <itkInterpolateImageFunction.h>
 #include <itkVectorIndexSelectionCastImageFilter.h>
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace itk
 {
@@ -59,15 +66,12 @@ public:
 
   using ImageType = TImage;
   using InterpolatorType = TInterpolator;
-  using InterpolatorPointer = typename InterpolatorType::Pointer;
   using ImagePointer = typename ImageType::Pointer;
   using PixelType = typename ImageType::PixelType;
   using ImagePointType = typename ImageType::PointType;
 
   /** Dimension underlying input image. */
   static constexpr unsigned int ImageDimension = Superclass::ImageDimension;
-
-  using CovariantVectorType = itk::CovariantVector<float, ImageDimension>;
 
 
   InterpolateVectorImageFunction() = default;
@@ -76,7 +80,7 @@ public:
   using Superclass::SetInputImage;
 
   /**
-   * \brief Initialize one B-Spline interpolator per feature channel of the input VectorImage.
+   * \brief Compute the cubic B-spline coefficients of every channel of the input VectorImage.
    *
    * \param vectorImage The input VectorImage whose channels are interpolated.
    */
@@ -92,7 +96,7 @@ public:
    * \return A 1D torch::Tensor containing interpolated values for the requested channels.
    */
   torch::Tensor
-  Evaluate(ImagePointType point, std::vector<unsigned int> subsetOfFeatures) const;
+  Evaluate(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures) const;
 
   /**
    * \brief Evaluates the spatial derivative of selected features at a given point.
@@ -106,7 +110,25 @@ public:
    * \return A 2D torch::Tensor (Channels × SpatialDimension) with spatial gradients per feature.
    */
   torch::Tensor
-  EvaluateDerivative(ImagePointType point, std::vector<unsigned int> subsetOfFeatures) const;
+  EvaluateDerivative(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures) const;
+
+  /** Keep a copy of these channels' coefficients voxel after voxel, the channels of a voxel side by side:
+   * evaluating exactly these channels then reads the fewest cache lines. Any other subset still reads the
+   * coefficients one channel after the other. Not thread-safe: call it before evaluating from threads. */
+  void
+  SetActiveChannels(const std::vector<unsigned int> & subsetOfFeatures);
+
+  /** Evaluate() written to `values`, one float per selected channel, without allocating a tensor. */
+  void
+  Evaluate(const ImagePointType & point, const std::vector<unsigned int> & subsetOfFeatures, float * values) const;
+
+  /** The selected channels' values to `values` and their spatial derivatives to `derivatives` (ImageDimension
+   * floats per channel, channel after channel), sharing each channel's B-spline weights between the two. */
+  void
+  EvaluateValueAndDerivative(const ImagePointType &            point,
+                             const std::vector<unsigned int> & subsetOfFeatures,
+                             float *                           values,
+                             float *                           derivatives) const;
 
   using OutputType = typename Superclass::OutputType;
   using ContinuousIndexType = typename Superclass::ContinuousIndexType;
@@ -125,8 +147,18 @@ public:
   }
 
 private:
-  ImagePointer                     m_VectorImage;
-  std::vector<InterpolatorPointer> m_Interpolators;
+  /** The values, and with VDerivative the spatial derivatives, of the selected channels. */
+  template <bool VDerivative>
+  void
+  EvaluateChannels(const ImagePointType &            point,
+                   const std::vector<unsigned int> & subsetOfFeatures,
+                   float *                           values,
+                   float *                           derivatives) const;
+
+  ImagePointer              m_VectorImage;
+  std::vector<float>        m_Coefficients; // one channel after the other, each voxel after voxel (axis 0 fastest)
+  std::vector<unsigned int> m_ActiveChannels;
+  std::vector<float>        m_ActiveCoefficients; // voxel after voxel, the active channels side by side
 };
 
 } // end namespace itk
