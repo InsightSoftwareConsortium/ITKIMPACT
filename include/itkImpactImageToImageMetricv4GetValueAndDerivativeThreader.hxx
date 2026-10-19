@@ -625,10 +625,15 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   auto &              losses = this->m_LossThreadStruct[0].m_losses;
 
   // Run `evaluate(begin, end, parallel, loss)` over the samples a batch at a time, `loss` being the
-  // accumulator of the thread that runs it.
-  auto inBatches = [&](const auto & evaluate) {
+  // accumulator of the thread that runs it. With `whole`, in one batch or not at all: false, the
+  // losses as they were, when the device does not take every point at once.
+  auto inBatches = [&](const auto & evaluate, bool whole = false) {
     if (!device.is_cuda())
     {
+      if (whole)
+      {
+        return false;
+      }
       // On the CPU the threads are the parallelism: each runs the models on its own share,
       // BatchSize points at a time (0: 64, see SetBatchSize()).
       const int64_t batch = requested > 0 ? requested : 64;
@@ -644,7 +649,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
           }
         },
         nullptr);
-      return;
+      return true;
     }
     // On a GPU one batch at a time, as large as it holds, its patches cut by all the threads:
     // BatchSize capped by the device budget (itkImpactBatchBudget.h), 0 = the budget alone. A
@@ -656,6 +661,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       int64_t       batch = requested > 0 ? requested : count;
       batch = std::max<int64_t>(bound > 0 ? std::min(batch, bound) : batch, 1);
       const int64_t end = std::min(begin + batch, count);
+      if (whole && end - begin < count)
+      {
+        return false;
+      }
 
       std::vector<Impact::Loss::State> before;
       for (const auto & l : losses)
@@ -681,8 +690,13 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
         {
           Impact::ShrinkBatchSize(config, end - begin, device);
         }
+        if (whole)
+        {
+          return false;
+        }
       }
     }
+    return true;
   };
   // Over a sampled point set the fixed features are kept from one evaluation to the next
   // (Internals::m_FixedFeatures): a batch whose points all have theirs cuts no fixed patch and runs
@@ -742,42 +756,50 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     return fixed;
   };
 
+  auto singlePass = [&](int64_t begin, int64_t end, bool parallel, LossPerThreadStruct & loss) {
+    const PatchBatch           batch = sample(begin, end, parallel, computeDerivative, true);
+    std::vector<torch::Tensor> fixed = fixedOf(batch, begin, end);
+    if (!computeDerivative)
+    {
+      std::vector<torch::Tensor> moving = featuresOf(batch, true);
+      for (size_t c = 0; c < fixed.size(); ++c)
+      {
+        loss.m_losses[c]->updateValue(fixed[c], moving[c]);
+      }
+      return;
+    }
+    // The loss gives d(loss)/d(feature) at the batch's points with the batch's value, and one
+    // backward pass a comparison carries it to the parameters, as the elastix metric does. It is
+    // exact for a mean of per-point terms, known at a point from that point alone, and for a
+    // global statistic when the batch holds every point.
+    std::vector<torch::Tensor> jacobians = this->Backpropagate(batch, [&](size_t c, torch::Tensor & moving) {
+      return loss.m_losses[c]->updateValueAndGetGradientModulator(fixed[c], moving);
+    });
+    torch::Tensor              indices = batch.m_NonZeroJacobianIndices;
+    for (size_t c = 0; c < jacobians.size(); ++c)
+    {
+      loss.m_losses[c]->updateDerivativeInJacobianMode(jacobians[c], indices);
+    }
+  };
   const bool global =
     computeDerivative && std::any_of(losses.begin(), losses.end(), [](const auto & l) { return !l->IsPerPointMean(); });
   if (!global)
   {
-    inBatches([&](int64_t begin, int64_t end, bool parallel, LossPerThreadStruct & loss) {
-      const PatchBatch           batch = sample(begin, end, parallel, computeDerivative, true);
-      std::vector<torch::Tensor> fixed = fixedOf(batch, begin, end);
-      if (!computeDerivative)
-      {
-        std::vector<torch::Tensor> moving = featuresOf(batch, true);
-        for (size_t c = 0; c < fixed.size(); ++c)
-        {
-          loss.m_losses[c]->updateValue(fixed[c], moving[c]);
-        }
-        return;
-      }
-      // A mean of per-point terms: its d(loss)/d(feature) at a point is known from that point
-      // alone, so the loss gives it with the batch's value, and one backward pass a comparison
-      // carries it to the parameters. This is what the elastix metric does.
-      std::vector<torch::Tensor> jacobians = this->Backpropagate(batch, [&](size_t c, torch::Tensor & moving) {
-        return loss.m_losses[c]->updateValueAndGetGradientModulator(fixed[c], moving);
-      });
-      torch::Tensor              indices = batch.m_NonZeroJacobianIndices;
-      for (size_t c = 0; c < jacobians.size(); ++c)
-      {
-        loss.m_losses[c]->updateDerivativeInJacobianMode(jacobians[c], indices);
-      }
-    });
+    inBatches(singlePass);
+    return;
+  }
+  // A global statistic (NCC) mixes the points: d(loss)/d(feature) at one of them is only known
+  // once all have been seen. A batch that holds every point, as one on a GPU often does, sees them
+  // all, and the single pass is exact for it too.
+  if (inBatches(singlePass, /*whole*/ true))
+  {
     return;
   }
 
-  // A global statistic (NCC) mixes the points: d(loss)/d(feature) at one of them is only known
-  // once all have been seen. A first pass, without gradient, gathers the features of every point,
-  // from which each loss takes its value and that derivative, [N, C]; a second carries it to the
-  // parameters as for a per-point loss, instead of the one backward pass per channel the closed
-  // form Static uses would take.
+  // Otherwise a first pass, without gradient, gathers the features of every point, from which each
+  // loss takes its value and that derivative, [N, C]; a second carries it to the parameters as for a
+  // per-point loss, instead of the one backward pass per channel the closed form Static uses would
+  // take.
   std::vector<torch::Tensor> fixedFeatures, movingFeatures;
   for (const torch::Tensor & subset : this->m_SubsetsOfFeaturesOnDevice)
   {

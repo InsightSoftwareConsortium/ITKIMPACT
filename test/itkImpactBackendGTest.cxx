@@ -1141,9 +1141,9 @@ private:
 // What the online mode costs on any machine is how often it runs the models. A batch takes one
 // forward pass of each model and one backward pass for a loss that is a mean of per-point terms
 // (L2); a global one (NCC) takes one more forward pass of the moving model, the first pass that
-// sees every point before the backward ones; a value alone takes no backward pass. On a GPU the
-// whole evaluation is one batch. A backward pass per channel, or batches of a few points, multiply
-// these counts.
+// sees every point before the backward ones, unless one batch holds every point, as on a GPU, where
+// the whole evaluation is one batch; a value alone takes no backward pass. A backward pass per
+// channel, or batches of a few points, multiply these counts.
 TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
 {
   using VirtualImageType = itk::Image<double, 3>;
@@ -1189,7 +1189,8 @@ TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
     const auto points = static_cast<int>(metric->GetNumberOfValidPoints());
     const int  batches = batchSize > 0 ? (points + static_cast<int>(batchSize) - 1) / static_cast<int>(batchSize) : 1;
     ASSERT_GT(points, 0);
-    EXPECT_EQ(ModelPassCounter::Forward(), (std::string(lossName) == "NCC" ? 3 : 2) * batches);
+    const bool twoPasses = std::string(lossName) == "NCC" && (std::string(device) == "cpu" || batches > 1);
+    EXPECT_EQ(ModelPassCounter::Forward(), (twoPasses ? 3 : 2) * batches);
     EXPECT_EQ(ModelPassCounter::Backward(), batches);
 
     ModelPassCounter::Reset();
@@ -1203,6 +1204,7 @@ TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
     if (torch::cuda::is_available())
     {
       check(lossName, "cuda", 0);
+      check(lossName, "cuda", 100);
     }
   }
 }
