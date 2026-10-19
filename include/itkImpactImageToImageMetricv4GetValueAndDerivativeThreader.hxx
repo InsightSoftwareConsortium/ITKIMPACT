@@ -109,6 +109,24 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     internals.m_MovingFeaturesMaps[comparison].m_FeaturesMapInterpolator->SetActiveChannels(
       this->m_SubsetsOfFeatures[comparison]);
   }
+  // The fixed features kept over a sampled point set (Internals::m_FixedFeatures), sized here, on
+  // one thread, and dropped when what they depend on has moved.
+  if (this->m_ImpactAssociate->GetMode() == "Jacobian" && this->m_ImpactAssociate->GetUseSampledPointSet())
+  {
+    const auto points = static_cast<int64_t>(this->m_ImpactAssociate->GetNumberOfDomainPoints());
+    const std::pair<unsigned int, ModifiedTimeType> stamp{ this->m_PlaneSeed,
+                                                           this->m_ImpactAssociate->GetFixedTransform()->GetMTime() };
+    if (internals.m_FixedFeaturesKnown.size() != static_cast<size_t>(points) || internals.m_FixedFeaturesStamp != stamp)
+    {
+      internals.m_FixedFeaturesKnown.assign(static_cast<size_t>(points), 0);
+      internals.m_FixedFeatures.clear();
+      for (const torch::Tensor & subset : this->m_SubsetsOfFeaturesOnDevice)
+      {
+        internals.m_FixedFeatures.push_back(torch::empty({ points, subset.numel() }, torch::kFloat32));
+      }
+      internals.m_FixedFeaturesStamp = stamp;
+    }
+  }
 }
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
@@ -264,6 +282,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     const VirtualPointType virtualPoint = sampledPointSet->GetPoint(i);
     if (this->ResolveSample(virtualImage->TransformPhysicalPointToIndex(virtualPoint), virtualPoint, sample))
     {
+      sample.m_Id = static_cast<SizeValueType>(i);
       samples.push_back(sample);
     }
   }
@@ -333,11 +352,12 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   const auto &         movingDirection = this->m_ImpactAssociate->GetMovingImage()->GetDirection();
   const PatchPlaneType plane = this->PatchPlane(sample.m_VirtualIndex, modelIndex, dim);
 
-  auto fixedAccessor = fixedPatches.accessor<float, 2>();
+  float * const fixedRow =
+    fixedPatches.defined() ? fixedPatches.template data_ptr<float>() + row * fixedPatches.size(1) : nullptr;
   auto movingAccessor = movingPatches.accessor<float, 2>();
   auto gradientAccessor = movingGradients.accessor<float, 3>();
 
-  for (int64_t flat = 0; flat < fixedPatches.size(1); ++flat)
+  for (int64_t flat = 0; flat < movingPatches.size(1); ++flat)
   {
     // Decode the multi-index with image axis 0 varying FASTEST, so that reshaping the row to
     // the reversed extents reproduces the Static path's tensor layout.
@@ -378,9 +398,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       }
     }
 
-    if (this->m_ImpactAssociate->m_FixedInterpolator->IsInsideBuffer(fixedPoint))
+    if (fixedRow != nullptr && this->m_ImpactAssociate->m_FixedInterpolator->IsInsideBuffer(fixedPoint))
     {
-      fixedAccessor[row][flat] = static_cast<float>(this->m_ImpactAssociate->m_FixedInterpolator->Evaluate(fixedPoint));
+      fixedRow[flat] = static_cast<float>(this->m_ImpactAssociate->m_FixedInterpolator->Evaluate(fixedPoint));
     }
     if (!this->m_ImpactAssociate->m_MovingInterpolator->IsInsideBuffer(movingPoint))
     {
@@ -419,7 +439,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   SampleBatch(typename std::vector<Sample>::const_iterator first,
               typename std::vector<Sample>::const_iterator last,
               bool                                         parallel,
-              bool                                         derivative) const -> PatchBatch
+              bool                                         derivative,
+              bool                                         fixed) const -> PatchBatch
 {
   using JacobianType = typename TImageToImageMetric::JacobianType;
   constexpr unsigned int movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
@@ -432,7 +453,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   {
     const std::vector<int64_t> & patchSize = config.GetPatchSize();
     const int64_t voxels = std::accumulate(patchSize.begin(), patchSize.end(), int64_t{ 1 }, std::multiplies<>());
-    batch.m_FixedPatches.push_back(torch::zeros({ size, voxels }, torch::kFloat32));
+    batch.m_FixedPatches.push_back(fixed ? torch::zeros({ size, voxels }, torch::kFloat32) : torch::Tensor());
     batch.m_MovingPatches.push_back(torch::zeros({ size, voxels }, torch::kFloat32));
     batch.m_MovingGradients.push_back(torch::zeros({ size, voxels, movingDimension }, torch::kFloat32));
   }
@@ -663,8 +684,16 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       }
     }
   };
-  auto sample = [&](int64_t begin, int64_t end, bool parallel, bool derivative) {
-    return this->SampleBatch(samples.begin() + begin, samples.begin() + end, parallel, derivative);
+  // Over a sampled point set the fixed features are kept from one evaluation to the next
+  // (Internals::m_FixedFeatures): a batch whose points all have theirs cuts no fixed patch and runs
+  // no fixed model.
+  auto &     internals = *this->m_ImpactAssociate->m_Internals;
+  const bool keep = this->m_ImpactAssociate->GetUseSampledPointSet();
+  auto       sample = [&](int64_t begin, int64_t end, bool parallel, bool derivative, bool fixed) {
+    fixed = fixed && !(keep && std::all_of(samples.begin() + begin, samples.begin() + end, [&](const Sample & s) {
+                         return internals.m_FixedFeaturesKnown[s.m_Id] != 0;
+                       }));
+    return this->SampleBatch(samples.begin() + begin, samples.begin() + end, parallel, derivative, fixed);
   };
   // The feature vectors of one image of a batch at every comparison, [B, C] each on the CPU.
   auto featuresOf = [&](const PatchBatch & batch, bool moving) {
@@ -681,14 +710,45 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     }
     return features;
   };
+  // The fixed feature vectors of a batch at every comparison: the kept ones when it cut no fixed
+  // patch, else the fixed model's, kept.
+  auto fixedOf = [&](const PatchBatch & batch, int64_t begin, int64_t end) {
+    if (!keep)
+    {
+      return featuresOf(batch, false);
+    }
+    torch::Tensor ids = torch::empty({ end - begin }, torch::kInt64);
+    std::transform(samples.begin() + begin, samples.begin() + end, ids.data_ptr<int64_t>(), [](const Sample & s) {
+      return static_cast<int64_t>(s.m_Id);
+    });
+    std::vector<torch::Tensor> fixed;
+    if (!batch.m_FixedPatches.front().defined())
+    {
+      for (const torch::Tensor & kept : internals.m_FixedFeatures)
+      {
+        fixed.push_back(kept.index_select(0, ids));
+      }
+      return fixed;
+    }
+    fixed = featuresOf(batch, false);
+    for (size_t c = 0; c < fixed.size(); ++c)
+    {
+      internals.m_FixedFeatures[c].index_copy_(0, ids, fixed[c]);
+    }
+    for (auto it = samples.begin() + begin; it != samples.begin() + end; ++it)
+    {
+      internals.m_FixedFeaturesKnown[it->m_Id] = 1;
+    }
+    return fixed;
+  };
 
   const bool global =
     computeDerivative && std::any_of(losses.begin(), losses.end(), [](const auto & l) { return !l->IsPerPointMean(); });
   if (!global)
   {
     inBatches([&](int64_t begin, int64_t end, bool parallel, LossPerThreadStruct & loss) {
-      const PatchBatch           batch = sample(begin, end, parallel, computeDerivative);
-      std::vector<torch::Tensor> fixed = featuresOf(batch, false);
+      const PatchBatch           batch = sample(begin, end, parallel, computeDerivative, true);
+      std::vector<torch::Tensor> fixed = fixedOf(batch, begin, end);
       if (!computeDerivative)
       {
         std::vector<torch::Tensor> moving = featuresOf(batch, true);
@@ -725,8 +785,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     movingFeatures.push_back(torch::empty({ count, subset.numel() }, torch::kFloat32));
   }
   inBatches([&](int64_t begin, int64_t end, bool parallel, LossPerThreadStruct &) {
-    const PatchBatch                 batch = sample(begin, end, parallel, false);
-    const std::vector<torch::Tensor> fixed = featuresOf(batch, false);
+    const PatchBatch                 batch = sample(begin, end, parallel, false, true);
+    const std::vector<torch::Tensor> fixed = fixedOf(batch, begin, end);
     const std::vector<torch::Tensor> moving = featuresOf(batch, true);
     for (size_t c = 0; c < fixed.size(); ++c)
     {
@@ -741,7 +801,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   }
   std::mutex accumulating; // the CPU threads all add to work unit 0's derivative
   inBatches([&](int64_t begin, int64_t end, bool parallel, LossPerThreadStruct &) {
-    const PatchBatch           batch = sample(begin, end, parallel, true);
+    const PatchBatch           batch = sample(begin, end, parallel, true, false);
     std::vector<torch::Tensor> jacobians = this->Backpropagate(
       batch, [&](size_t c, torch::Tensor &) { return modulators[c].narrow(0, begin, end - begin); });
     torch::Tensor               indices = batch.m_NonZeroJacobianIndices;

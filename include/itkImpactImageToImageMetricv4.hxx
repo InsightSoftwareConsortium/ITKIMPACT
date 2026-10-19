@@ -74,6 +74,14 @@ struct ImpactImageToImageMetricv4<TFixedImage,
   // one configuration serves both.
   ImpactImageMetadata m_FixedImageMetadata;
   ImpactImageMetadata m_MovingImageMetadata;
+  // Online, over a sampled point set: each point's fixed feature vectors, [points, C] per
+  // comparison, and whether the point has them yet. Nothing they depend on moves from one
+  // evaluation to the next -- the fixed image and transform, the point, its plane, the channels --
+  // so the fixed model runs once per point and not once per evaluation. Initialize() drops them,
+  // and so does a new plane seed or a modified fixed transform (the stamp).
+  std::vector<torch::Tensor>                m_FixedFeatures;
+  std::vector<char>                         m_FixedFeaturesKnown;
+  std::pair<unsigned int, ModifiedTimeType> m_FixedFeaturesStamp{};
 };
 
 template <typename TFixedImage,
@@ -409,6 +417,8 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
     this->m_Internals->m_FixedFeaturesMaps.clear();
     this->m_Internals->m_MovingFeaturesMaps.clear();
     this->m_Internals->m_Principal_components.clear();
+    this->m_Internals->m_FixedFeatures.clear();
+    this->m_Internals->m_FixedFeaturesKnown.clear();
 
     if (m_FixedModelsConfiguration.size() != m_MovingModelsConfiguration.size())
     {

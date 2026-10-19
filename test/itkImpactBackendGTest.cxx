@@ -1207,6 +1207,106 @@ TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
   }
 }
 
+// Over a sampled point set nothing the fixed features depend on moves between two evaluations, so
+// the online mode computes them once: from the second evaluation on, the fixed model no longer
+// runs, and the value and the derivative are those of a metric evaluating afresh. A modified fixed
+// transform has them computed again.
+TEST(ImpactMetric, OnlineModeKeepsTheFixedFeaturesOfASampledPointSet)
+{
+  using VirtualImageType = ImageType;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+  auto points = MetricType::FixedSampledPointSetType::New();
+  for (unsigned int n = 0; n < 64; ++n)
+  {
+    ImageType::PointType point;
+    fixed->TransformIndexToPhysicalPoint(ImageType::IndexType{ { 2 + n % 4, 2 + n / 4 % 4, 2 + n / 16 } }, point);
+    points->SetPoint(n, point);
+  }
+
+  auto make =
+    [&](const char * lossName, TransformType * transform, itk::IdentityTransform<double, 3> * fixedTransform) {
+      auto                                       metric = MetricType::New();
+      std::vector<itk::ImpactModelConfiguration> configs;
+      configs.emplace_back(ToyModelPath(),
+                           3,
+                           1,
+                           std::vector<unsigned int>{ 3, 3, 3 },
+                           std::vector<float>{ 1.f, 1.f, 1.f },
+                           std::vector<unsigned int>{ 0, 0, 0 },
+                           std::vector<bool>{ true, false },
+                           false);
+      metric->SetModelsConfiguration(configs);
+      metric->SetDistance({ std::string(lossName) });
+      metric->SetLayersWeight({ 1.f });
+      metric->SetSubsetFeatures({ 4 });
+      metric->SetPCA({ 0 });
+      metric->SetMode("Jacobian");
+      metric->SetSeed(1);
+      metric->SetDevice("cpu");
+      metric->SetBatchSize(16);
+      metric->SetNormalizeLosses(false); // a fresh metric latches its own first value
+      auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+      movingInterp->SetSplineOrder(3);
+      metric->SetMovingInterpolator(movingInterp);
+      metric->SetFixedImage(fixed);
+      metric->SetMovingImage(moving);
+      metric->SetFixedTransform(fixedTransform);
+      metric->SetMovingTransform(transform);
+      metric->SetFixedSampledPointSet(points);
+      metric->SetUseSampledPointSet(true);
+      metric->SetVirtualDomainFromImage(fixed);
+      metric->SetMaximumNumberOfWorkUnits(1);
+      metric->Initialize();
+      return metric;
+    };
+
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    const int movingPasses = std::string(lossName) == "NCC" ? 2 : 1;
+    auto      transform = TransformType::New();
+    transform->SetIdentity();
+    auto fixedTransform = itk::IdentityTransform<double, 3>::New();
+    auto metric = make(lossName, transform, fixedTransform);
+
+    MetricType::MeasureType    value;
+    MetricType::DerivativeType derivative;
+    ModelPassCounter           counter;
+    metric->GetValueAndDerivative(value, derivative);
+    ASSERT_EQ(metric->GetNumberOfValidPoints(), 64u);
+    EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);
+
+    TransformType::ParametersType shift(3);
+    shift[0] = 0.3;
+    shift[1] = -0.2;
+    shift[2] = 0.1;
+    transform->SetParameters(shift);
+    ModelPassCounter::Reset();
+    metric->GetValueAndDerivative(value, derivative);
+    EXPECT_EQ(ModelPassCounter::Forward(), movingPasses * 4);
+    EXPECT_EQ(ModelPassCounter::Backward(), 4);
+
+    MetricType::MeasureType    freshValue;
+    MetricType::DerivativeType freshDerivative;
+    make(lossName, transform, fixedTransform)->GetValueAndDerivative(freshValue, freshDerivative);
+    EXPECT_NEAR(value, freshValue, 1e-9 * std::abs(freshValue));
+    ASSERT_EQ(derivative.GetSize(), freshDerivative.GetSize());
+    for (unsigned int j = 0; j < derivative.GetSize(); ++j)
+    {
+      EXPECT_NEAR(derivative[j], freshDerivative[j], 1e-9 * std::abs(freshDerivative[j])) << "parameter " << j;
+    }
+
+    fixedTransform->Modified();
+    ModelPassCounter::Reset();
+    metric->GetValueAndDerivative(value, derivative);
+    EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);
+  }
+}
+
 // The Static analogue: the points are split over the work units, and a feature subset drawn per
 // point from each work unit's own generator gave every point a subset that depended on its rank in
 // that split. All points of an evaluation now compare the same channels.

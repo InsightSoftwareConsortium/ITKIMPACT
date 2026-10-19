@@ -213,6 +213,7 @@ protected:
     VirtualPointType     m_VirtualPoint;
     FixedImagePointType  m_FixedPoint;
     MovingImagePointType m_MovingPoint;
+    SizeValueType        m_Id{ 0 }; // its index in the sampled point set
   };
 
   /** The plane a patch is cut on, as a matrix whose COLUMNS are the patch axes expressed in
@@ -243,9 +244,10 @@ protected:
   PatchPlaneType
   PatchPlane(const VirtualIndexType & virtualIndex, size_t modelIndex, unsigned int modelDimension) const;
 
-  /** Sample model \p modelIndex's intensity patch around one point in both images, and the
-   * moving interpolator's spatial gradient at every patch voxel, into row \p row of the batch
-   * tensors ([B, nVox] for the values, [B, nVox, MovingDim] for the gradient). */
+  /** Sample model \p modelIndex's intensity patch around one point in both images (the fixed one
+   * unless \p fixedPatches is undefined), and the moving interpolator's spatial gradient at every
+   * patch voxel, into row \p row of the batch tensors ([B, nVox] for the values, [B, nVox,
+   * MovingDim] for the gradient). */
   void
   SamplePatch(const Sample &  sample,
               size_t          modelIndex,
@@ -268,14 +270,15 @@ protected:
     torch::Tensor              m_NonZeroJacobianIndices;
   };
 
-  /** Cut the patches of a batch of points, and with \p derivative the moving gradients and the
-   * transform's Jacobian at each; over all the threads when \p parallel, which a thread already
-   * running its own share leaves off. */
+  /** Cut the moving patches of a batch of points, the fixed ones with \p fixed, and with
+   * \p derivative the moving gradients and the transform's Jacobian at each; over all the threads
+   * when \p parallel, which a thread already running its own share leaves off. */
   PatchBatch
   SampleBatch(typename std::vector<Sample>::const_iterator first,
               typename std::vector<Sample>::const_iterator last,
               bool                                         parallel,
-              bool                                         derivative) const;
+              bool                                         derivative,
+              bool                                         fixed) const;
 
   /** A batch of patch values, [B, nVox], as model \p model of the moving or the fixed image takes
    * them: [B, C, s...] on the device. */
