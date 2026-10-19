@@ -17,6 +17,7 @@
  *=========================================================================*/
 
 #include "gtest/gtest.h"
+#include <ATen/record_function.h>
 
 #include <chrono>
 #include <thread>
@@ -51,10 +52,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <random>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -987,11 +990,11 @@ MakeMetric(const char * lossName, const char * mode, const char * device, itk::T
 
 // Online mode runs the model on a batch of points at a time, so what a point contributes must not
 // depend on which batch it happened to land in. For a loss that is a mean of per-point terms that
-// is arithmetic. For NCC it is not: NCC correlates the sampled points with one another, and it
-// holds only because the derivative is accumulated as sums and combined in closed form once every
-// point has been seen. Seeding the backward pass with NCC's own gradient instead would measure the
-// correlation WITHIN a batch -- which at a batch of one is a zero variance, hence an identically
-// zero gradient, silently.
+// is arithmetic. For NCC it is not: NCC correlates the sampled points with one another, so its
+// gradient with respect to one point's features is only known once every point has been seen, and
+// a first pass sees them all before the backward passes. Seeding them with the gradient of NCC
+// within a batch would measure the correlation WITHIN that batch -- which at a batch of one is a
+// zero variance, hence an identically zero gradient, silently.
 TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
 {
   using MetricType = RampMetricType;
@@ -1078,6 +1081,129 @@ TEST(ImpactMetric, JacobianOnTheGpuMatchesTheCpu)
     }
     ASSERT_GT(norm, 1e-12);
     EXPECT_LT(std::sqrt(difference / norm), 1e-2);
+  }
+}
+
+// The passes a model makes, counted as the convolutions run forward and backward, on every thread,
+// while the counter lives. The toy model is one convolution, so a count is a number of passes: a
+// cost that no machine and no load changes, which a test can hold exactly.
+class ModelPassCounter
+{
+public:
+  ModelPassCounter()
+    : m_Handle(at::addGlobalCallback(at::RecordFunctionCallback(&ModelPassCounter::Count)))
+  {
+    Reset();
+  }
+  ~ModelPassCounter() { at::removeCallback(m_Handle); }
+  ModelPassCounter(const ModelPassCounter &) = delete;
+  ModelPassCounter &
+  operator=(const ModelPassCounter &) = delete;
+
+  static std::atomic<int> &
+  Forward()
+  {
+    static std::atomic<int> count{ 0 };
+    return count;
+  }
+  static std::atomic<int> &
+  Backward()
+  {
+    static std::atomic<int> count{ 0 };
+    return count;
+  }
+  static void
+  Reset()
+  {
+    Forward() = 0;
+    Backward() = 0;
+  }
+
+private:
+  static std::unique_ptr<at::ObserverContext>
+  Count(const at::RecordFunction & function)
+  {
+    const std::string_view name = function.name();
+    if (name == "aten::convolution")
+    {
+      ++Forward();
+    }
+    else if (name == "aten::convolution_backward")
+    {
+      ++Backward();
+    }
+    return nullptr;
+  }
+
+  at::CallbackHandle m_Handle;
+};
+
+// What the online mode costs on any machine is how often it runs the models. A batch takes one
+// forward pass of each model and one backward pass for a loss that is a mean of per-point terms
+// (L2); a global one (NCC) takes one more forward pass of the moving model, the first pass that
+// sees every point before the backward ones; a value alone takes no backward pass. On a GPU the
+// whole evaluation is one batch. A backward pass per channel, or batches of a few points, multiply
+// these counts.
+TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  auto check = [&](const char * lossName, const char * device, unsigned int batchSize) {
+    SCOPED_TRACE(std::string(lossName) + " on " + device);
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 4 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(1);
+    metric->SetDevice(device);
+    metric->SetBatchSize(batchSize);
+    auto transform = itk::TranslationTransform<double, 3>::New();
+    transform->SetIdentity();
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+
+    MetricType::MeasureType    value;
+    MetricType::DerivativeType derivative;
+    ModelPassCounter           counter;
+    metric->GetValueAndDerivative(value, derivative);
+    const auto points = static_cast<int>(metric->GetNumberOfValidPoints());
+    const int  batches = batchSize > 0 ? (points + static_cast<int>(batchSize) - 1) / static_cast<int>(batchSize) : 1;
+    ASSERT_GT(points, 0);
+    EXPECT_EQ(ModelPassCounter::Forward(), (std::string(lossName) == "NCC" ? 3 : 2) * batches);
+    EXPECT_EQ(ModelPassCounter::Backward(), batches);
+
+    ModelPassCounter::Reset();
+    metric->GetValue();
+    EXPECT_EQ(ModelPassCounter::Forward(), 2 * batches);
+    EXPECT_EQ(ModelPassCounter::Backward(), 0);
+  };
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    check(lossName, "cpu", 100);
+    if (torch::cuda::is_available())
+    {
+      check(lossName, "cuda", 0);
+    }
   }
 }
 
