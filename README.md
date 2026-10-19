@@ -312,7 +312,8 @@ lives behind opaque handles), so the Python bindings build without exposing `tor
   its largest axis until it does. See `itkImpactBatchBudget.h`.
 - Speed. `ImpactMetric.OnlineModeRunsTheModelsOnceABatch` counts how often the online mode runs
   the models, a cost no machine changes. `benchmarks/ab.sh BUILD_DIR REF [REV]` times two
-  revisions side by side on one machine, busy or not.
+  revisions side by side on one machine, busy or not. The metric runs each of its threads on one
+  OpenMP thread; with a single work unit on a busy machine, `OMP_NUM_THREADS=1` does the same.
 - Displacement fields are `itk::Image<itk::Vector<float, N>, N>`.
 - The feature path runs each model once on the whole volume and warps the resulting feature
   maps; layers may be coarser than the input and are handled at their native (possibly

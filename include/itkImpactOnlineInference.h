@@ -51,6 +51,43 @@ namespace itk
 namespace Impact
 {
 
+/** \class OneOpenMPThread
+ * \ingroup Impact
+ * \brief While it lives, the calling thread runs its LibTorch operations on one OpenMP thread.
+ *
+ * Only when \p shared, i.e. when other threads share the work out with the calling thread; on as
+ * many as before once it is gone. LibTorch spreads an operation over as many OpenMP threads as the
+ * calling thread allows, and threads that already share the work out each ran a team as large as
+ * the machine: an online evaluation of the v4 metric took three times as long. A thread that works
+ * alone keeps them all. LibTorch's native backend has one pool for the process instead, whose size
+ * cannot change once it runs: there this does nothing. */
+class OneOpenMPThread
+{
+public:
+  explicit OneOpenMPThread(bool shared)
+    : m_Previous(shared && AT_PARALLEL_OPENMP ? at::get_num_threads() : 1)
+  {
+    if (m_Previous != 1)
+    {
+      at::set_num_threads(1);
+    }
+  }
+  ~OneOpenMPThread()
+  {
+    if (m_Previous != 1)
+    {
+      at::set_num_threads(m_Previous);
+    }
+  }
+  OneOpenMPThread(const OneOpenMPThread &) = delete;
+  OneOpenMPThread &
+  operator=(const OneOpenMPThread &) = delete;
+
+private:
+  const int m_Previous;
+};
+
+
 /** The shape a sampled patch must be given as a tensor.
  *
  * The host framework fills a flat buffer in GetPatchIndex() order, which runs ITK axis 0

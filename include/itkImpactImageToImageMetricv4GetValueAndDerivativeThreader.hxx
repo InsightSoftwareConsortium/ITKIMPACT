@@ -134,6 +134,9 @@ void
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
   AfterThreadedExecution()
 {
+  // The reductions below, and the small operations of the online passes, are not worth a team.
+  const Impact::OneOpenMPThread oneThread(this->GetNumberOfWorkUnitsUsed() > 1);
+
   // Let the base reduce the valid-point count (and per-point derivative contributions,
   // if any). It also sets m_Value from the per-point measures, which we leave at zero
   // and override below with the IMPACT loss value.
@@ -183,8 +186,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   // Online, walking point by point would cost one forward and one backward pass each; Static, a
   // few small tensor operations each, and the framework's walk also computed an image gradient
   // per point that IMPACT never reads.
-  std::vector<Sample>   samples = this->CollectSamples(domain);
-  LossPerThreadStruct & loss = this->m_LossThreadStruct[threadId];
+  const Impact::OneOpenMPThread oneThread(this->GetNumberOfWorkUnitsUsed() > 1);
+  std::vector<Sample>           samples = this->CollectSamples(domain);
+  LossPerThreadStruct &         loss = this->m_LossThreadStruct[threadId];
 
   // ProcessVirtualPoint() would have kept these counts and we bypassed it: the first is what
   // the base metric reduces into GetNumberOfValidPoints(), the second what normalizes the loss.
@@ -642,7 +646,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
         0,
         parts,
         [&](SizeValueType part) {
-          const auto p = static_cast<int64_t>(part);
+          const Impact::OneOpenMPThread oneThread(parts > 1);
+          const auto                    p = static_cast<int64_t>(part);
           for (int64_t begin = count * p / parts, end = count * (p + 1) / parts; begin < end; begin += batch)
           {
             evaluate(begin, std::min(begin + batch, end), false, this->m_LossThreadStruct[part]);
