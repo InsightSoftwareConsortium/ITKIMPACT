@@ -310,6 +310,9 @@ lives behind opaque handles), so the Python bindings build without exposing `tor
   still fails is halved and replayed. `BatchSize` on the v4 metric is only a cap. In Static
   mode a patch size of `0` runs the whole image, and an image that does not fit is split along
   its largest axis until it does. See `itkImpactBatchBudget.h`.
+- Speed. `ImpactMetric.OnlineModeRunsTheModelsOnceABatch` counts how often the online mode runs
+  the models, a cost no machine changes. `benchmarks/ab.sh BUILD_DIR REF [REV]` times two
+  revisions side by side on one machine, busy or not.
 - Displacement fields are `itk::Image<itk::Vector<float, N>, N>`.
 - The feature path runs each model once on the whole volume and warps the resulting feature
   maps; layers may be coarser than the input and are handled at their native (possibly
