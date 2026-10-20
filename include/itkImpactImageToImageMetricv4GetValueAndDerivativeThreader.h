@@ -22,6 +22,7 @@
 #include <itkImageToImageMetricv4GetValueAndDerivativeThreader.h>
 #include "ImpactLoss.h"
 #include "itkImpactLossNormalization.h"
+#include "itkImpactOnlineInference.h" // Impact::OnlineBatch, Impact::EvaluateOnline
 #include <algorithm>
 #include <functional>
 #include <random>
@@ -257,49 +258,17 @@ protected:
               torch::Tensor & movingGradients,
               bool            computeDerivative) const;
 
-  /** A batch of points as the models take it, sampled on the CPU: per model, the fixed and
-   * moving patches ([B, nVox]) and the moving interpolator's gradient at every patch voxel
-   * ([B, nVox, MovingDim]); the moving transform's Jacobian ([B, MovingDim, P]) and the global
-   * parameter index of each of its columns ([B, P]). */
-  struct PatchBatch
-  {
-    std::vector<torch::Tensor> m_FixedPatches;
-    std::vector<torch::Tensor> m_MovingPatches;
-    std::vector<torch::Tensor> m_MovingGradients;
-    torch::Tensor              m_TransformJacobian;
-    torch::Tensor              m_NonZeroJacobianIndices;
-  };
-
   /** Cut the moving patches of a batch of points, the fixed ones with \p fixed, and with
    * \p derivative the moving gradients and the transform's Jacobian at each; over all the threads
    * when \p parallel, which a thread already running its own share leaves off. */
-  PatchBatch
+  Impact::OnlineBatch
   SampleBatch(typename std::vector<Sample>::const_iterator first,
               typename std::vector<Sample>::const_iterator last,
               bool                                         parallel,
               bool                                         derivative,
               bool                                         fixed) const;
 
-  /** A batch of patch values, [B, nVox], as model \p model of the moving or the fixed image takes
-   * them: [B, C, s...] on the device. */
-  torch::Tensor
-  ModelPatches(const torch::Tensor & values, size_t model, bool moving) const;
-
-  /** Run model \p model of the moving or the fixed image on \p patches: the central feature vector
-   * of every kept layer, at the channels its comparison samples, [B, C] each on the device.
-   * \p comparison is the first of the model's comparisons. */
-  std::vector<torch::Tensor>
-  Features(size_t model, bool moving, const torch::Tensor & patches, size_t comparison) const;
-
-  /** d(loss)/d(parameter) of a batch at every comparison, [B, 1, P] each, to be added at the
-   * batch's NonZeroJacobianIndices. The moving models run with gradient, and each comparison's
-   * backward pass is seeded with `modulator(comparison, movingFeatures)`: d(loss)/d(feature) at
-   * the batch's points, [B, C]. */
-  std::vector<torch::Tensor>
-  Backpropagate(const PatchBatch &                                            batch,
-                const std::function<torch::Tensor(size_t, torch::Tensor &)> & modulator) const;
-
-  /** Online mode: run the models on the points every work unit collected. */
+  /** Online mode: run the models on the points every work unit collected (Impact::EvaluateOnline). */
   void
   EvaluateOnline();
 

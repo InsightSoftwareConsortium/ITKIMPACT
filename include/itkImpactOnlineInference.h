@@ -41,6 +41,8 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <string>
@@ -482,6 +484,344 @@ GenerateOutputsAndJacobian(
   }
   return layersJacobian;
 } // end GenerateOutputsAndJacobian
+
+/** A batch of points as the host of an online evaluation cuts them, on the CPU: per model, the fixed and moving
+ * patches ([B, nVox], image axis 0 fastest, see PatchTensorShape) and the moving image's spatial gradient at every
+ * patch voxel ([B, nVox, MovingDim]); the moving transform's Jacobian ([B, MovingDim, P]) and the global parameter
+ * index of each of its columns ([B, P]). The gradients and the Jacobian only with a derivative; the fixed patches
+ * undefined when the host keeps the fixed features of these points (OnlineHost::KeptFixedFeatures). */
+struct OnlineBatch
+{
+  std::vector<torch::Tensor> fixedPatches;
+  std::vector<torch::Tensor> movingPatches;
+  std::vector<torch::Tensor> movingGradients;
+  torch::Tensor              transformJacobian;
+  torch::Tensor              nonZeroJacobianIndices;
+};
+
+/** Code built against several versions of this header (benchmarks/ab.sh) tests for OnlineHost with this. */
+#define ITK_IMPACT_HAS_ONLINE_HOST 1
+
+/** \class OnlineHost
+ * \ingroup Impact
+ * \brief What EvaluateOnline asks of the metric it evaluates: its points, by row, and its threads. */
+class OnlineHost
+{
+public:
+  virtual ~OnlineHost() = default;
+  /** The points [begin, end), cut over all the host's threads when `parallel` (a thread already running its own share
+   * leaves it off): the fixed patches with `fixed`, the gradients and the Jacobian with `derivative`. */
+  virtual OnlineBatch
+  Sample(int64_t begin, int64_t end, bool parallel, bool derivative, bool fixed) const = 0;
+  /** Run `body(part)` for every part in [0, parts), on the host's threads. */
+  virtual void
+  Parallelize(int64_t parts, const std::function<void(int64_t)> & body) const = 0;
+  /** The fixed features, [B, C] per comparison on the CPU, of the points [begin, end) of a batch the host cut without
+   * fixed patches. */
+  virtual std::vector<torch::Tensor>
+  KeptFixedFeatures(int64_t, int64_t) const
+  {
+    return {};
+  }
+  /** The fixed features of the points [begin, end), computed from their patches, for a host that keeps them. */
+  virtual void
+  KeepFixedFeatures(int64_t, int64_t, const std::vector<torch::Tensor> &) const
+  {}
+};
+
+/** The models and settings of an online evaluation. Both images are cut to the fixed configurations' patches. */
+struct OnlineSettings
+{
+  const std::vector<ImpactModelConfiguration> & fixedConfigurations;
+  const std::vector<ImpactModelConfiguration> & movingConfigurations;
+  /** Per comparison (kept layer, in model then mask order), the channels compared, on the device. */
+  const std::vector<torch::Tensor> & subsets;
+  torch::Device                      device;
+  /** Points per forward pass: on a GPU capped by the device budget (itkImpactBatchBudget.h), 0 = the budget alone; on
+   * the CPU 0 = 64. */
+  int64_t batchSize;
+  /** How many parts the CPU splits the points into, one per thread, each with its own losses. */
+  int64_t workUnits;
+  /** The images' metadata the models take; null: each configuration's own. */
+  const ImpactImageMetadata * fixedMetadata = nullptr;
+  const ImpactImageMetadata * movingMetadata = nullptr;
+};
+
+/** A batch of patch values, [B, nVox], as model `model` of the fixed or the moving image takes them: [B, C, s...] on
+ * the device. PatchTensorShape is the one place that knows the spatial extents are reversed; the single intensity
+ * channel is repeated to the channel count the model expects. */
+inline torch::Tensor
+OnlineModelPatches(const OnlineSettings & settings, const torch::Tensor & values, size_t model, bool moving)
+{
+  const ImpactModelConfiguration & fixedConfig = settings.fixedConfigurations[model];
+  const ImpactModelConfiguration & config = moving ? settings.movingConfigurations[model] : fixedConfig;
+  const std::vector<int64_t>       spatial = PatchTensorShape(fixedConfig);
+  std::vector<int64_t>             shape{ values.size(0), 1 };
+  shape.insert(shape.end(), spatial.begin(), spatial.end());
+  std::vector<int64_t> channels(shape.size(), 1);
+  channels[1] = static_cast<int64_t>(fixedConfig.GetNumberOfChannels());
+  return values.reshape(shape).repeat(channels).to(settings.device).to(GetModelDtype(config));
+}
+
+/** Model `model` of the fixed or the moving image run on `patches`: the central feature vector of every kept layer,
+ * normalized as the configuration says, at the channels its comparison samples, [B, C] each on the device.
+ * `comparison` is the model's first. */
+inline std::vector<torch::Tensor>
+OnlineFeatures(const OnlineSettings & settings,
+               size_t                 model,
+               bool                   moving,
+               const torch::Tensor &  patches,
+               size_t                 comparison)
+{
+  const ImpactModelConfiguration & config =
+    moving ? settings.movingConfigurations[model] : settings.fixedConfigurations[model];
+  const ImpactImageMetadata *     metadata = moving ? settings.movingMetadata : settings.fixedMetadata;
+  std::vector<torch::jit::IValue> outputs = metadata ? Forward(config, patches, *metadata) : Forward(config, patches);
+  const std::vector<bool> &       mask = config.GetLayersMask();
+  std::vector<torch::Tensor>      features;
+  for (size_t it = 0; it < mask.size(); ++it)
+  {
+    if (!mask[it])
+    {
+      continue;
+    }
+    torch::Tensor layer = outputs[it].toTensor(); // [B, C, s...] -> [B, C], the patch's central voxel
+    while (layer.dim() > 2)
+    {
+      layer = layer.select(2, layer.size(2) / 2);
+    }
+    features.push_back(NormalizeFeatureChannels(layer.to(torch::kFloat32), config.GetFeatureNormalization(), 1)
+                         .index_select(1, settings.subsets[comparison++]));
+  }
+  return features;
+}
+
+/** d(loss)/d(parameter) of a batch at every comparison, [B, 1, P] each on the CPU, to be added at the batch's
+ * nonZeroJacobianIndices. The moving models run with gradient, and each comparison's backward pass is seeded with
+ * `modulator(comparison, movingFeatures)`: d(loss)/d(feature) at the batch's points, [B, C]. */
+inline std::vector<torch::Tensor>
+OnlineBackpropagate(const OnlineSettings &                                        settings,
+                    const OnlineBatch &                                           batch,
+                    const std::function<torch::Tensor(size_t, torch::Tensor &)> & modulator)
+{
+  std::vector<torch::Tensor> jacobians; // one per comparison, in order
+  for (size_t i = 0; i < batch.movingPatches.size(); ++i)
+  {
+    // The patch values are the autograd leaf: differentiating the features with respect to them and contracting with
+    // the moving image's spatial gradients gives d(feature)/d(moving coordinate) for the whole batch at once. One
+    // forward pass serves every kept layer, so the graph has to survive until the last of them is done.
+    const torch::Tensor patches =
+      OnlineModelPatches(settings, batch.movingPatches[i], i, true).detach().set_requires_grad(true);
+    const std::vector<torch::Tensor> layers = OnlineFeatures(settings, i, true, patches, jacobians.size());
+    // d(patch value)/d(moving coordinate), tiled once per repeated channel so that it lines up with the flattened
+    // gradient below: summing over the copies sums over the channel axis, which is exactly the derivative with
+    // respect to the underlying intensity.
+    const torch::Tensor patchGradients =
+      batch.movingGradients[i].to(settings.device).repeat({ 1, patches.size(1), 1 }); // [B, C * nVox, MovingDim]
+    for (size_t k = 0; k < layers.size(); ++k)
+    {
+      torch::Tensor       features = layers[k].detach().to(torch::kCPU);
+      const torch::Tensor seed = modulator(jacobians.size(), features).to(settings.device).to(layers[k].dtype());
+      const torch::Tensor gradient =
+        torch::autograd::grad({ layers[k] }, { patches }, { seed }, k + 1 < layers.size(), false)[0];
+      // d(.)/d(moving coordinate), [B, 1, MovingDim], and then d(.)/d(parameter), [B, 1, P].
+      const torch::Tensor coordinate = torch::bmm(gradient.flatten(1).unsqueeze(1).to(torch::kFloat32), patchGradients);
+      jacobians.push_back(torch::bmm(coordinate.to(torch::kCPU), batch.transformJacobian));
+    }
+  }
+  return jacobians;
+}
+
+/** The online (Jacobian) evaluation of an IMPACT metric over `count` points: their loss value and, with
+ * `computeDerivative`, its derivative, accumulated into `lossesOf(part)`, the losses of part `part`, which the host
+ * then sums over the parts.
+ *
+ * On the CPU the threads are the parallelism: each runs the models on its own share of the points, a batch at a time,
+ * on one OpenMP thread. On a GPU one batch at a time, as large as the device holds, its patches cut by all the
+ * threads; a batch that runs out of memory is halved and replayed after the losses have been rewound.
+ *
+ * A loss is exact whatever the batches: a mean of per-point terms is known at a point from that point alone, while a
+ * global statistic (NCC, OrganDice) mixes the points, and d(loss)/d(feature) at one of them is only known once all
+ * have been seen. A batch that holds every point, as one on a GPU often does, sees them all; otherwise a first pass,
+ * without gradient, gathers the features of every point, from which each loss takes its value and that derivative,
+ * and a second carries it to the parameters.
+ *
+ * The host calls it, and sums the parts' losses after it, on one OpenMP thread when it has several (OneOpenMPThread):
+ * a derivative tens of thousands long, as a B-spline transform's, otherwise takes a team of threads for every
+ * operation, which competes with the host's own. */
+inline void
+EvaluateOnline(const OnlineSettings &                                                    settings,
+               const OnlineHost &                                                        host,
+               int64_t                                                                   count,
+               bool                                                                      computeDerivative,
+               const std::function<std::vector<std::unique_ptr<Loss>> &(int64_t part)> & lossesOf)
+{
+  if (count == 0)
+  {
+    return;
+  }
+  const torch::Device & device = settings.device;
+  auto &                losses = lossesOf(0);
+
+  // Run `evaluate(begin, end, parallel, losses)` over the points a batch at a time, `losses` being those of the part
+  // that runs it. With `whole`, in one batch or not at all: false, the losses as they were, when the device does not
+  // take every point at once.
+  auto inBatches = [&](const auto & evaluate, bool whole = false) {
+    if (!device.is_cuda())
+    {
+      if (whole)
+      {
+        return false;
+      }
+      const int64_t batch = settings.batchSize > 0 ? settings.batchSize : 64;
+      const int64_t parts = std::max<int64_t>(1, std::min<int64_t>(count, settings.workUnits));
+      host.Parallelize(parts, [&](int64_t part) {
+        const OneOpenMPThread oneThread(parts > 1);
+        for (int64_t begin = count * part / parts, end = count * (part + 1) / parts; begin < end; begin += batch)
+        {
+          evaluate(begin, std::min(begin + batch, end), false, lossesOf(part));
+        }
+      });
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(DeviceForwardMutex());
+    for (int64_t begin = 0; begin < count;)
+    {
+      const int64_t bound = EffectiveBatchSize(settings.movingConfigurations);
+      int64_t       batch = settings.batchSize > 0 ? settings.batchSize : count;
+      batch = std::max<int64_t>(bound > 0 ? std::min(batch, bound) : batch, 1);
+      const int64_t end = std::min(begin + batch, count);
+      if (whole && end - begin < count)
+      {
+        return false;
+      }
+      std::vector<Loss::State> before;
+      for (const auto & loss : losses)
+      {
+        before.push_back(loss->SaveState());
+      }
+      try
+      {
+        evaluate(begin, end, true, losses);
+        begin = end;
+      }
+      catch (const std::exception & error)
+      {
+        if (!IsDeviceOutOfMemory(error) || end - begin <= 1)
+        {
+          throw;
+        }
+        for (size_t l = 0; l < losses.size(); ++l)
+        {
+          losses[l]->RestoreState(before[l]);
+        }
+        for (const ImpactModelConfiguration & config : settings.movingConfigurations)
+        {
+          ShrinkBatchSize(config, end - begin, device);
+        }
+        if (whole)
+        {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+  // The feature vectors of one image of a batch at every comparison, [B, C] each on the CPU.
+  auto featuresOf = [&](const OnlineBatch & batch, bool moving) {
+    torch::NoGradGuard         noGrad;
+    std::vector<torch::Tensor> features;
+    for (size_t i = 0; i < settings.fixedConfigurations.size(); ++i)
+    {
+      const torch::Tensor & values = moving ? batch.movingPatches[i] : batch.fixedPatches[i];
+      for (const torch::Tensor & layer :
+           OnlineFeatures(settings, i, moving, OnlineModelPatches(settings, values, i, moving), features.size()))
+      {
+        features.push_back(layer.to(torch::kCPU));
+      }
+    }
+    return features;
+  };
+  // The fixed feature vectors of a batch: those the host keeps when it cut no fixed patch, else the fixed models'.
+  auto fixedOf = [&](const OnlineBatch & batch, int64_t begin, int64_t end) {
+    if (!batch.fixedPatches.front().defined())
+    {
+      return host.KeptFixedFeatures(begin, end);
+    }
+    std::vector<torch::Tensor> fixed = featuresOf(batch, false);
+    host.KeepFixedFeatures(begin, end, fixed);
+    return fixed;
+  };
+
+  auto singlePass = [&](int64_t begin, int64_t end, bool parallel, std::vector<std::unique_ptr<Loss>> & partLosses) {
+    const OnlineBatch          batch = host.Sample(begin, end, parallel, computeDerivative, true);
+    std::vector<torch::Tensor> fixed = fixedOf(batch, begin, end);
+    if (!computeDerivative)
+    {
+      std::vector<torch::Tensor> moving = featuresOf(batch, true);
+      for (size_t c = 0; c < fixed.size(); ++c)
+      {
+        partLosses[c]->updateValue(fixed[c], moving[c]);
+      }
+      return;
+    }
+    // The loss gives d(loss)/d(feature) at the batch's points with the batch's value, and one backward pass a
+    // comparison carries it to the parameters.
+    std::vector<torch::Tensor> jacobians = OnlineBackpropagate(settings, batch, [&](size_t c, torch::Tensor & moving) {
+      return partLosses[c]->updateValueAndGetGradientModulator(fixed[c], moving);
+    });
+    torch::Tensor              indices = batch.nonZeroJacobianIndices;
+    for (size_t c = 0; c < jacobians.size(); ++c)
+    {
+      partLosses[c]->updateDerivativeInJacobianMode(jacobians[c], indices);
+    }
+  };
+  const bool global =
+    computeDerivative && std::any_of(losses.begin(), losses.end(), [](const auto & l) { return !l->IsPerPointMean(); });
+  if (!global)
+  {
+    inBatches(singlePass);
+    return;
+  }
+  if (inBatches(singlePass, /*whole*/ true))
+  {
+    return;
+  }
+
+  std::vector<torch::Tensor> fixedFeatures, movingFeatures;
+  for (const torch::Tensor & subset : settings.subsets)
+  {
+    fixedFeatures.push_back(torch::empty({ count, subset.numel() }, torch::kFloat32));
+    movingFeatures.push_back(torch::empty({ count, subset.numel() }, torch::kFloat32));
+  }
+  inBatches([&](int64_t begin, int64_t end, bool parallel, std::vector<std::unique_ptr<Loss>> &) {
+    const OnlineBatch                batch = host.Sample(begin, end, parallel, false, true);
+    const std::vector<torch::Tensor> fixed = fixedOf(batch, begin, end);
+    const std::vector<torch::Tensor> moving = featuresOf(batch, true);
+    for (size_t c = 0; c < fixed.size(); ++c)
+    {
+      fixedFeatures[c].narrow(0, begin, end - begin).copy_(fixed[c]);
+      movingFeatures[c].narrow(0, begin, end - begin).copy_(moving[c]);
+    }
+  });
+  std::vector<torch::Tensor> modulators;
+  for (size_t c = 0; c < losses.size(); ++c)
+  {
+    modulators.push_back(losses[c]->updateValueAndGetGradientModulator(fixedFeatures[c], movingFeatures[c]));
+  }
+  std::mutex accumulating; // the CPU parts all add to part 0's derivative
+  inBatches([&](int64_t begin, int64_t end, bool parallel, std::vector<std::unique_ptr<Loss>> &) {
+    const OnlineBatch          batch = host.Sample(begin, end, parallel, true, false);
+    std::vector<torch::Tensor> jacobians = OnlineBackpropagate(
+      settings, batch, [&](size_t c, torch::Tensor &) { return modulators[c].narrow(0, begin, end - begin); });
+    torch::Tensor               indices = batch.nonZeroJacobianIndices;
+    std::lock_guard<std::mutex> lock(accumulating);
+    for (size_t c = 0; c < jacobians.size(); ++c)
+    {
+      losses[c]->updateDerivativeInJacobianMode(jacobians[c], indices);
+    }
+  });
+}
 
 
 } // namespace Impact
