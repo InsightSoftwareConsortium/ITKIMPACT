@@ -18,12 +18,12 @@
 #ifndef itkImpactOnlineInference_h
 #define itkImpactOnlineInference_h
 
-// Framework-neutral online ("Jacobian") inference shared one-way (Elastix -> ITKIMPACT):
-// patch-offset sampling, batched TorchScript forward, center extraction, and the autograd
-// value+Jacobian path used by the registration metrics. Depends only on the backend
+// Framework-neutral online ("Jacobian") evaluation shared one-way (Elastix -> ITKIMPACT): patch
+// offsets, batched TorchScript forward, center extraction and the autograd value+derivative path
+// both registration metrics run (EvaluateOnline). Depends only on the backend
 // ImpactModelConfiguration (+ its torch accessors) and the IMPACT losses, talking to the host
-// framework through point-sampling callbacks (ImagesPatchValues[AndJacobians]Evaluator).
-// Pulls in LibTorch; never part of the castxml-parsed public surface.
+// metric through an OnlineHost that cuts its patches. Pulls in LibTorch; never part of the
+// castxml-parsed public surface.
 
 #include "itkImpactModelConfiguration.h"
 #include "itkImpactModelConfigurationDetail.h"
@@ -144,21 +144,6 @@ PatchPlaneRotation(unsigned int seed, size_t modelIndex, const TIndex & index)
   plane[2][2] = cb * ca;
   return plane;
 }
-
-/** Callback evaluating a patch of image intensities around a point (value-only path). Its third
- * argument is the tensor shape the returned patch must have: see PatchTensorShape(). */
-template <typename ImagePointType>
-using ImagesPatchValuesEvaluator = std::function<
-  torch::Tensor(const ImagePointType &, const std::vector<std::vector<float>> &, const std::vector<int64_t> &)>;
-
-/** Callback evaluating a patch of image intensities and accumulating the per-voxel
- * intensity->coordinate Jacobian (derivative path). */
-template <typename ImagePointType>
-using ImagesPatchValuesAndJacobiansEvaluator = std::function<torch::Tensor(const ImagePointType &,
-                                                                           torch::Tensor &,
-                                                                           const std::vector<std::vector<float>> &,
-                                                                           const std::vector<int64_t> &,
-                                                                           int)>;
 
 inline std::vector<torch::Tensor>
 GetModelOutputsExample(std::vector<itk::ImpactModelConfiguration> & modelsConfig,
@@ -284,206 +269,6 @@ GetPatchIndex(const itk::ImpactModelConfiguration & modelConfiguration,
   }
   return patchIndex;
 } // end GetPatchIndex
-
-template <typename ImagePointType>
-std::vector<torch::Tensor>
-GenerateOutputs(const std::vector<itk::ImpactModelConfiguration> &                modelConfig,
-                const std::vector<ImagePointType> &                               fixedPoints,
-                const std::vector<std::vector<std::vector<std::vector<float>>>> & patchIndex,
-                const std::vector<torch::Tensor>                                  subsetsOfFeatures,
-                torch::Device                                                     device,
-                const ImagesPatchValuesEvaluator<ImagePointType> &                imagesPatchValuesEvaluator)
-{
-
-  std::vector<torch::Tensor> outputsTensor;
-  {
-    torch::NoGradGuard noGrad;
-    const auto         nbSample = static_cast<int64_t>(fixedPoints.size());
-
-    size_t a = 0;
-    for (size_t i = 0; i < modelConfig.size(); ++i)
-    {
-      const auto & config = modelConfig[i];
-
-      std::vector<int64_t> sizes(config.GetPatchSize().size() + 1, -1);
-      sizes[0] = nbSample;
-
-      const std::vector<int64_t> tensorShape = PatchTensorShape(config);
-      torch::Tensor patchValueTensor = torch::zeros({ torch::IntArrayRef(tensorShape) }, itk::GetModelDtype(config))
-                                         .unsqueeze(0)
-                                         .expand(sizes)
-                                         .unsqueeze(1)
-                                         .clone();
-
-      for (int64_t s = 0; s < nbSample; ++s)
-      {
-        patchValueTensor[s] =
-          imagesPatchValuesEvaluator(fixedPoints[s], patchIndex[i][s], tensorShape).to(itk::GetModelDtype(config));
-      }
-
-      std::vector<int64_t> resizeVector(patchValueTensor.dim(), 1);
-      resizeVector[1] = config.GetNumberOfChannels();
-
-      // Batched by the device budget (itkImpactBatchBudget.h); kept layers joined at the end.
-      const std::vector<bool> &               mask = config.GetLayersMask();
-      const auto                              kept = static_cast<size_t>(std::count(mask.begin(), mask.end(), true));
-      std::vector<std::vector<torch::Tensor>> batches(kept);
-      ForEachBatch(
-        config,
-        device,
-        nbSample,
-        [&](int64_t begin, int64_t end) {
-          torch::Tensor input = patchValueTensor.narrow(0, begin, end - begin)
-                                  .to(device)
-                                  .repeat({ torch::IntArrayRef(resizeVector) })
-                                  .clone();
-          std::vector<torch::jit::IValue> outputsList = itk::Forward(config, input);
-          std::vector<torch::Tensor>      layers;
-          layers.reserve(kept);
-          for (size_t it = 0; it < outputsList.size(); ++it)
-          {
-            if (mask[it])
-            {
-              const size_t k = layers.size();
-              // The point's feature vector normalized over all its channels, before the subset keeps a few.
-              layers.push_back(
-                Impact::NormalizeFeatureChannels(
-                  outputsList[it].toTensor().index(itk::GetCentersIndexLayers(config)[a + k]).to(torch::kFloat32),
-                  config.GetFeatureNormalization(),
-                  1)
-                  .index_select(1, subsetsOfFeatures[a + k]));
-            }
-          }
-          for (size_t k = 0; k < layers.size(); ++k)
-          {
-            batches[k].push_back(layers[k]);
-          }
-        },
-        [] {});
-      for (size_t k = 0; k < kept; ++k)
-      {
-        outputsTensor.push_back(torch::cat(batches[k], 0));
-      }
-      a += kept;
-    }
-  }
-  return outputsTensor;
-} // end GenerateOutputs
-
-template <typename ImagePointType>
-std::vector<torch::Tensor>
-GenerateOutputsAndJacobian(
-  const std::vector<itk::ImpactModelConfiguration> &                modelConfig,
-  const std::vector<ImagePointType> &                               fixedPoints,
-  const std::vector<std::vector<std::vector<std::vector<float>>>> & patchIndex,
-  std::vector<torch::Tensor>                                        subsetsOfFeatures,
-  std::vector<torch::Tensor>                                        fixedOutputsTensor,
-  torch::Device                                                     device,
-  std::vector<std::unique_ptr<itk::Impact::Loss>> &                 losses,
-  const ImagesPatchValuesAndJacobiansEvaluator<ImagePointType> &    imagesPatchValuesAndJacobiansEvaluator)
-{
-  std::vector<torch::Tensor> layersJacobian;
-
-  const auto   nbSample = static_cast<int64_t>(fixedPoints.size());
-  unsigned int dimension = fixedPoints[0].size();
-
-  size_t a = 0;
-  for (size_t i = 0; i < modelConfig.size(); ++i)
-  {
-    const auto & config = modelConfig[i];
-
-    std::vector<int64_t> sizes(config.GetPatchSize().size() + 1, -1);
-    sizes[0] = nbSample;
-
-    const std::vector<int64_t> tensorShape = PatchTensorShape(config);
-    torch::Tensor patchValueTensor = torch::zeros({ torch::IntArrayRef(tensorShape) }, itk::GetModelDtype(config))
-                                       .unsqueeze(0)
-                                       .expand(sizes)
-                                       .unsqueeze(1)
-                                       .clone();
-    torch::Tensor imagesPatchesJacobians =
-      torch::zeros({ nbSample, static_cast<int64_t>(patchIndex[i][0].size()), dimension }, torch::kFloat32);
-
-    for (int64_t s = 0; s < nbSample; ++s)
-    {
-      patchValueTensor[s] =
-        imagesPatchValuesAndJacobiansEvaluator(fixedPoints[s], imagesPatchesJacobians, patchIndex[i][s], tensorShape, s)
-          .to(itk::GetModelDtype(config));
-    }
-
-    std::vector<int64_t> resizeVector(patchValueTensor.dim(), 1);
-    resizeVector[1] = config.GetNumberOfChannels();
-    const auto channels = static_cast<int64_t>(config.GetNumberOfChannels());
-
-    const std::vector<bool> & mask = config.GetLayersMask();
-    const auto                kept = static_cast<size_t>(std::count(mask.begin(), mask.end(), true));
-    // The losses accumulate inside a batch; a replayed batch is rewound to what they held before.
-    std::vector<std::vector<torch::Tensor>> batches(kept);
-    std::vector<itk::Impact::Loss::State>   before(kept);
-    auto                                    rewind = [&]() {
-      for (size_t k = 0; k < kept; ++k)
-      {
-        losses[a + k]->RestoreState(before[k]);
-      }
-    };
-    ForEachBatch(
-      config,
-      device,
-      nbSample,
-      [&](int64_t begin, int64_t end) {
-        for (size_t k = 0; k < kept; ++k)
-        {
-          before[k] = losses[a + k]->SaveState();
-        }
-        const int64_t n = end - begin;
-        torch::Tensor input = patchValueTensor.narrow(0, begin, n)
-                                .to(device)
-                                .repeat({ torch::IntArrayRef(resizeVector) })
-                                .clone()
-                                .set_requires_grad(true);
-        torch::Tensor patchJacobians =
-          imagesPatchesJacobians.narrow(0, begin, n).to(device).repeat({ 1, channels, 1 }).clone();
-
-        std::vector<torch::jit::IValue> outputsList = itk::Forward(config, input);
-        std::vector<torch::Tensor>      jacobians;
-        jacobians.reserve(kept);
-        for (size_t it = 0; it < outputsList.size(); ++it)
-        {
-          if (!mask[it])
-          {
-            continue;
-          }
-          const size_t k = jacobians.size();
-          // Normalized inside the graph, so the Jacobian below carries the normalization too.
-          torch::Tensor layer =
-            Impact::NormalizeFeatureChannels(
-              outputsList[it].toTensor().index(itk::GetCentersIndexLayers(config)[a + k]).to(torch::kFloat32),
-              config.GetFeatureNormalization(),
-              1)
-              .index_select(1, subsetsOfFeatures[a + k]);
-          torch::Tensor fixedLayer = fixedOutputsTensor[a + k].narrow(0, begin, n);
-          torch::Tensor gradientModulator = losses[a + k]->updateValueAndGetGradientModulator(fixedLayer, layer);
-          jacobians.push_back(
-            torch::bmm(torch::autograd::grad({ layer }, { input }, { gradientModulator }, kept > 1, false)[0]
-                         .flatten(1)
-                         .unsqueeze(1)
-                         .to(torch::kFloat32),
-                       patchJacobians));
-        }
-        for (size_t k = 0; k < jacobians.size(); ++k)
-        {
-          batches[k].push_back(jacobians[k]);
-        }
-      },
-      rewind);
-    for (size_t k = 0; k < kept; ++k)
-    {
-      layersJacobian.push_back(torch::cat(batches[k], 0));
-    }
-    a += kept;
-  }
-  return layersJacobian;
-} // end GenerateOutputsAndJacobian
 
 /** A batch of points as the host of an online evaluation cuts them, on the CPU: per model, the fixed and moving
  * patches ([B, nVox], image axis 0 fastest, see PatchTensorShape) and the moving image's spatial gradient at every

@@ -2017,17 +2017,17 @@ TEST(ImpactBackend, AnisotropicPatchIsTiledInItkAxisOrder)
   EXPECT_LT(diffAt(4, 8, 8), 1e-3) << "x = 4 is interior to its patch: no seam may appear";
 }
 
-// Online mode runs its samples through the model in batches bounded by the device budget
-// (itkImpactBatchBudget.h); nothing may depend on where the batches are cut.
+// Online mode runs its samples through the models in batches (the threads' shares on the CPU, bounded by the device
+// budget on a GPU, itkImpactBatchBudget.h); nothing may depend on where the batches are cut, not even the derivative of
+// a global loss such as NCC, which takes every point.
 namespace
 {
 struct OnlineFixture
 {
-  std::vector<itk::ImpactModelConfiguration>                configs;
-  std::vector<itk::Point<double, 3>>                        points;
-  std::vector<std::vector<std::vector<std::vector<float>>>> patchIndex{ 1 };
-  std::vector<torch::Tensor> subset{ torch::arange(4, torch::kInt64), torch::arange(1, torch::kInt64) };
-  torch::Device              device{ torch::kCPU };
+  std::vector<itk::ImpactModelConfiguration> configs;
+  std::vector<itk::Point<double, 3>>         points;
+  std::vector<torch::Tensor>                 subset{ torch::arange(4, torch::kInt64), torch::arange(1, torch::kInt64) };
+  torch::Device                              device{ torch::kCPU };
 
   explicit OnlineFixture(size_t samples)
   {
@@ -2043,7 +2043,6 @@ struct OnlineFixture
     for (size_t s = 0; s < samples; ++s)
     {
       points.emplace_back(itk::MakePoint(static_cast<double>(s), 0.0, 0.0)); // the sample rides on x
-      patchIndex[0].push_back(configs[0].GetPatchIndex());
     }
   }
   // Intensities that depend on the sample, so batches cannot be confused by accident.
@@ -2059,55 +2058,102 @@ struct OnlineFixture
 };
 } // namespace
 
-TEST(ImpactBackend, OnlineInferenceIsIndependentOfTheBatchBound)
+TEST(ImpactBackend, OnlineEvaluationIsIndependentOfTheBatches)
 {
-  constexpr size_t samples = 7;
-  OnlineFixture    fx(samples);
-  auto             values = [](const itk::Point<double, 3> & point,
-                   const std::vector<std::vector<float>> &,
-                   const std::vector<int64_t> & shape) { return OnlineFixture::patch(point, shape, 0.0); };
-  auto             valuesAndJacobians = [](const itk::Point<double, 3> &           point,
-                               torch::Tensor &                         jacobians,
-                               const std::vector<std::vector<float>> & index,
-                               const std::vector<int64_t> &            shape,
-                               int                                     s) {
-    jacobians[s] = torch::arange(static_cast<int64_t>(index.size()), torch::kFloat32).unsqueeze(1).repeat({ 1, 3 }) *
-                     0.01f * static_cast<float>(s + 1) +
-                   0.5f;
-    return OnlineFixture::patch(point, shape, 1.0);
+  // The points of the fixture, cut by a host: patches that depend on the sample, deterministic gradients and a
+  // two-parameter transform Jacobian.
+  constexpr int64_t samples = 7, parameters = 2;
+  OnlineFixture     fx(samples);
+  class Host : public itk::Impact::OnlineHost
+  {
+  public:
+    explicit Host(const OnlineFixture & fixture)
+      : m_Fixture(fixture)
+    {}
+    itk::Impact::OnlineBatch
+    Sample(int64_t begin, int64_t end, bool, bool derivative, bool fixed) const override
+    {
+      const std::vector<int64_t> shape = itk::Impact::PatchTensorShape(m_Fixture.configs[0]);
+      std::vector<torch::Tensor> fixedRows, movingRows, gradients, jacobians;
+      for (int64_t s = begin; s < end; ++s)
+      {
+        const auto & point = m_Fixture.points[static_cast<size_t>(s)];
+        fixedRows.push_back(OnlineFixture::patch(point, shape, 0.0).flatten());
+        movingRows.push_back(OnlineFixture::patch(point, shape, 1.0).flatten());
+        const int64_t voxels = movingRows.back().numel();
+        gradients.push_back(torch::arange(voxels, torch::kFloat32).unsqueeze(1).repeat({ 1, 3 }) * 0.01f *
+                              static_cast<float>(s + 1) +
+                            0.5f);
+        jacobians.push_back(torch::arange(3 * parameters, torch::kFloat32).reshape({ 3, parameters }) * 0.1f +
+                            0.01f * static_cast<float>(s));
+      }
+      itk::Impact::OnlineBatch batch;
+      batch.fixedPatches.push_back(fixed ? torch::stack(fixedRows) : torch::Tensor());
+      batch.movingPatches.push_back(torch::stack(movingRows));
+      if (derivative)
+      {
+        batch.movingGradients.push_back(torch::stack(gradients));
+        batch.transformJacobian = torch::stack(jacobians);
+        batch.nonZeroJacobianIndices = torch::arange(parameters, torch::kInt64).repeat({ end - begin, 1 });
+      }
+      return batch;
+    }
+    void
+    Parallelize(int64_t parts, const std::function<void(int64_t)> & body) const override
+    {
+      for (int64_t part = 0; part < parts; ++part)
+      {
+        body(part);
+      }
+    }
+
+  private:
+    const OnlineFixture & m_Fixture;
   };
-  auto run = [&](int64_t bound) {
-    itk::SetBatchSize(fx.configs[0], bound);
-    std::vector<torch::Tensor> fixedOutputs = itk::Impact::GenerateOutputs<itk::Point<double, 3>>(
-      fx.configs, fx.points, fx.patchIndex, fx.subset, fx.device, values);
-    std::vector<std::unique_ptr<itk::Impact::Loss>> losses;
-    for (size_t i = 0; i < fixedOutputs.size(); ++i)
+  const Host host(fx);
+  // The value and the derivative of both kept layers, the parts' losses summed.
+  auto run = [&](const std::string & distance, int64_t batch, int64_t parts) {
+    std::vector<std::vector<std::unique_ptr<itk::Impact::Loss>>> losses(static_cast<size_t>(parts));
+    for (auto & part : losses)
     {
-      losses.push_back(itk::Impact::LossFactory::Instance().Create("L2"));
-      losses.back()->SetNumberOfParameters(1);
+      for (size_t layer = 0; layer < fx.subset.size(); ++layer)
+      {
+        part.push_back(itk::Impact::LossFactory::Instance().Create(distance));
+        part.back()->SetNumberOfParameters(parameters);
+      }
     }
-    std::vector<torch::Tensor> jacobians = itk::Impact::GenerateOutputsAndJacobian<itk::Point<double, 3>>(
-      fx.configs, fx.points, fx.patchIndex, fx.subset, fixedOutputs, fx.device, losses, valuesAndJacobians);
-    std::vector<double> lossValues;
-    for (const auto & loss : losses)
+    const itk::Impact::OnlineSettings settings{ fx.configs, fx.configs, fx.subset, fx.device, batch, parts };
+    itk::Impact::EvaluateOnline(
+      settings, host, samples, true, [&](int64_t part) -> std::vector<std::unique_ptr<itk::Impact::Loss>> & {
+        return losses[static_cast<size_t>(part)];
+      });
+    std::vector<std::pair<double, torch::Tensor>> layers;
+    for (size_t layer = 0; layer < fx.subset.size(); ++layer)
     {
-      lossValues.push_back(loss->GetValue(samples));
+      for (size_t part = 1; part < losses.size(); ++part)
+      {
+        *losses[0][layer] += *losses[part][layer];
+      }
+      layers.emplace_back(losses[0][layer]->GetValue(samples), losses[0][layer]->GetDerivative(samples));
     }
-    return std::make_tuple(fixedOutputs, jacobians, lossValues);
+    return layers;
   };
 
-  const auto [outputsAll, jacobiansAll, valuesAll] = run(0);
-  ASSERT_EQ(outputsAll.size(), 2u);
-  ASSERT_EQ(outputsAll[0].sizes(), (std::vector<int64_t>{ samples, 4 }));
-  EXPECT_GT(valuesAll[0], 0.0);
-  for (const int64_t bound : { 3, 1, 100 })
+  for (const std::string distance : { "L2", "NCC" })
   {
-    const auto [outputs, jacobians, lossValues] = run(bound);
-    for (size_t k = 0; k < 2; ++k)
+    const auto whole = run(distance, samples, 1);
+    ASSERT_GT(whole[0].second.abs().sum().item<double>(), 0.0) << distance << ": no derivative";
+    for (const auto & [batch, parts] : { std::pair<int64_t, int64_t>{ 3, 1 }, { 1, 3 }, { 2, 2 }, { 0, 4 } })
     {
-      EXPECT_TRUE(torch::allclose(outputs[k], outputsAll[k], 1e-6, 1e-6)) << "layer " << k << " bound " << bound;
-      EXPECT_TRUE(torch::allclose(jacobians[k], jacobiansAll[k], 1e-5, 1e-6)) << "layer " << k << " bound " << bound;
-      EXPECT_NEAR(lossValues[k], valuesAll[k], 1e-6 * std::abs(valuesAll[k]) + 1e-9) << "layer " << k;
+      const auto split = run(distance, batch, parts);
+      for (size_t layer = 0; layer < whole.size(); ++layer)
+      {
+        EXPECT_NEAR(split[layer].first, whole[layer].first, 1e-6 * std::abs(whole[layer].first) + 1e-9)
+          << distance << ", layer " << layer << ", batches of " << batch << " over " << parts << " parts";
+        EXPECT_TRUE(torch::allclose(split[layer].second, whole[layer].second, 1e-4, 1e-7))
+          << distance << ", layer " << layer << ", batches of " << batch << " over " << parts
+          << " parts: " << split[layer].second << " vs " << whole[layer].second;
+      }
     }
   }
 }
@@ -2222,12 +2268,11 @@ TEST(ImpactBackend, WholeImagePatchShrinksLargestZeroAxisFirst)
 // on a volume is run slice by slice, along the last ITK axis. The passthrough layer must
 // therefore reconstruct the volume exactly -- every slice is blended into a partition of unity
 // of its own -- and the swept axis must keep its extent and its spacing.
-// The online path exists only for the elastix metric, which samples a patch into a flat buffer
-// in GetPatchIndex() order -- ITK axis 0 fastest -- and hands it back as a tensor. A row-major
-// tensor over that buffer therefore has ITK x as its LAST, fastest axis, so its shape is the
-// patch size reversed. Give it the un-reversed shape and every axis but the middle one is
-// misread: for [3, 5, 7] the model is not handed a transposed patch but a re-partitioned one.
-// Isotropic patches hide this completely, which is why it needs a test of its own.
+// An online host (the elastix metric) samples a patch into a flat row in GetPatchIndex() order -- ITK axis 0
+// fastest -- and Impact::OnlineModelPatches shapes it for the model. A row-major tensor over that row therefore has
+// ITK x as its LAST, fastest axis, so its shape is the patch size reversed (PatchTensorShape). Give it the un-reversed
+// shape and every axis but the middle one is misread: for [3, 5, 7] the model is not handed a transposed patch but a
+// re-partitioned one. Isotropic patches hide this completely, which is why it needs a test of its own.
 TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
 {
   const std::vector<unsigned int> patch = { 3, 5, 7 }; // x, y, z -- no two axes equal
@@ -2243,8 +2288,7 @@ TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
 
   const torch::Device                        device(torch::kCPU);
   std::vector<itk::ImpactModelConfiguration> configs{ config };
-  // Probes the model and records where the center of each output layer is; GenerateOutputs
-  // needs it, and it is the same call the metric makes before its first evaluation.
+  // Probes the model, as the metric does before its first evaluation.
   ASSERT_NO_THROW(itk::Impact::GetModelOutputsExample(configs, "fixed", device));
 
   // An intensity that depends on all three axes differently, so a re-partitioned patch cannot
@@ -2267,30 +2311,25 @@ TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
     referenceCenter = itk::Forward(configs[0], reference)[0].toTensor().index({ "...", pz / 2, py / 2, px / 2 });
   }
 
-  // What the elastix evaluator does: fill a flat buffer in patch-offset order, then wrap it in
-  // a tensor at the shape it was handed. The offsets carry (index - patchSize/2) at unit voxel
-  // size, so the index each one came from is recoverable.
-  auto evaluator = [&](const itk::Point<double, 3> &,
-                       const std::vector<std::vector<float>> & patchIndex,
-                       const std::vector<int64_t> &            shape) {
-    std::vector<float> values(patchIndex.size(), 0.0f);
-    for (size_t i = 0; i < patchIndex.size(); ++i)
-    {
-      values[i] = intensity(static_cast<int64_t>(patchIndex[i][0]) + px / 2,
-                            static_cast<int64_t>(patchIndex[i][1]) + py / 2,
-                            static_cast<int64_t>(patchIndex[i][2]) + pz / 2);
-    }
-    return torch::from_blob(values.data(), { torch::IntArrayRef(shape) }, torch::kFloat32).unsqueeze(0).clone();
-  };
-
-  std::vector<itk::Point<double, 3>>                        fixedPoints(1);
-  std::vector<std::vector<std::vector<std::vector<float>>>> patchIndex(1);
-  patchIndex[0].push_back(configs[0].GetPatchIndex());
-  ASSERT_EQ(patchIndex[0][0].size(), static_cast<size_t>(px * py * pz));
-
-  const std::vector<torch::Tensor> subset{ torch::arange(4, torch::kInt64) };
-  std::vector<torch::Tensor>       outputs =
-    itk::Impact::GenerateOutputs<itk::Point<double, 3>>(configs, fixedPoints, patchIndex, subset, device, evaluator);
+  // What the elastix metric does: fill a row in patch-offset order. The offsets carry (index - patchSize/2) at unit
+  // voxel size, so the index each one came from is recoverable.
+  const std::vector<std::vector<float>> & offsets = configs[0].GetPatchIndex();
+  ASSERT_EQ(offsets.size(), static_cast<size_t>(px * py * pz));
+  torch::Tensor row = torch::empty({ 1, px * py * pz }, torch::kFloat32);
+  for (size_t i = 0; i < offsets.size(); ++i)
+  {
+    row[0][static_cast<int64_t>(i)] = intensity(static_cast<int64_t>(offsets[i][0]) + px / 2,
+                                                static_cast<int64_t>(offsets[i][1]) + py / 2,
+                                                static_cast<int64_t>(offsets[i][2]) + pz / 2);
+  }
+  const std::vector<torch::Tensor>  subset{ torch::arange(4, torch::kInt64) };
+  const itk::Impact::OnlineSettings settings{ configs, configs, subset, device, 0, 1 };
+  std::vector<torch::Tensor>        outputs;
+  {
+    torch::NoGradGuard noGrad;
+    outputs =
+      itk::Impact::OnlineFeatures(settings, 0, false, itk::Impact::OnlineModelPatches(settings, row, 0, false), 0);
+  }
 
   ASSERT_EQ(outputs.size(), 1u);
   ASSERT_EQ(outputs[0].sizes(), (std::vector<int64_t>{ 1, 4 }));
