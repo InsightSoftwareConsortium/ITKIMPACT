@@ -18,7 +18,7 @@
 # data, a filter that keeps nothing): a comparison that measured nothing is not a pass.
 #
 # IMPACT_PERF_ONLY keeps the cases whose name (mode-device-loss) contains it: online-cpu,
-# online-cuda, static, ncc...
+# online-cuda, static, elastix-cpu (the elastix metric's online path), ncc...
 # IMPACT_PERF_LOCK names a file held with flock around every run, for a GPU shared with other jobs.
 # The drivers run in this environment: it must let them load LibTorch, as for ctest.
 set -euo pipefail
@@ -83,7 +83,7 @@ for round in $(seq "$rounds"); do
     if [ $side = rev ]; then
       exe=$rev_driver
     fi
-    "${lock[@]}" "$exe" --gtest_also_run_disabled_tests --gtest_filter=ImpactPerf.DISABLED_Evaluation |
+    "${lock[@]}" "$exe" --gtest_also_run_disabled_tests --gtest_filter='ImpactPerf.*' |
       awk -v side=$side -v round="$round" '$1 == "IMPACT_PERF" { print side, round, $2, $3 }' >>"$results"
   done
   echo "round $round of $rounds, load $(cut -d' ' -f1 /proc/loadavg)" >&2
