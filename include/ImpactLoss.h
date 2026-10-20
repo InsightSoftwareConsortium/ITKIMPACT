@@ -166,6 +166,24 @@ public:
     return false;
   }
 
+  /** For a global distance (IsPerPointMean false), each channel's similarity over a window, from the window's means
+   * of f, m, f^2, m^2 and f*m ({1, C, ...} each): 1 at a perfect match. The coarse stage's cost is 1 minus its mean
+   * over the channels. A point-wise distance has its terms instead (forwardPoints), and is refused here. */
+  virtual torch::Tensor
+  SimilarityFromMoments(const torch::Tensor & meanFixed,
+                        const torch::Tensor & meanMoving,
+                        const torch::Tensor & meanFixedSquare,
+                        const torch::Tensor & meanMovingSquare,
+                        const torch::Tensor & meanProduct) const
+  {
+    (void)meanFixed;
+    (void)meanMoving;
+    (void)meanFixedSquare;
+    (void)meanMovingSquare;
+    (void)meanProduct;
+    throw std::runtime_error("SimilarityFromMoments() is not implemented for this loss");
+  }
+
   /** The loss between two feature maps on one grid, {1, C, spatial...}, for a spatial distance; `kernel` is the
    * side of its window in voxels along each spatial axis, odd, in the maps' axis order. `mask` ({1, 1, spatial...},
    * bool), when given, keeps the voxels whose terms are averaged (0 when it keeps none); the windows still read every
@@ -466,6 +484,190 @@ public:
 inline RegisterLoss<Dice> Dice_reg("Dice");
 
 /**
+ * \class OrganDice
+ * \ingroup Impact
+ * \brief Soft Dice of each channel over all the points, its denominator a sum of squares: 1 - the mean over the
+ * channels of 2 sum(f m) / (sum(f^2) + sum(m^2)), 0 at a perfect match.
+ *
+ * On a segmentation's probabilities each channel is an organ, and this is each organ's Dice over the image, where
+ * Dice compares the two feature vectors at each point. A channel absent from both (a zero denominator) counts as a
+ * match, 1, with no gradient. Like NCC it is a global statistic: it does not decompose over points, so it accumulates
+ * sums and combines them once every point has been seen.
+ */
+class OrganDice : public Loss
+{
+private:
+  torch::Tensor m_sfm, m_sff, m_smm; // per channel
+  torch::Tensor m_sfdm, m_smdm;      // per channel and parameter, Static mode
+
+  /** Each channel's Dice from its sums, 1 where the denominator is zero. */
+  static torch::Tensor
+  DiceOf(const torch::Tensor & product, const torch::Tensor & denominator)
+  {
+    const torch::Tensor empty = denominator == 0;
+    return torch::where(empty, 1.0, 2.0 * product / torch::where(empty, 1.0, denominator));
+  }
+
+public:
+  OrganDice()
+    : Loss()
+  {}
+
+  bool
+  IsPerPointMean() const override
+  {
+    return false;
+  }
+
+  torch::Tensor
+  SimilarityFromMoments(const torch::Tensor &,
+                        const torch::Tensor &,
+                        const torch::Tensor & meanFixedSquare,
+                        const torch::Tensor & meanMovingSquare,
+                        const torch::Tensor & meanProduct) const override
+  {
+    return DiceOf(meanProduct, meanFixedSquare + meanMovingSquare);
+  }
+
+  void
+  initialize(torch::Tensor & output) override
+  {
+    if (!this->m_initialized)
+    {
+      this->m_sfm = torch::zeros({ output.size(1) }, output.options());
+      this->m_sff = torch::zeros({ output.size(1) }, output.options());
+      this->m_smm = torch::zeros({ output.size(1) }, output.options());
+      this->m_initialized = true;
+    }
+  }
+
+  void
+  updateValue(torch::Tensor & fixedOutput, torch::Tensor & movingOutput) override
+  {
+    this->initialize(fixedOutput);
+    this->m_sfm += (fixedOutput * movingOutput).sum(0);
+    this->m_sff += (fixedOutput * fixedOutput).sum(0);
+    this->m_smm += (movingOutput * movingOutput).sum(0);
+  }
+
+  void
+  updateValueAndDerivativeInStaticMode(torch::Tensor & fixedOutput,
+                                       torch::Tensor & movingOutput,
+                                       torch::Tensor & jacobian,
+                                       torch::Tensor & nonZeroJacobianIndices) override
+  {
+    // sfdm = sum(f * dm), smdm = sum(m * dm), per channel and parameter: with the sums, the closed form of
+    // GetDerivative.
+    if (!this->m_initialized)
+    {
+      this->m_sfdm = torch::zeros({ fixedOutput.size(1), this->m_nb_parameters }, fixedOutput.options());
+      this->m_smdm = torch::zeros({ fixedOutput.size(1), this->m_nb_parameters }, fixedOutput.options());
+    }
+    this->updateValue(fixedOutput, movingOutput);
+    this->m_sfdm.index_add_(
+      1, nonZeroJacobianIndices.flatten(), (fixedOutput.unsqueeze(-1) * jacobian).permute({ 1, 0, 2 }).flatten(1, 2));
+    this->m_smdm.index_add_(
+      1, nonZeroJacobianIndices.flatten(), (movingOutput.unsqueeze(-1) * jacobian).permute({ 1, 0, 2 }).flatten(1, 2));
+  }
+
+  /** d(loss)/d(moving feature) at the points given, from their own sums: exact when they are every point of the
+   * evaluation, as the online mode hands a global loss. */
+  torch::Tensor
+  updateValueAndGetGradientModulator(torch::Tensor & fixedOutput, torch::Tensor & movingOutput) override
+  {
+    if (!this->m_initialized)
+    {
+      this->m_derivative = torch::zeros({ this->m_nb_parameters }, fixedOutput.options());
+    }
+    this->initialize(fixedOutput);
+    const torch::Tensor product = (fixedOutput * movingOutput).sum(0);
+    const torch::Tensor fixedSquare = (fixedOutput * fixedOutput).sum(0);
+    const torch::Tensor movingSquare = (movingOutput * movingOutput).sum(0);
+    this->m_sfm += product;
+    this->m_sff += fixedSquare;
+    this->m_smm += movingSquare;
+    const torch::Tensor denominator = fixedSquare + movingSquare;
+    // d(2 p / D)/dm = 2 (f D - 2 p m) / D^2, for each point and channel; the loss is 1 minus its mean over channels.
+    const torch::Tensor empty = denominator == 0;
+    const torch::Tensor safe = torch::where(empty, 1.0, denominator);
+    const torch::Tensor grad = -2.0 * (fixedOutput * safe - 2.0 * product * movingOutput) / (safe * safe) /
+                               static_cast<double>(fixedOutput.size(1));
+    return torch::where(empty, 0.0, grad);
+  }
+
+  torch::Tensor
+  forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
+  {
+    return 1.0 -
+           DiceOf((fixedOutput * movingOutput).sum(0), (fixedOutput * fixedOutput + movingOutput * movingOutput).sum(0))
+             .mean();
+  }
+
+  double
+  GetValue(double) const override
+  {
+    if (!this->m_initialized)
+    {
+      return 0.0;
+    }
+    return 1.0 - DiceOf(this->m_sfm, this->m_sff + this->m_smm).mean().item<double>();
+  }
+
+  torch::Tensor
+  GetDerivative(double) const override
+  {
+    if (this->m_derivative.defined())
+    {
+      return this->m_derivative.to(torch::kCPU);
+    }
+    // d(2 p / D)/dp = 2 (sfdm D - p 2 smdm) / D^2 per channel; the loss is 1 minus its mean over channels.
+    const torch::Tensor denominator = this->m_sff + this->m_smm;
+    const torch::Tensor empty = (denominator == 0).unsqueeze(-1);
+    const torch::Tensor safe = torch::where(denominator == 0, 1.0, denominator).unsqueeze(-1);
+    const torch::Tensor dice =
+      2.0 * (this->m_sfdm * safe - 2.0 * this->m_sfm.unsqueeze(-1) * this->m_smdm) / (safe * safe);
+    return (-torch::where(empty, 0.0, dice).mean(0)).to(torch::kCPU);
+  }
+
+  OrganDice &
+  operator+=(const Loss & other) override
+  {
+    const auto * organ = dynamic_cast<const OrganDice *>(&other);
+    // A work unit that processed no point never ran initialize(): it contributes nothing.
+    if (organ == nullptr || !organ->m_initialized)
+    {
+      return *this;
+    }
+    if (!this->m_initialized)
+    {
+      this->m_sfm = organ->m_sfm;
+      this->m_sff = organ->m_sff;
+      this->m_smm = organ->m_smm;
+      this->m_sfdm = organ->m_sfdm;
+      this->m_smdm = organ->m_smdm;
+      this->m_derivative = organ->m_derivative;
+      this->m_initialized = true;
+      return *this;
+    }
+    this->m_sfm += organ->m_sfm;
+    this->m_sff += organ->m_sff;
+    this->m_smm += organ->m_smm;
+    if (this->m_sfdm.defined() && organ->m_sfdm.defined())
+    {
+      this->m_sfdm += organ->m_sfdm;
+      this->m_smdm += organ->m_smdm;
+    }
+    if (this->m_derivative.defined() && organ->m_derivative.defined())
+    {
+      this->m_derivative += organ->m_derivative;
+    }
+    return *this;
+  }
+};
+
+inline RegisterLoss<OrganDice> OrganDice_reg("OrganDice");
+
+/**
  * \class L1Cosine
  * \ingroup Impact
  * \brief Combined cosine similarity and exponential L1 loss (penalizes both direction
@@ -658,6 +860,16 @@ public:
   IsPerPointMean() const override
   {
     return false;
+  }
+
+  torch::Tensor
+  SimilarityFromMoments(const torch::Tensor & meanFixed,
+                        const torch::Tensor & meanMoving,
+                        const torch::Tensor & meanFixedSquare,
+                        const torch::Tensor & meanMovingSquare,
+                        const torch::Tensor & meanProduct) const override
+  {
+    return Correlation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
   }
 
   void
@@ -884,6 +1096,16 @@ public:
   IsPerPointMean() const override
   {
     return false;
+  }
+
+  torch::Tensor
+  SimilarityFromMoments(const torch::Tensor & meanFixed,
+                        const torch::Tensor & meanMoving,
+                        const torch::Tensor & meanFixedSquare,
+                        const torch::Tensor & meanMovingSquare,
+                        const torch::Tensor & meanProduct) const override
+  {
+    return SquaredCorrelation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
   }
 
   void

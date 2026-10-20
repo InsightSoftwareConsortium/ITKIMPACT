@@ -156,7 +156,7 @@ TEST(ImpactBackend, ImageToTensorFilterResampling)
 // --- A4: Dice loss is soft, NaN-safe and does not mutate its inputs ----------
 TEST(ImpactBackend, ImpactLossFactoryHasAllLosses)
 {
-  for (const char * name : { "L1", "L2", "Dice", "L1Cosine", "Cosine", "NCC" })
+  for (const char * name : { "L1", "L2", "Dice", "OrganDice", "L1Cosine", "Cosine", "NCC" })
   {
     std::unique_ptr<itk::Impact::Loss> loss;
     ASSERT_NO_THROW(loss = itk::Impact::LossFactory::Instance().Create(name)) << name;
@@ -610,8 +610,9 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
     EXPECT_GT(norm, 1e-8) << "derivative should be non-zero for misaligned images";
   };
 
-  checkLoss("Cosine"); // d(1 - cosine)/dm with the full dot-product cross term
-  checkLoss("NCC");    // cross-point statistics path (closed-form derivative)
+  checkLoss("Cosine");    // d(1 - cosine)/dm with the full dot-product cross term
+  checkLoss("NCC");       // cross-point statistics path (closed-form derivative)
+  checkLoss("OrganDice"); // per-channel sums over all the points (closed-form derivative)
   checkLoss("L1");
   checkLoss("L2");
   checkLoss("L1Cosine");
@@ -933,8 +934,9 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
     EXPECT_GT(norm, 1e-8) << "derivative should be non-zero for misaligned images";
   };
 
-  checkLoss("Cosine"); // normalized cross term
-  checkLoss("NCC");    // cross-point statistics path
+  checkLoss("Cosine");    // normalized cross term
+  checkLoss("NCC");       // cross-point statistics path
+  checkLoss("OrganDice"); // per-channel sums over all the points
   checkLoss("L1");
   checkLoss("L2");
   checkLoss("L1Cosine");
@@ -1736,7 +1738,7 @@ TEST(ImpactMetric, AnEvenPatchIsCentredOnTheVoxelThatIsReadBack)
 // energy exactly 1.0 at every transform: this test passed on NCC and would have failed on L1.
 TEST(ImpactMetric, TranslationRegistrationConvergesForEveryDistance)
 {
-  for (const std::string distance : { "NCC", "L1", "L2", "Cosine", "L1Cosine" })
+  for (const std::string distance : { "NCC", "OrganDice", "L1", "L2", "Cosine", "L1Cosine" })
   {
     using VirtualImageType = itk::Image<double, 3>;
     using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
@@ -2748,7 +2750,7 @@ TEST(ImpactLoss, ForwardValueGradientFiniteDifference)
   torch::manual_seed(7);
   const int64_t N = 48, C = 6;
   const auto    opts = torch::TensorOptions().dtype(torch::kFloat64);
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC" })
   {
     auto          loss = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor fixed = torch::rand({ N, C }, opts) + 0.2; // strictly positive (Dice-safe)
@@ -3955,7 +3957,7 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
   auto window = [&](const Volume & q) { return box(box(q)); };
   auto clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
 
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
     const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor cost = torch::zeros({ L, Z, Y, X });
@@ -3970,7 +3972,7 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
       };
       auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
       Volume expected(Z * Y * X, 0.0);
-      if (name == "NCC" || name == "LNCC")
+      if (name == "NCC" || name == "LNCC" || name == "OrganDice")
       {
         const Volume weight = window(Volume(Z * Y * X, 1.0));
         for (int64_t c = 0; c < C; ++c)
@@ -3996,7 +3998,8 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
             const double covariance = mfm[i] / w - meanF * meanM;
             const double varianceF = mff[i] / w - meanF * meanF, varianceM = mmm[i] / w - meanM * meanM;
             const double correlation =
-              name == "NCC"
+              name == "OrganDice" ? (mff[i] + mmm[i] > 0 ? 2.0 * mfm[i] / (mff[i] + mmm[i]) : 1.0)
+              : name == "NCC"
                 ? covariance / std::max(std::sqrt(std::max(varianceF, 0.0)) * std::sqrt(std::max(varianceM, 0.0)), 1e-8)
                 : covariance * covariance / (std::max(varianceF, 1e-5) * std::max(varianceM, 1e-5));
             expected[i] += (1.0 - correlation) / C;
@@ -4056,7 +4059,7 @@ TEST(ImpactConvexAdam, CoarseRecoversATranslationWithEveryDistance)
   expected[0] = 3.0;
   expected[1] = -2.5;
   expected[2] = 1.5;
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "OrganDice", "NCC", "LNCC" })
   {
     auto coarse = CoarseType::New();
     coarse->SetFixedImage(fixed);
@@ -4329,7 +4332,7 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
   auto                clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
   const torch::Tensor support =
     itk::Impact::CoarseMaskSupport<3>(fixedShare, movingShare, halfWidths, fixed.sizes(), L);
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
     const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor cost = torch::zeros({ L, Z, Y, X });
@@ -4364,7 +4367,7 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
         return mean;
       };
       Volume expected(Z * Y * X, 0.0);
-      if (name == "NCC" || name == "LNCC")
+      if (name == "NCC" || name == "LNCC" || name == "OrganDice")
       {
         for (int64_t c = 0; c < C; ++c)
         {
@@ -4390,7 +4393,8 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
             const double covariance = mfm[i] - mf[i] * mm[i];
             const double varianceF = mff[i] - mf[i] * mf[i], varianceM = mmm[i] - mm[i] * mm[i];
             const double correlation =
-              name == "NCC"
+              name == "OrganDice" ? (mff[i] + mmm[i] > 0 ? 2.0 * mfm[i] / (mff[i] + mmm[i]) : 1.0)
+              : name == "NCC"
                 ? covariance / std::max(std::sqrt(std::max(varianceF, 0.0)) * std::sqrt(std::max(varianceM, 0.0)), 1e-8)
                 : covariance * covariance / (std::max(varianceF, 1e-5) * std::max(varianceM, 1e-5));
             expected[i] += (1.0 - correlation) / C;
@@ -4503,7 +4507,7 @@ TEST(ImpactTorchAdam, MaskedMapLossMatchesABruteForceForEveryDistance)
   auto                       F = fixed.accessor<double, 5>();
   auto                       M = moving.accessor<double, 5>();
   auto                       K = mask.accessor<bool, 5>();
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
     const auto   loss = itk::Impact::LossFactory::Instance().Create(name);
     const double value = itk::Impact::MapLoss<3>(*loss, fixed, moving, mask, window).item<double>();
@@ -4530,6 +4534,25 @@ TEST(ImpactTorchAdam, MaskedMapLossMatchesABruteForceForEveryDistance)
               }
         const double covariance = sfm - sf * sm / n;
         expected += covariance / std::sqrt((sff - sf * sf / n) * (smm - sm * sm / n)) / C;
+      }
+      expected = 1.0 - expected;
+    }
+    else if (name == "OrganDice")
+    {
+      for (int64_t c = 0; c < C; ++c)
+      {
+        double sff = 0, smm = 0, sfm = 0;
+        for (int64_t z = 0; z < Z; ++z)
+          for (int64_t y = 0; y < Y; ++y)
+            for (int64_t x = 0; x < X; ++x)
+              if (K[0][0][z][y][x])
+              {
+                const double a = F[0][c][z][y][x], b = M[0][c][z][y][x];
+                sff += a * a;
+                smm += b * b;
+                sfm += a * b;
+              }
+        expected += 2.0 * sfm / (sff + smm) / C;
       }
       expected = 1.0 - expected;
     }

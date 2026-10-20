@@ -63,9 +63,10 @@ CoarseBoxWindow(const torch::Tensor & t)
 /** One feature layer's coarse cost for one candidate displacement, {1, 1, coarse...}: `fixed` and `shifted` ({1, C,
  * coarse...}) are the two images' coarse features, the moving one shifted by the candidate. The cost at a coarse voxel
  * is `distance` over the cell window around it (CoarseBoxWindow): a point-wise distance's terms (Loss::forwardPoints)
- * averaged over the window -- for L2 exactly ConvexAdam's smoothed SSD --, NCC and LNCC each channel's correlation over
- * the window, from its weighted means of f, m, f^2, m^2 and f*m (the weight falling outside the image dropped). A
- * point-wise term that is not a number (the cosine of a zero vector) counts as no similarity, 1.
+ * averaged over the window -- for L2 exactly ConvexAdam's smoothed SSD --, a global distance (NCC, LNCC, OrganDice)
+ * each channel's similarity over the window (Loss::SimilarityFromMoments), from its weighted means of f, m, f^2, m^2
+ * and f*m (the weight falling outside the image dropped). A point-wise term that is not a number (the cosine of a zero
+ * vector) counts as no similarity, 1.
  *
  * `weight` ({1, 1, coarse...}), when given, weighs each cell in the window (the masks' shares, CoarseMaskWeight): every
  * mean is then a ratio of two window sums, and a coarse voxel whose window holds no weight costs 0 (see
@@ -90,11 +91,9 @@ CoarseLayerCost(const Loss &          distance,
     const torch::Tensor meanFixedSquare = mean(fixed * fixed);
     const torch::Tensor meanMovingSquare = mean(shifted * shifted);
     const torch::Tensor meanProduct = mean(fixed * shifted);
-    const torch::Tensor correlation =
-      distance.IsSpatial()
-        ? LNCC::SquaredCorrelation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct)
-        : NCC::Correlation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
-    return 1.0 - correlation.mean(1, /*keepdim=*/true);
+    const torch::Tensor similarity =
+      distance.SimilarityFromMoments(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
+    return 1.0 - similarity.mean(1, /*keepdim=*/true);
   }
   const torch::Tensor total = CoarseBoxWindow<Dim>(weight);
   const torch::Tensor held = total > 0.0;
@@ -110,11 +109,9 @@ CoarseLayerCost(const Loss &          distance,
   const torch::Tensor meanFixedSquare = mean(fixed * fixed);
   const torch::Tensor meanMovingSquare = mean(shifted * shifted);
   const torch::Tensor meanProduct = mean(fixed * shifted);
-  const torch::Tensor correlation =
-    distance.IsSpatial()
-      ? LNCC::SquaredCorrelation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct)
-      : NCC::Correlation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
-  return torch::where(held, 1.0 - correlation.mean(1, /*keepdim=*/true), 0.0);
+  const torch::Tensor similarity =
+    distance.SimilarityFromMoments(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
+  return torch::where(held, 1.0 - similarity.mean(1, /*keepdim=*/true), 0.0);
 }
 
 /** The shift of `volume` ({1, C, coarse...}) by candidate `l` of the box of `halfWidths` (see AccumulateCoarseCost),
