@@ -18,9 +18,14 @@
 
 // The only LibTorch-dependent part of ImpactModelConfiguration: loading the TorchScript model.
 // Keeping it here (compiled, linking LibTorch) lets itkImpactModelConfiguration.h stay
-// torch-free and therefore Python-wrappable.
+// torch-free and therefore Python-wrappable. With ITK_IMPACT_WITHOUT_TORCH defined it holds the
+// configuration only, for a host that runs the models itself (Elastix's WebAssembly build).
 
-#include "itkImpactModelConfigurationDetail.h"
+#ifdef ITK_IMPACT_WITHOUT_TORCH
+#  include "itkImpactModelConfiguration.h"
+#else
+#  include "itkImpactModelConfigurationDetail.h"
+#endif
 
 namespace itk
 {
@@ -39,13 +44,16 @@ ImpactModelConfiguration::ImpactModelConfiguration(std::string               mod
   , m_patchSize(patchSize.begin(), patchSize.end())
   , m_voxelSize(voxelSize)
   , m_layersMask(layersMask)
-  , m_impl(std::make_shared<detail::ImpactModelConfigurationImpl>())
 {
   // The reassembly reads the per-axis overlap only. Fill the missing axes by repeating the
   // last entry given, so a single value still means "the same on every axis", and an empty
   // one means no overlap at all.
   SetOverlaps(overlap.empty() ? std::vector<unsigned int>(m_dimension, 0u) : overlap);
 
+#ifdef ITK_IMPACT_WITHOUT_TORCH
+  (void)useMixedPrecision;
+#else
+  m_impl = std::make_shared<detail::ImpactModelConfigurationImpl>();
   m_impl->dtype = useMixedPrecision ? torch::kFloat16 : torch::kFloat32;
   // The model runs with the default JIT graph-executor optimization (fusion) enabled.
   // Export models WITHOUT data-dependent control flow (e.g. a shape test feeding a
@@ -62,6 +70,7 @@ ImpactModelConfiguration::ImpactModelConfiguration(std::string               mod
   // arguments to metadata-aware models. The requested layer count is the mask size.
   m_impl->nArgs = m_impl->model->get_method("forward").function().getSchema().arguments().size() - 1;
   m_impl->nLayers = torch::tensor(static_cast<int64_t>(m_layersMask.size()), torch::kInt16);
+#endif
 
   // Precompute the physical patch offsets for the online (non-Static) inference: a grid
   // over the patch, axis 0 varying fastest, each offset = (index - patchSize/2) * voxelSize
