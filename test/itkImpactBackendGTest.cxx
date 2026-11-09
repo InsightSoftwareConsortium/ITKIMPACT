@@ -938,6 +938,53 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
   checkLoss("Dice");
 }
 
+// The metric of the three invariance tests below, left for the caller to initialize: the toy model
+// on two 8^3 ramps (different, so the gradient is non-trivial) and two of the four channels, so
+// that every point of an evaluation compares the same two whatever the batches or work units (NCC
+// accumulates its statistics channel by channel). Jacobian mode reads 3^3 patches online through a
+// cubic B-spline of the moving image; Static mode compares feature maps computed once at overlap 2
+// and never refreshed.
+using RampMetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, itk::Image<double, 3>, double>;
+
+static RampMetricType::Pointer
+MakeMetric(const char * lossName, const char * mode, const char * device, itk::Transform<double, 3, 3> * transform)
+{
+  const bool                                 jacobian = std::string(mode) == "Jacobian";
+  auto                                       metric = RampMetricType::New();
+  std::vector<itk::ImpactModelConfiguration> configs;
+  configs.emplace_back(ToyModelPath(),
+                       3,
+                       1,
+                       std::vector<unsigned int>(3, jacobian ? 3u : 0u),
+                       std::vector<float>{ 1.f, 1.f, 1.f },
+                       std::vector<unsigned int>(3, jacobian ? 0u : 2u),
+                       std::vector<bool>{ true, false },
+                       false);
+  metric->SetModelsConfiguration(configs);
+  metric->SetDistance({ std::string(lossName) });
+  metric->SetLayersWeight({ 1.f });
+  metric->SetSubsetFeatures({ 2 });
+  metric->SetPCA({ 0 });
+  metric->SetMode(mode);
+  metric->SetSeed(1);
+  metric->SetDevice(device);
+  if (jacobian)
+  {
+    auto movingInterp = InterpolatorType::New();
+    movingInterp->SetSplineOrder(3);
+    metric->SetMovingInterpolator(movingInterp);
+  }
+  else
+  {
+    metric->SetFeaturesMapUpdateInterval(-1);
+  }
+  metric->SetFixedImage(MakeRampImage(8, 0));
+  metric->SetMovingImage(MakeRampImage(8, 1));
+  metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+  metric->SetMovingTransform(transform);
+  return metric;
+}
+
 // Online mode runs the model on a batch of points at a time, so what a point contributes must not
 // depend on which batch it happened to land in. For a loss that is a mean of per-point terms that
 // is arithmetic. For NCC it is not: NCC correlates the sampled points with one another, and it
@@ -947,51 +994,13 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
 // zero gradient, silently.
 TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
 {
-  using VirtualImageType = itk::Image<double, 3>;
-  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
-  using TransformType = itk::TranslationTransform<double, 3>;
+  using MetricType = RampMetricType;
 
-  auto fixed = MakeRampImage(8, 0);
-  auto moving = MakeRampImage(8, 1); // different => non-trivial gradient
-  auto identityFixed = itk::IdentityTransform<double, 3>::New();
-
-  auto evaluate = [&](const char * lossName, unsigned int batchSize, MetricType::DerivativeType & derivative) {
-    auto                                       metric = MetricType::New();
-    std::vector<itk::ImpactModelConfiguration> configs;
-    configs.emplace_back(ToyModelPath(),
-                         3,
-                         1,
-                         std::vector<unsigned int>{ 3, 3, 3 },
-                         std::vector<float>{ 1.f, 1.f, 1.f },
-                         std::vector<unsigned int>{ 0, 0, 0 },
-                         std::vector<bool>{ true, false },
-                         false);
-    metric->SetModelsConfiguration(configs);
-    metric->SetDistance({ std::string(lossName) });
-    metric->SetLayersWeight({ 1.f });
-    // Two of the four channels: every point of an evaluation compares the same two, whatever the
-    // batches. NCC accumulates its statistics channel by channel, so a subset drawn per batch
-    // mixed channels within one sum.
-    metric->SetSubsetFeatures({ 2 });
-    metric->SetPCA({ 0 });
-    metric->SetMode("Jacobian");
-    metric->SetSeed(1);
-    metric->SetDevice("cpu");
-    metric->SetBatchSize(batchSize);
-
-    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
-    movingInterp->SetSplineOrder(3);
-    metric->SetMovingInterpolator(movingInterp);
-
-    auto transform = TransformType::New();
+  auto evaluate = [](const char * lossName, unsigned int batchSize, MetricType::DerivativeType & derivative) {
+    auto transform = itk::TranslationTransform<double, 3>::New();
     transform->SetIdentity();
-
-    metric->SetFixedImage(fixed);
-    metric->SetMovingImage(moving);
-    metric->SetFixedTransform(identityFixed);
-    metric->SetMovingTransform(transform);
-    metric->SetUseFixedImageGradientFilter(false);
-    metric->SetUseMovingImageGradientFilter(false);
+    auto metric = MakeMetric(lossName, "Jacobian", "cpu", transform);
+    metric->SetBatchSize(batchSize);
     metric->SetMaximumNumberOfWorkUnits(1);
     metric->Initialize();
 
@@ -1040,41 +1049,12 @@ TEST(ImpactMetric, JacobianOnTheGpuMatchesTheCpu)
   {
     GTEST_SKIP() << "no CUDA device";
   }
-  using VirtualImageType = itk::Image<double, 3>;
-  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using MetricType = RampMetricType;
 
-  auto fixed = MakeRampImage(8, 0);
-  auto moving = MakeRampImage(8, 1);
-
-  auto evaluate = [&](const char * lossName, const char * device, MetricType::DerivativeType & derivative) {
-    auto                                       metric = MetricType::New();
-    std::vector<itk::ImpactModelConfiguration> configs;
-    configs.emplace_back(ToyModelPath(),
-                         3,
-                         1,
-                         std::vector<unsigned int>{ 3, 3, 3 },
-                         std::vector<float>{ 1.f, 1.f, 1.f },
-                         std::vector<unsigned int>{ 0, 0, 0 },
-                         std::vector<bool>{ true, false },
-                         false);
-    metric->SetModelsConfiguration(configs);
-    metric->SetDistance({ std::string(lossName) });
-    metric->SetLayersWeight({ 1.f });
-    metric->SetSubsetFeatures({ 2 });
-    metric->SetPCA({ 0 });
-    metric->SetMode("Jacobian");
-    metric->SetSeed(1);
-    metric->SetDevice(device);
-
-    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
-    movingInterp->SetSplineOrder(3);
-    metric->SetMovingInterpolator(movingInterp);
+  auto evaluate = [](const char * lossName, const char * device, MetricType::DerivativeType & derivative) {
     auto transform = itk::TranslationTransform<double, 3>::New();
     transform->SetIdentity();
-    metric->SetFixedImage(fixed);
-    metric->SetMovingImage(moving);
-    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
-    metric->SetMovingTransform(transform);
+    auto metric = MakeMetric(lossName, "Jacobian", device, transform);
     metric->Initialize();
 
     MetricType::MeasureType value;
@@ -1106,42 +1086,12 @@ TEST(ImpactMetric, JacobianOnTheGpuMatchesTheCpu)
 // that split. All points of an evaluation now compare the same channels.
 TEST(ImpactMetric, StaticResultIsIndependentOfTheNumberOfWorkUnits)
 {
-  using VirtualImageType = itk::Image<double, 3>;
-  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using MetricType = RampMetricType;
 
-  auto fixed = MakeRampImage(8, 0);
-  auto moving = MakeRampImage(8, 1);
-
-  auto evaluate = [&](const char * lossName, unsigned int workUnits, MetricType::DerivativeType & derivative) {
-    auto                                       metric = MetricType::New();
-    std::vector<itk::ImpactModelConfiguration> configs;
-    configs.emplace_back(ToyModelPath(),
-                         3,
-                         1,
-                         std::vector<unsigned int>{ 0, 0, 0 },
-                         std::vector<float>{ 1.f, 1.f, 1.f },
-                         std::vector<unsigned int>{ 2, 2, 2 },
-                         std::vector<bool>{ true, false },
-                         false);
-    metric->SetModelsConfiguration(configs);
-    metric->SetDistance({ std::string(lossName) });
-    metric->SetLayersWeight({ 1.f });
-    metric->SetSubsetFeatures({ 2 });
-    metric->SetPCA({ 0 });
-    metric->SetMode("Static");
-    metric->SetSeed(1);
-    metric->SetFeaturesMapUpdateInterval(-1);
-    metric->SetDevice("cpu");
-
+  auto evaluate = [](const char * lossName, unsigned int workUnits, MetricType::DerivativeType & derivative) {
     auto affine = itk::AffineTransform<double, 3>::New();
     affine->SetIdentity();
-
-    metric->SetFixedImage(fixed);
-    metric->SetMovingImage(moving);
-    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
-    metric->SetMovingTransform(affine);
-    metric->SetUseFixedImageGradientFilter(false);
-    metric->SetUseMovingImageGradientFilter(false);
+    auto metric = MakeMetric(lossName, "Static", "cpu", affine);
     metric->SetMaximumNumberOfWorkUnits(workUnits);
     metric->Initialize();
 
