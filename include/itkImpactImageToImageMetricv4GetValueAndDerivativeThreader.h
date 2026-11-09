@@ -96,7 +96,10 @@ protected:
                const MovingImageGradientType &,
                MeasureType &,
                DerivativeType &,
-               const ThreadIdType) const override;
+               const ThreadIdType) const override
+  {
+    itkExceptionMacro("ProcessPoint is not used: ThreadedExecution evaluates the points in batches.");
+  }
 
   /**
    * \brief Per-work-unit accumulator of loss values and gradients, one loss object per
@@ -304,6 +307,16 @@ protected:
                       typename std::vector<Sample>::const_iterator last,
                       const ThreadIdType                           threadId,
                       LossPerThreadStruct &                        loss) const;
+
+  /** One sample's d(moving coordinate)/d(parameter) to `jacobianOut`, MovingImageDimension rows of
+   * GetCachedNumberOfLocalParameters() floats, and the global index of each column to `indicesOut`.
+   * `jacobian` and `jacobianPositional` are the transform's scratch matrices. */
+  void
+  FillTransformJacobian(const Sample &                               sample,
+                        typename TImageToImageMetric::JacobianType & jacobian,
+                        typename TImageToImageMetric::JacobianType & jacobianPositional,
+                        float *                                      jacobianOut,
+                        int64_t *                                    indicesOut) const;
 
   /** The points each work unit collected, online. */
   std::vector<std::vector<Sample>> m_OnlineSamples;

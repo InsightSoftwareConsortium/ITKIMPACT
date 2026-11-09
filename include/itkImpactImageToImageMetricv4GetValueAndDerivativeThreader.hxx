@@ -422,7 +422,6 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
               bool                                         derivative) const -> PatchBatch
 {
   using JacobianType = typename TImageToImageMetric::JacobianType;
-  using MovingTransformType = typename TImageToImageMetric::MovingTransformType;
   constexpr unsigned int movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
 
   const auto   size = static_cast<int64_t>(last - first);
@@ -439,11 +438,8 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   }
 
   // d(moving coordinate)/d(parameter) at every point, and the global parameter index of each of
-  // its columns. A global transform (affine, rigid) has offset 0; a local-support displacement
-  // field only affects the parameter block of the point's own virtual voxel.
+  // its columns.
   const auto parameters = static_cast<int64_t>(this->GetCachedNumberOfLocalParameters());
-  const auto transform = this->m_ImpactAssociate->GetMovingTransform();
-  const bool field = transform->GetTransformCategory() == MovingTransformType::TransformCategoryEnum::DisplacementField;
   float *    jacobianOut = nullptr;
   int64_t *  indicesOut = nullptr;
   if (derivative)
@@ -465,27 +461,13 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
         this->SamplePatch(
           sample, i, row, batch.m_FixedPatches[i], batch.m_MovingPatches[i], batch.m_MovingGradients[i], derivative);
       }
-      if (!derivative)
+      if (derivative)
       {
-        continue;
-      }
-      transform->ComputeJacobianWithRespectToParametersCachedTemporaries(
-        sample.m_VirtualPoint, jacobian, jacobianPositional);
-      for (unsigned int d = 0; d < movingDimension; ++d)
-      {
-        for (int64_t parameter = 0; parameter < parameters; ++parameter)
-        {
-          jacobianOut[(row * movingDimension + d) * parameters + parameter] =
-            static_cast<float>(jacobian(d, parameter));
-        }
-      }
-      const int64_t offset =
-        field ? static_cast<int64_t>(
-                  this->m_ImpactAssociate->ComputeParameterOffsetFromVirtualIndex(sample.m_VirtualIndex, parameters))
-              : 0;
-      for (int64_t parameter = 0; parameter < parameters; ++parameter)
-      {
-        indicesOut[row * parameters + parameter] = offset + parameter;
+        this->FillTransformJacobian(sample,
+                                    jacobian,
+                                    jacobianPositional,
+                                    jacobianOut + row * movingDimension * parameters,
+                                    indicesOut + row * parameters);
       }
     }
   };
@@ -773,21 +755,37 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
-bool
+void
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  ProcessPoint(const VirtualIndexType &,
-               const VirtualPointType &,
-               const FixedImagePointType &,
-               const FixedImagePixelType &,
-               const FixedImageGradientType &,
-               const MovingImagePointType &,
-               const MovingImagePixelType &,
-               const MovingImageGradientType &,
-               MeasureType &,
-               DerivativeType &,
-               const ThreadIdType) const
+  FillTransformJacobian(const Sample &                               sample,
+                        typename TImageToImageMetric::JacobianType & jacobian,
+                        typename TImageToImageMetric::JacobianType & jacobianPositional,
+                        float *                                      jacobianOut,
+                        int64_t *                                    indicesOut) const
 {
-  itkExceptionMacro("ProcessPoint is not used: ThreadedExecution evaluates the points in batches.");
+  using MovingTransformType = typename TImageToImageMetric::MovingTransformType;
+  const auto transform = this->m_ImpactAssociate->GetMovingTransform();
+  const auto parameters = static_cast<int64_t>(this->GetCachedNumberOfLocalParameters());
+  transform->ComputeJacobianWithRespectToParametersCachedTemporaries(
+    sample.m_VirtualPoint, jacobian, jacobianPositional);
+  for (unsigned int d = 0; d < ImageToImageMetricv4Type::MovingImageDimension; ++d)
+  {
+    for (int64_t parameter = 0; parameter < parameters; ++parameter)
+    {
+      *jacobianOut++ = static_cast<float>(jacobian(d, parameter));
+    }
+  }
+  // A global transform (affine, rigid) has offset 0; a local-support displacement field only
+  // affects the parameter block of the point's own virtual voxel.
+  const int64_t offset =
+    transform->GetTransformCategory() == MovingTransformType::TransformCategoryEnum::DisplacementField
+      ? static_cast<int64_t>(
+          this->m_ImpactAssociate->ComputeParameterOffsetFromVirtualIndex(sample.m_VirtualIndex, parameters))
+      : 0;
+  for (int64_t parameter = 0; parameter < parameters; ++parameter)
+  {
+    *indicesOut++ = offset + parameter;
+  }
 }
 
 
@@ -835,13 +833,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     JacobianType & jacobian = this->m_GetValueAndDerivativePerThreadVariables[threadId].MovingTransformJacobian;
     JacobianType & jacobianPositional =
       this->m_GetValueAndDerivativePerThreadVariables[threadId].MovingTransformJacobianPositional;
-    const auto transform = this->m_ImpactAssociate->GetMovingTransform();
     const auto parameters = static_cast<int64_t>(this->GetCachedNumberOfLocalParameters());
-    // A global transform (affine, rigid) has offset 0. A local-support displacement field only
-    // affects the parameter block of the point's own virtual voxel.
-    using MovingTransformType = typename TImageToImageMetric::MovingTransformType;
-    const bool field =
-      transform->GetTransformCategory() == MovingTransformType::TransformCategoryEnum::DisplacementField;
 
     transformJacobian = torch::empty({ count, movingDimension, parameters }, torch::kFloat32);
     nonZeroJacobianIndices = torch::empty({ count, parameters }, torch::kInt64);
@@ -849,23 +841,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     int64_t * indicesOut = nonZeroJacobianIndices.data_ptr<int64_t>();
     for (auto sample = first; sample != last; ++sample)
     {
-      transform->ComputeJacobianWithRespectToParametersCachedTemporaries(
-        sample->m_VirtualPoint, jacobian, jacobianPositional);
-      for (unsigned int d = 0; d < movingDimension; ++d)
-      {
-        for (int64_t parameter = 0; parameter < parameters; ++parameter)
-        {
-          *jacobianOut++ = static_cast<float>(jacobian(d, parameter));
-        }
-      }
-      const int64_t offset =
-        field ? static_cast<int64_t>(
-                  this->m_ImpactAssociate->ComputeParameterOffsetFromVirtualIndex(sample->m_VirtualIndex, parameters))
-              : 0;
-      for (int64_t parameter = 0; parameter < parameters; ++parameter)
-      {
-        *indicesOut++ = offset + parameter;
-      }
+      this->FillTransformJacobian(*sample, jacobian, jacobianPositional, jacobianOut, indicesOut);
+      jacobianOut += movingDimension * parameters;
+      indicesOut += parameters;
     }
   }
 
