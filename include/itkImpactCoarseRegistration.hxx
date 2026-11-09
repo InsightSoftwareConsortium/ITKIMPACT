@@ -304,6 +304,8 @@ BuildCoarseGrid(const torch::Tensor & voxelField, const TFixedImage * fixed, con
     spacing[a] = fixed->GetSpacing()[a] * static_cast<double>(cells);
     shift[a] = (static_cast<double>(cells) - 1.0) / 2.0 - static_cast<double>(pad * cells);
   }
+  typename FieldType::PointType first; // the first voxel of the region, whatever its index
+  fixed->TransformIndexToPhysicalPoint(fixed->GetLargestPossibleRegion().GetIndex(), first);
   for (unsigned int r = 0; r < Dim; ++r)
   {
     double offset = 0.0;
@@ -311,7 +313,7 @@ BuildCoarseGrid(const torch::Tensor & voxelField, const TFixedImage * fixed, con
     {
       offset += fixed->GetDirection()[r][c] * fixed->GetSpacing()[c] * shift[c];
     }
-    origin[r] = fixed->GetOrigin()[r] + offset;
+    origin[r] = first[r] + offset;
   }
   typename FieldType::RegionType region;
   region.SetSize(size);

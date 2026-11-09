@@ -255,8 +255,10 @@ public:
    * grid, each RegionSize voxels of the finest axis a side (rounded to whole cells of the control grid), with their
    * features, and the region of the moving image they read, through the images' own pipelines (SetRequestedRegion
    * then Update: an itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them
-   * from its buffer). The boxes are visited in epochs, in an order drawn from Seed, skipping those the fixed mask does
-   * not reach. A box's loss is the dense loss restricted to its cells, weighed by its share of the counted cells, with
+   * from its buffer). The boxes are visited in epochs, in an order drawn from Seed; one the fixed mask does not reach
+   * costs its share of the regularizer alone, nothing read. A box's loss is the dense loss restricted to its cells,
+   * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
+   * mean, which the resident route keeps exact), with
    * the regularizer's differences whose first cell lies in it; Adam steps the cells the iteration touched and leaves
    * the others as they are. Visiting every box at every iteration reproduces the whole-image run, so the schedule is
    * the only approximation. Static mode, point-wise distances, feature layers at the image's resolution (MIND); the

@@ -181,9 +181,11 @@ BuildControlGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
   }
   typename FieldType::RegionType region;
   region.SetSize(size);
+  typename FieldType::PointType origin; // the first voxel of the region, whatever its index
+  fixed->TransformIndexToPhysicalPoint(fixed->GetLargestPossibleRegion().GetIndex(), origin);
   grid->SetRegions(region);
   grid->SetSpacing(spacing);
-  grid->SetOrigin(fixed->GetOrigin());
+  grid->SetOrigin(origin);
   grid->SetDirection(fixed->GetDirection());
   grid->Allocate();
   WriteVoxelFieldToDisplacement<Dim>(voxelField, fixed->GetSpacing(), fixed->GetDirection(), grid);
@@ -2427,6 +2429,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         fixedIndex[Dim - 1 - d] = cells[d] > 1 ? static_cast<double>(c) * static_cast<double>(spatial[d] - 1) /
                                                    static_cast<double>(cells[d] - 1)
                                                : 0.0;
+        fixedIndex[Dim - 1 - d] += static_cast<double>(fixedRegion.GetIndex()[Dim - 1 - d]);
       }
       typename FixedImageType::PointType point;
       m_FixedImage->TransformContinuousIndexToPhysicalPoint(fixedIndex, point);
@@ -2626,20 +2629,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // ---- Box by box: every box visited NumberOfIterations times, RegionsPerIteration an iteration, in epochs of a
     // permutation drawn from Seed. A box's loss is the dense loss restricted to its cells, weighed by its share of
     // the counted cells, plus its share of the regularizer; Adam steps the cells the iteration touched. ----
+    // Every box, the ones the fixed mask does not reach for their share of the regularizer alone, nothing read: an
+    // epoch visits each once, in a fresh permutation, its last batch shorter when the count does not divide.
     std::mt19937        scheduleGenerator(m_Seed);
-    std::vector<size_t> order = occupied;
-    size_t              cursor = order.size();
-    auto                nextBox = [&]() {
-      if (cursor >= order.size())
-      {
-        std::shuffle(order.begin(), order.end(), scheduleGenerator);
-        cursor = 0;
-      }
-      return order[cursor++];
-    };
-    const size_t perIteration = std::min<size_t>(m_RegionsPerIteration, occupied.size());
-    const auto   iterations =
-      static_cast<size_t>(m_NumberOfIterations) * ((occupied.size() + perIteration - 1) / perIteration);
+    std::vector<size_t> order(boxes.size());
+    std::iota(order.begin(), order.end(), 0);
+    const size_t perIteration = std::min<size_t>(m_RegionsPerIteration, order.size());
+    const size_t perEpoch = (order.size() + perIteration - 1) / perIteration;
+    const size_t iterations = static_cast<size_t>(m_NumberOfIterations) * perEpoch;
     // The cells a box touches: its own, the regularizer's next one, and the smoothing's reach.
     const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
     // One box's loss for the smoothed field `smoothed` (a leaf); `raw`, when given, takes each layer's unweighted
@@ -2653,6 +2650,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         n[d] = box.cell1[d] - box.cell0[d];
         cellCount *= n[d];
+      }
+      if (countByBox[b] == 0)
+      {
+        return regularizer(smoothed, box.cell0, box.cell1); // nothing of it counts: its edges alone, nothing read
       }
       // Where each cell reads the moving map, in cells: q = c + u (s_min units -> voxels -> cells), and the cells of
       // the moving map the box reads: what q reaches, one around for the interpolation and one spare, within the
@@ -2729,11 +2730,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     m_MetricValuesPerIteration.reserve(iterations);
     for (size_t iteration = 0; iteration < iterations; ++iteration)
     {
-      std::vector<size_t> drawn(perIteration);
-      for (size_t k = 0; k < perIteration; ++k)
+      const size_t slot = iteration % perEpoch;
+      if (slot == 0)
       {
-        drawn[k] = nextBox();
+        std::shuffle(order.begin(), order.end(), scheduleGenerator);
       }
+      const std::vector<size_t> drawn(
+        order.begin() + static_cast<std::ptrdiff_t>(slot * perIteration),
+        order.begin() + static_cast<std::ptrdiff_t>(std::min(order.size(), (slot + 1) * perIteration)));
       drawSubsets(channels);
       if (normalizes && !normalization.IsLatched(0))
       {
