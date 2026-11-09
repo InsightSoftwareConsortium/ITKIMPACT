@@ -25,6 +25,7 @@
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
+#include <itkTransform.h>
 #include <itkImpactModelConfiguration.h>
 #include <itkImpactLossNormalization.h>
 
@@ -211,6 +212,49 @@ public:
   itkBooleanMacro(InverseConsistency);
   /** @} */
 
+  /** \name Region sampling: an out-of-core run.
+   * With RegionSize > 0 the images are never read whole. One pass over boxes of the fixed grid, each RegionSize
+   * voxels of the finest axis a side (whole cells of the coarse grid), reads each box of the fixed image and of the
+   * moving image (brought onto the fixed grid through the identity, region by region) with its halo, extracts their
+   * features and pools them to the coarse grid, which stays on the device; the cost volume is then built by boxes of
+   * that grid, each within CostBoxBytes, never whole, and the coupled-convex iterations and the inverse consistency
+   * run on the pooled maps. The field is the whole-image run's to float precision. The images are read through their
+   * own pipelines (SetRequestedRegion then Update: an itk::ImageFileReader with UseStreamingOn reads those regions
+   * alone; an image in memory serves them from its buffer); the caller keeps its readers alive. Request a region of
+   * GetOutput() (or stream it to a writer) rather than the whole field, and take the field on the coarse grid from
+   * GetCoarseGridTransform(). PCA fits its basis on the whole feature map, a model resampling the image to its own
+   * voxel size and a layer at another resolution than the image do not line up with the boxes: refused. */
+  /** @{ */
+  /** Side of a box, in voxels of the finest axis; 0 (the default) reads the images whole. */
+  itkSetMacro(RegionSize, unsigned int);
+  itkGetConstMacro(RegionSize, unsigned int);
+  /** Voxels read around a box, on every axis, so that its features equal those of the whole image: the receptive
+   * field of the feature model, in its input's voxels (0 for a point-wise model). */
+  itkSetMacro(RegionHalo, unsigned int);
+  itkGetConstMacro(RegionHalo, unsigned int);
+  /** A transform from the fixed to the moving physical space the moving image and its mask are read through with
+   * RegionSize (an affine pre-alignment): each of their regions is brought onto the fixed grid through it, by linear
+   * interpolation (nearest neighbour for the mask), by a resampler that asks the moving image for that region alone.
+   * Without one, the identity. */
+  using TransformType = Transform<double, ImageDimension, ImageDimension>;
+  itkSetConstObjectMacro(MovingTransform, TransformType);
+  itkGetConstObjectMacro(MovingTransform, TransformType);
+  /** Bytes a box of the cost volume may take (default 1 GiB): the coarse grid is tiled into boxes whose cost over
+   * every candidate, with the margins the cell window and the candidates read, fits it. */
+  itkSetMacro(CostBoxBytes, SizeValueType);
+  itkGetConstMacro(CostBoxBytes, SizeValueType);
+  /** Bytes requested from the images and masks over the run. */
+  itkGetConstMacro(BytesRead, SizeValueType);
+  /** Whether the fixed (moving) image served its regions without buffering it whole. */
+  itkGetConstMacro(FixedImageStreamed, bool);
+  itkGetConstMacro(MovingImageStreamed, bool);
+  /** The field on the coarse grid as a transform: one sample per cell at the cell's centre, padded by two cells of
+   * replicated border, so that its linear interpolation is the map the dense field holds at every voxel. With
+   * RegionSize > 0 it is solved without allocating the dense field. */
+  DisplacementFieldTransformType *
+  GetCoarseGridTransform();
+  /** @} */
+
   /** The output displacement field (== GetOutput()), fixed grid, millimetres, x,y,z. */
   DisplacementFieldType *
   GetDisplacementField();
@@ -230,6 +274,14 @@ protected:
 
   void
   GenerateData() override;
+
+  /** With RegionSize > 0: the requested region of the dense field, interpolated from the coarse grid. */
+  void
+  DynamicThreadedGenerateData(const typename Superclass::OutputImageRegionType & region) override;
+
+  /** The region-sampled run (RegionSize > 0): solves the coarse grid without reading an image whole. */
+  void
+  SolveByRegions();
 
 private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
@@ -253,7 +305,19 @@ private:
   unsigned int m_DisplacementHalfWidth{ 3 };
   bool         m_InverseConsistency{ true };
 
+  unsigned int     m_RegionSize{ 0 };
+  unsigned int     m_RegionHalo{ 0 };
+  typename TransformType::ConstPointer m_MovingTransform{ nullptr };
+  SizeValueType    m_CostBoxBytes{ static_cast<SizeValueType>(1) << 30 };
+  SizeValueType    m_BytesRead{ 0 };
+  bool             m_FixedImageStreamed{ false };
+  bool             m_MovingImageStreamed{ false };
+  bool             m_Solved{ false };
+  ModifiedTimeType m_SolvedTime{ 0 };
+
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };
+  typename DisplacementFieldType::Pointer          m_CoarseGrid{ nullptr };
+  typename DisplacementFieldTransformType::Pointer m_CoarseGridTransform{ nullptr };
 };
 
 } // end namespace itk

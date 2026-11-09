@@ -29,7 +29,8 @@ set(ImpactTests
   itkTensorToImageFilterTest.cxx
   itkImageToFeaturesMapTest.cxx
   itkInterpolateVectorImageFunctionTest.cxx
-  itkImpactFineRegistrationRegionTest.cxx)
+  itkImpactFineRegistrationRegionTest.cxx
+  itkImpactCoarseRegistrationRegionTest.cxx)
 
 CreateTestDriver(Impact "${Impact-Test_LIBRARIES}" "${ImpactTests}")
 
@@ -80,6 +81,9 @@ itk_add_test(NAME itkInterpolateVectorImageFunctionTest
 # test's temporary directory and streamed back.
 itk_add_test(NAME itkImpactFineRegistrationRegionTest
   COMMAND ImpactTestDriver itkImpactFineRegistrationRegionTest
+  ${ITK_TEST_OUTPUT_DIR})
+itk_add_test(NAME itkImpactCoarseRegistrationRegionTest
+  COMMAND ImpactTestDriver itkImpactCoarseRegistrationRegionTest
   ${ITK_TEST_OUTPUT_DIR})
 
 # GoogleTest-based unit tests for the IMPACT backend. Self-contained: they use

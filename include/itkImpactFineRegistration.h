@@ -272,8 +272,9 @@ public:
    * the visits of every box, so that a cell is stepped as many times as in the dense run. */
   itkSetMacro(RegionsPerIteration, unsigned int);
   itkGetConstMacro(RegionsPerIteration, unsigned int);
-  /** How far the region read around a box extends past it, in voxels of the finest axis: half the receptive field of
-   * the feature model, so that its features on the box equal those of the whole image (0 for a point-wise model). */
+  /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
+   * receptive field of the feature model, in its input's voxels, so that its features on the box equal those of the
+   * whole image (0 for a point-wise model). */
   itkSetMacro(RegionHalo, unsigned int);
   itkGetConstMacro(RegionHalo, unsigned int);
   /** A transform from the fixed to the moving physical space applied before the field, outside the optimization and

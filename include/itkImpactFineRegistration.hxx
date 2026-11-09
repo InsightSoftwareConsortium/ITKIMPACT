@@ -1821,11 +1821,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       std::max<int64_t>(1, std::llround(static_cast<double>(regionVoxels[d]) / static_cast<double>(shrink[d])));
   }
   const std::vector<Impact::CellBox> boxes = Impact::TileCells(cells, perBox);
-  std::vector<int64_t>               halo(Dim, 0);
-  if (m_RegionHalo > 0)
-  {
-    halo = Impact::IsotropicVoxelCounts(voxelSide, static_cast<double>(m_RegionHalo));
-  }
+  // A model's receptive field is in its input's voxels, on every axis whatever their spacing.
+  const std::vector<int64_t> halo(Dim, static_cast<int64_t>(m_RegionHalo));
   // The cells' positions, {1, Dim, n...}, for the cells [c0, c1).
   auto cellPositions = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<torch::Tensor> axes;
