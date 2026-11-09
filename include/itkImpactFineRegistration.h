@@ -28,6 +28,7 @@
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
+#include <itkTransform.h>
 #include <itkImpactModelConfiguration.h>
 #include <itkImpactLossNormalization.h>
 
@@ -249,6 +250,56 @@ public:
   itkGetConstMacro(FeatureChunkSize, unsigned int);
   /** @} */
 
+  /** \name Region sampling: an out-of-core run.
+   * With RegionSize > 0 the images are never read whole: every iteration reads RegionsPerIteration boxes of the fixed
+   * grid, each RegionSize voxels of the finest axis a side (rounded to whole cells of the control grid), with their
+   * features, and the region of the moving image they read, through the images' own pipelines (SetRequestedRegion
+   * then Update: an itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them
+   * from its buffer). The boxes are visited in epochs, in an order drawn from Seed, skipping those the fixed mask does
+   * not reach. A box's loss is the dense loss restricted to its cells, weighed by its share of the counted cells, with
+   * the regularizer's differences whose first cell lies in it; Adam steps the cells the iteration touched and leaves
+   * the others as they are. Visiting every box at every iteration reproduces the whole-image run, so the schedule is
+   * the only approximation. Static mode, point-wise distances, feature layers at the image's resolution (MIND); the
+   * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
+   * displacement field may lie on any grid: it is read at the control points. The output is produced by region:
+   * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
+   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. */
+  /** @{ */
+  /** Side of a box, in voxels of the finest axis; 0 (the default) reads the images whole. */
+  itkSetMacro(RegionSize, unsigned int);
+  itkGetConstMacro(RegionSize, unsigned int);
+  /** Boxes read at every iteration when the pooled maps are not resident (default 1); NumberOfIterations then counts
+   * the visits of every box, so that a cell is stepped as many times as in the dense run. */
+  itkSetMacro(RegionsPerIteration, unsigned int);
+  itkGetConstMacro(RegionsPerIteration, unsigned int);
+  /** How far the region read around a box extends past it, in voxels of the finest axis: half the receptive field of
+   * the feature model, so that its features on the box equal those of the whole image (0 for a point-wise model). */
+  itkSetMacro(RegionHalo, unsigned int);
+  itkGetConstMacro(RegionHalo, unsigned int);
+  /** A transform from the fixed to the moving physical space applied before the field, outside the optimization and
+   * its regularizer (an affine pre-alignment, or a coarser registration's field): a fixed point x reads the moving
+   * image at T(x + u(x)). Each region of the moving image is brought onto the fixed grid through it, by linear
+   * interpolation (nearest neighbour for the moving mask); evaluated at the corners of a lattice of at most four
+   * voxels a step and interpolated linearly between them, exact for a linear transform. Unset: the identity, the
+   * moving image read on its own grid where the fixed one places it. */
+  using TransformType = Transform<double, ImageDimension, ImageDimension>;
+  itkSetConstObjectMacro(MovingTransform, TransformType);
+  itkGetConstObjectMacro(MovingTransform, TransformType);
+  /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it, one pass
+   * over the boxes pools them once and every iteration compares them whole (the dense run on the pooled maps,
+   * reading no image); past it, every iteration reads its RegionsPerIteration boxes. 0 (the default): half the
+   * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
+   * which route a run took. */
+  itkSetMacro(ResidentFeatureBudget, SizeValueType);
+  itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
+  itkGetConstMacro(ResidentFeatures, bool);
+  /** Bytes requested from the images and masks over the run. */
+  itkGetConstMacro(BytesRead, SizeValueType);
+  /** Whether the fixed (moving) image served its regions without buffering it whole. */
+  itkGetConstMacro(FixedImageStreamed, bool);
+  itkGetConstMacro(MovingImageStreamed, bool);
+  /** @} */
+
   /** \name Outputs. */
   /** @{ */
   /** The output displacement field (== GetOutput()), on the fixed grid, in millimetres. */
@@ -262,6 +313,12 @@ public:
   /** The moving image warped onto the fixed grid by the final field (for inspection). */
   WarpedImageType *
   GetWarpedMovingImage();
+
+  /** The (smoothed) control grid as a displacement field on its own grid, wrapped in a transform: the same map as the
+   * dense output, linearly interpolated, in GridShrinkFactor-fold fewer voxels. Solves the registration if it has not
+   * run yet, without allocating the dense field. */
+  DisplacementFieldTransformType *
+  GetControlGridTransform();
 
   /** The total (similarity + regularization) loss recorded at each Adam iteration. */
   const std::vector<double> &
@@ -286,6 +343,14 @@ protected:
   void
   GenerateData() override;
 
+  /** With RegionSize > 0: the requested region of the dense field, interpolated from the control grid. */
+  void
+  DynamicThreadedGenerateData(const typename Superclass::OutputImageRegionType & region) override;
+
+  /** The region-sampled run (RegionSize > 0): solves the control grid without reading an image whole. */
+  void
+  SolveByRegions();
+
 private:
   typename FixedImageType::ConstPointer   m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer  m_MovingImage{ nullptr };
@@ -303,26 +368,40 @@ private:
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };
 
-  unsigned int m_NumberOfIterations{ 80 };
-  double       m_LearningRate{ 1.0 };
-  double       m_Beta1{ 0.9 };
-  double       m_Beta2{ 0.999 };
-  double       m_Epsilon{ 1e-8 };
-  double       m_RegularizationWeight{ 1.25 };
-  unsigned int m_GridShrinkFactor{ 1 };
-  unsigned int m_ControlGridSmoothingIterations{ 0 };
-  int          m_FeatureMapUpdateInterval{ -1 };
-  bool         m_NormalizeLosses{ true };
-  unsigned int m_LNCCKernel{ 5 };
-  double       m_SamplingPercentage{ 1.0 };
-  unsigned int m_BatchSize{ 0 };
-  std::string  m_Mode{ "Static" };
-  unsigned int m_FeatureChunkSize{ 32 };
+  unsigned int  m_NumberOfIterations{ 80 };
+  double        m_LearningRate{ 1.0 };
+  double        m_Beta1{ 0.9 };
+  double        m_Beta2{ 0.999 };
+  double        m_Epsilon{ 1e-8 };
+  double        m_RegularizationWeight{ 1.25 };
+  unsigned int  m_GridShrinkFactor{ 1 };
+  unsigned int  m_ControlGridSmoothingIterations{ 0 };
+  int           m_FeatureMapUpdateInterval{ -1 };
+  bool          m_NormalizeLosses{ true };
+  unsigned int  m_LNCCKernel{ 5 };
+  double        m_SamplingPercentage{ 1.0 };
+  unsigned int  m_BatchSize{ 0 };
+  std::string   m_Mode{ "Static" };
+  unsigned int  m_FeatureChunkSize{ 32 };
+  unsigned int  m_RegionSize{ 0 };
+  unsigned int  m_RegionsPerIteration{ 1 };
+  unsigned int  m_RegionHalo{ 0 };
+  SizeValueType m_ResidentFeatureBudget{ 0 };
+  bool          m_ResidentFeatures{ false };
+
+  typename TransformType::ConstPointer m_MovingTransform{ nullptr };
+  SizeValueType                        m_BytesRead{ 0 };
+  bool                                 m_FixedImageStreamed{ false };
+  bool                                 m_MovingImageStreamed{ false };
+  bool                                 m_Solved{ false };
+  ModifiedTimeType                     m_SolvedTime{ 0 };
 
   // Auxiliary outputs (the primary displacement field is the ImageSource output 0).
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };
   typename WarpedImageType::Pointer                m_WarpedMovingImage{ nullptr };
   std::vector<double>                              m_MetricValuesPerIteration;
+  typename DisplacementFieldType::Pointer          m_ControlGrid{ nullptr };
+  typename DisplacementFieldTransformType::Pointer m_ControlGridTransform{ nullptr };
 };
 
 } // end namespace itk
