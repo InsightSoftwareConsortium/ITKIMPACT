@@ -1850,11 +1850,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   };
 
   // ---- Masks, read by regions on their own image's grid. ----
-  auto sameGrid = [](const auto * a, const auto * b) {
-    return a->GetLargestPossibleRegion().GetSize() == b->GetLargestPossibleRegion().GetSize() &&
-           a->GetSpacing() == b->GetSpacing() && a->GetOrigin() == b->GetOrigin() &&
-           a->GetDirection() == b->GetDirection();
-  };
+  auto sameGrid = [](const auto * a, const auto * b) { return Impact::SameGrid(a, b); };
   if (m_FixedMask.IsNotNull())
   {
     const_cast<MaskImageType *>(m_FixedMask.GetPointer())->UpdateOutputInformation();
@@ -1980,52 +1976,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                     const std::vector<int64_t> & c1,
                     const std::vector<int64_t> & extra,
                     std::vector<int64_t> &       lowPad,
-                    std::vector<int64_t> &       core) -> RegionType {
-    typename RegionType::IndexType index;
-    typename RegionType::SizeType  size;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      const int64_t start = windows[d].starts[c0[d]];
-      const int64_t end = windows[d].ends[c1[d] - 1];
-      const int64_t low = std::max<int64_t>(0, start - extra[d]);
-      const int64_t high = std::min<int64_t>(spatial[d], end + extra[d]);
-      index[Dim - 1 - d] = static_cast<IndexValueType>(low) + fixedRegion.GetIndex()[Dim - 1 - d];
-      size[Dim - 1 - d] = static_cast<SizeValueType>(high - low);
-      lowPad[d] = start - low;
-      core[d] = end - start;
-    }
-    return RegionType(index, size);
+                    std::vector<int64_t> &       core) {
+    return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core);
   };
-  auto cropCore = [&](torch::Tensor t, const std::vector<int64_t> & lowPad, const std::vector<int64_t> & core) {
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      t = t.narrow(2 + static_cast<int64_t>(d), lowPad[d], core[d]);
-    }
-    return t;
+  const auto cropCore = Impact::CropCore;
+  auto       windowsOf = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
+    return Impact::RelativeWindows(windows, c0, c1);
   };
-  // The pooling windows of the cells [c0, c1), relative to their span.
-  auto windowsOf = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
-    std::vector<Impact::PoolWindows> relative(Dim);
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      const int64_t base = windows[d].starts[c0[d]];
-      for (int64_t c = c0[d]; c < c1[d]; ++c)
-      {
-        relative[d].starts.push_back(windows[d].starts[c] - base);
-        relative[d].ends.push_back(windows[d].ends[c] - base);
-      }
-    }
-    return relative;
-  };
-  // `t` ({1, C, n...}) written over the cells [c0, c1) of `whole` ({1, C, cells...}).
-  auto writeCells = [&](torch::Tensor & whole, const std::vector<int64_t> & c0, const torch::Tensor & t) {
-    torch::Tensor view = whole;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      view = view.narrow(2 + static_cast<int64_t>(d), c0[d], t.size(2 + static_cast<int64_t>(d)));
-    }
-    view.copy_(t);
-  };
+  const auto writeCells = Impact::WriteCells;
 
   // ---- Occupancy: each box's cells in the fixed mask (share of their voxels >= 0.5), all of them without one. ----
   const std::vector<int64_t> noHalo(Dim, 0);
@@ -2074,29 +2032,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   bool                                       takesMetadata = false; // a model that reads the image's statistics
   if (featureMode)
   {
-    size_t layerCount = 0;
-    for (const ImpactModelConfiguration & config : m_FixedModelsConfiguration)
-    {
-      layerCount += NumberOfKeptLayers(config);
-      const std::vector<float> & voxel = config.GetVoxelSize();
-      for (unsigned int a = 0; a < Dim && voxel.size() == Dim; ++a)
-      {
-        const double spacing = m_FixedImage->GetSpacing()[a];
-        if (voxel[a] > 0.0f && std::abs(voxel[a] - spacing) > 1e-6 * spacing)
-        {
-          itkExceptionMacro("ImpactFineRegistration: " << config.GetModelPath()
-                                                       << " resamples the image to its voxel size, whose lattice a "
-                                                          "region does not line up with; give it the image's spacing, "
-                                                          "or no voxel size, with RegionSize.");
-        }
-      }
-      if (config.GetDimension() != Dim)
-      {
-        itkExceptionMacro("ImpactFineRegistration: " << config.GetModelPath() << " is a " << config.GetDimension()
-                                                     << "D model; RegionSize runs models of the image's dimension.");
-      }
-      takesMetadata = takesMetadata || config.GetImpl()->nArgs >= 4;
-    }
+    const Impact::RegionModels models =
+      Impact::CheckRegionModels(m_FixedModelsConfiguration, m_FixedImage->GetSpacing(), Dim, "ImpactFineRegistration");
+    const size_t layerCount = models.layerCount;
+    takesMetadata = models.takesMetadata;
     for (size_t l = 0; l < layerCount; ++l)
     {
       const std::string name = m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
@@ -2130,50 +2069,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   ImpactImageMetadata fixedMetadata, movingMetadata;
   if (takesMetadata)
   {
-    auto statistics = [&](const torch::Tensor & direction, auto && readBlocks) {
-      double  minimum = std::numeric_limits<double>::infinity(), maximum = -minimum, sum = 0.0, sumOfSquares = 0.0;
-      int64_t count = 0;
-      readBlocks([&](const torch::Tensor & block) {
-        const torch::Tensor values = block.to(torch::kFloat64);
-        minimum = std::min(minimum, values.min().template item<double>());
-        maximum = std::max(maximum, values.max().template item<double>());
-        sum += values.sum().template item<double>();
-        sumOfSquares += (values * values).sum().template item<double>();
-        count += values.numel();
-      });
-      const double mean = sum / static_cast<double>(std::max<int64_t>(count, 1));
-      const double variance =
-        count > 1
-          ? std::max(0.0, (sumOfSquares - sum * sum / static_cast<double>(count)) / static_cast<double>(count - 1))
-          : 0.0;
-      ImpactImageMetadata metadata;
-      metadata.stats = torch::tensor({ static_cast<float>(minimum),
-                                       static_cast<float>(maximum),
-                                       static_cast<float>(mean),
-                                       static_cast<float>(std::sqrt(variance)) },
-                                     torch::kFloat32);
-      metadata.direction = direction;
-      return metadata;
-    };
-    auto directionOf = [&](const auto & direction) {
-      torch::Tensor tensor = torch::empty({ static_cast<int64_t>(Dim), static_cast<int64_t>(Dim) }, torch::kInt16);
-      for (unsigned int r = 0; r < Dim; ++r)
-      {
-        for (unsigned int c = 0; c < Dim; ++c)
-        {
-          tensor[r][c] = static_cast<int16_t>(std::llround(direction(r, c)));
-        }
-      }
-      return tensor;
-    };
-    fixedMetadata = statistics(directionOf(m_FixedImage->GetDirection()), [&](auto && take) {
+    fixedMetadata = Impact::MetadataByBlocks(m_FixedImage->GetDirection(), Dim, [&](auto && take) {
       for (const Impact::CellBox & box : boxes)
       {
         std::vector<int64_t> lowPad(Dim), core(Dim);
         take(readFixed(spanOf(box.cell0, box.cell1, noHalo, lowPad, core)));
       }
     });
-    movingMetadata = statistics(directionOf(m_MovingImage->GetDirection()), [&](auto && take) {
+    movingMetadata = Impact::MetadataByBlocks(m_MovingImage->GetDirection(), Dim, [&](auto && take) {
       // The moving image in its own grid, in blocks of the box size.
       std::vector<int64_t> extent(Dim), step(Dim), counts(Dim);
       size_t               total = 1;
@@ -2200,63 +2103,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
     });
   }
-  auto useMetadata = [&](const std::vector<ImpactModelConfiguration> & configs, const ImpactImageMetadata & metadata) {
-    for (const auto & config : configs)
-    {
-      config.GetImpl()->imageMetadata = metadata;
-    }
-  };
   // The feature layers of an image region {1, 1, span...}, at its resolution, each model run on the region whole in
   // one forward (a region is sized to fit the device, so the tiler ExtractFeatureLayers measures the device for at
   // every call has nothing to cut); the region itself in intensity mode.
-  auto layersOf = [&](const torch::Tensor & image, bool moving) -> std::vector<torch::Tensor> {
-    if (!featureMode)
-    {
-      return { image };
-    }
-    const std::vector<ImpactModelConfiguration> & configs = moving ? movingConfigs : m_FixedModelsConfiguration;
-    if (takesMetadata)
-    {
-      useMetadata(configs, moving ? movingMetadata : fixedMetadata);
-    }
-    std::vector<torch::Tensor> layers;
-    torch::NoGradGuard         noGrad;
-    for (const ImpactModelConfiguration & config : configs)
-    {
-      ModelTo(config, device);
-      torch::Tensor input = image.to(GetModelDtype(config));
-      if (config.GetNumberOfChannels() > 1)
-      {
-        std::vector<int64_t> repeats(Dim + 2, 1);
-        repeats[1] = static_cast<int64_t>(config.GetNumberOfChannels());
-        input = input.repeat(repeats);
-      }
-      const std::vector<torch::jit::IValue> outputs = Forward(config, input);
-      const std::vector<bool> &             mask = config.GetLayersMask();
-      for (size_t i = 0; i < outputs.size(); ++i)
-      {
-        if (i < mask.size() && !mask[i])
-        {
-          continue;
-        }
-        const torch::Tensor layer = Impact::NormalizeFeatureChannels(
-          outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1);
-        if (!std::equal(layer.sizes().begin() + 2, layer.sizes().end(), image.sizes().begin() + 2))
-        {
-          itkExceptionMacro("ImpactFineRegistration: a feature layer of another resolution than the image ("
-                            << layer.sizes() << " for " << image.sizes()
-                            << ") cannot be computed by regions, its lattice not lining up with the image's; "
-                               "RegionSize takes layers at the image's resolution (MIND).");
-        }
-        layers.push_back(layer.contiguous());
-      }
-    }
-    if (layers.size() != losses.size())
-    {
-      itkExceptionMacro("ImpactFineRegistration: the models produced " << layers.size() << " feature layers where "
-                                                                       << losses.size() << " are kept.");
-    }
-    return layers;
+  auto layersOf = [&](const torch::Tensor & image, bool moving) {
+    return Impact::RegionLayers<Dim>(featureMode ? (moving ? movingConfigs : m_FixedModelsConfiguration)
+                                                 : std::vector<ImpactModelConfiguration>{},
+                                     image,
+                                     device,
+                                     losses.size(),
+                                     takesMetadata ? &(moving ? movingMetadata : fixedMetadata) : nullptr,
+                                     "ImpactFineRegistration");
   };
   // The fixed features pooled over the cells [c0, c1): {1, C, n...} per layer.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {

@@ -22,6 +22,9 @@
 // reading a region through an image's own pipeline, the cell lattice its boxes tile, the pooling windows of the
 // cells, and Adam on the cells an iteration touched. LibTorch-backed: included by the .hxx only.
 
+#include "itkImpactModelConfiguration.h"
+#include "itkImpactTorchRegistrationHelpers.h"
+
 #include <itkImageRegion.h>
 #include <itkImageRegionConstIterator.h>
 #include <itkMacro.h>
@@ -38,6 +41,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <string>
 #include <vector>
 #if !defined(_WIN32)
 #  include <unistd.h>
@@ -146,6 +151,250 @@ ReadRegion(const TImage * image, const typename TImage::RegionType & region)
     buffer[i++] = static_cast<float>(it.Get());
   }
   return torch::from_blob(buffer.data(), shape, torch::kFloat32).clone().unsqueeze(0).unsqueeze(0);
+}
+
+/** The windows of `cells` cells of `voxelsPerCell` voxels each from the first voxel: the coarse stage's cells, the
+ * tail voxels past the last one dropped. */
+inline PoolWindows
+UniformPoolWindows(int64_t cells, int64_t voxelsPerCell)
+{
+  PoolWindows windows;
+  for (int64_t i = 0; i < cells; ++i)
+  {
+    windows.starts.push_back(i * voxelsPerCell);
+    windows.ends.push_back((i + 1) * voxelsPerCell);
+  }
+  return windows;
+}
+
+/** The windows of the cells [c0, c1), relative to their span. */
+inline std::vector<PoolWindows>
+RelativeWindows(const std::vector<PoolWindows> & windows, const std::vector<int64_t> & c0, const std::vector<int64_t> & c1)
+{
+  std::vector<PoolWindows> relative(windows.size());
+  for (size_t d = 0; d < windows.size(); ++d)
+  {
+    const int64_t base = windows[d].starts[c0[d]];
+    for (int64_t c = c0[d]; c < c1[d]; ++c)
+    {
+      relative[d].starts.push_back(windows[d].starts[c] - base);
+      relative[d].ends.push_back(windows[d].ends[c] - base);
+    }
+  }
+  return relative;
+}
+
+/** Whether two images share one grid: size, spacing, origin and direction. */
+template <typename TA, typename TB>
+bool
+SameGrid(const TA * a, const TB * b)
+{
+  return a->GetLargestPossibleRegion().GetSize() == b->GetLargestPossibleRegion().GetSize() &&
+         a->GetSpacing() == b->GetSpacing() && a->GetOrigin() == b->GetOrigin() &&
+         a->GetDirection() == b->GetDirection();
+}
+
+/** The region of a grid (`spatial` in tensor order, `index` its first index) that the cells [c0, c1) of `windows`
+ * span, `extra` voxels around on each tensor axis, clipped to the grid: `lowPad` what the clipping left of the margin
+ * on the low side, `core` the cells' own extent. */
+template <typename TRegion>
+TRegion
+CellSpan(const std::vector<int64_t> &     c0,
+         const std::vector<int64_t> &     c1,
+         const std::vector<int64_t> &     extra,
+         const std::vector<PoolWindows> & windows,
+         const std::vector<int64_t> &     spatial,
+         const typename TRegion::IndexType & index,
+         std::vector<int64_t> &           lowPad,
+         std::vector<int64_t> &           core)
+{
+  constexpr unsigned int Dim = TRegion::ImageDimension;
+  typename TRegion::IndexType start;
+  typename TRegion::SizeType  size;
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t first = windows[d].starts[c0[d]];
+    const int64_t end = windows[d].ends[c1[d] - 1];
+    const int64_t low = std::max<int64_t>(0, first - extra[d]);
+    const int64_t high = std::min<int64_t>(spatial[d], end + extra[d]);
+    start[Dim - 1 - d] = static_cast<IndexValueType>(low) + index[Dim - 1 - d];
+    size[Dim - 1 - d] = static_cast<SizeValueType>(high - low);
+    lowPad[d] = first - low;
+    core[d] = end - first;
+  }
+  return TRegion(start, size);
+}
+
+/** `t` ({1, C, span...}) narrowed to the cells' own extent: `lowPad` dropped on the low side, `core` kept. */
+inline torch::Tensor
+CropCore(torch::Tensor t, const std::vector<int64_t> & lowPad, const std::vector<int64_t> & core)
+{
+  for (size_t d = 0; d < core.size(); ++d)
+  {
+    t = t.narrow(2 + static_cast<int64_t>(d), lowPad[d], core[d]);
+  }
+  return t;
+}
+
+/** `t` narrowed to [lo, hi) on each spatial axis, the first of them at `firstAxis`. */
+inline torch::Tensor
+NarrowTo(torch::Tensor t, const std::vector<int64_t> & lo, const std::vector<int64_t> & hi, int64_t firstAxis)
+{
+  for (size_t d = 0; d < lo.size(); ++d)
+  {
+    t = t.narrow(firstAxis + static_cast<int64_t>(d), lo[d], hi[d] - lo[d]);
+  }
+  return t;
+}
+
+/** `t` ({1, C, n...}) written over the cells [c0, c1) of `whole` ({1, C, cells...}). */
+inline void
+WriteCells(torch::Tensor & whole, const std::vector<int64_t> & c0, const torch::Tensor & t)
+{
+  torch::Tensor view = whole;
+  for (size_t d = 0; d < c0.size(); ++d)
+  {
+    view = view.narrow(2 + static_cast<int64_t>(d), c0[d], t.size(2 + static_cast<int64_t>(d)));
+  }
+  view.copy_(t);
+}
+
+/** What the feature models of a region-sampled run must be: run at the image's resolution (no voxel size of
+ * their own, whose lattice a region does not line up with) and of the image's dimension. The kept layers over the
+ * models, and whether one reads the image's statistics. */
+struct RegionModels
+{
+  size_t layerCount{ 0 };
+  bool   takesMetadata{ false };
+};
+
+template <typename TSpacing>
+RegionModels
+CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
+                  const TSpacing &                              spacing,
+                  unsigned int                                  dim,
+                  const char *                                  who)
+{
+  RegionModels models;
+  for (const ImpactModelConfiguration & config : configs)
+  {
+    models.layerCount += NumberOfKeptLayers(config);
+    const std::vector<float> & voxel = config.GetVoxelSize();
+    for (unsigned int a = 0; a < dim && voxel.size() == dim; ++a)
+    {
+      if (voxel[a] > 0.0f && std::abs(voxel[a] - spacing[a]) > 1e-6 * spacing[a])
+      {
+        itkGenericExceptionMacro(<< who << ": " << config.GetModelPath()
+                                 << " resamples the image to its voxel size, whose lattice a region does not line up "
+                                    "with; give it the image's spacing, or no voxel size, with RegionSize.");
+      }
+    }
+    if (config.GetDimension() != dim)
+    {
+      itkGenericExceptionMacro(<< who << ": " << config.GetModelPath() << " is a " << config.GetDimension()
+                               << "D model; RegionSize runs models of the image's dimension.");
+    }
+    models.takesMetadata = models.takesMetadata || config.GetImpl()->nArgs >= 4;
+  }
+  return models;
+}
+
+/** The image's statistics (minimum, maximum, mean, sigma, as StatisticsImageFilter takes them) accumulated over
+ * the blocks `readBlocks` hands over (it calls its argument with each block's tensor), with `direction`: what a
+ * metadata-aware model (MIND) reads. */
+template <typename TDirection, typename TReadBlocks>
+ImpactImageMetadata
+MetadataByBlocks(const TDirection & direction, unsigned int dim, TReadBlocks && readBlocks)
+{
+  double  minimum = std::numeric_limits<double>::infinity(), maximum = -minimum, sum = 0.0, sumOfSquares = 0.0;
+  int64_t count = 0;
+  readBlocks([&](const torch::Tensor & block) {
+    const torch::Tensor values = block.to(torch::kFloat64);
+    minimum = std::min(minimum, values.min().template item<double>());
+    maximum = std::max(maximum, values.max().template item<double>());
+    sum += values.sum().template item<double>();
+    sumOfSquares += (values * values).sum().template item<double>();
+    count += values.numel();
+  });
+  const double mean = sum / static_cast<double>(std::max<int64_t>(count, 1));
+  const double variance =
+    count > 1 ? std::max(0.0, (sumOfSquares - sum * sum / static_cast<double>(count)) / static_cast<double>(count - 1))
+              : 0.0;
+  ImpactImageMetadata metadata;
+  metadata.stats = torch::tensor({ static_cast<float>(minimum),
+                                   static_cast<float>(maximum),
+                                   static_cast<float>(mean),
+                                   static_cast<float>(std::sqrt(variance)) },
+                                 torch::kFloat32);
+  metadata.direction = torch::empty({ static_cast<int64_t>(dim), static_cast<int64_t>(dim) }, torch::kInt16);
+  for (unsigned int r = 0; r < dim; ++r)
+  {
+    for (unsigned int c = 0; c < dim; ++c)
+    {
+      metadata.direction[r][c] = static_cast<int16_t>(std::llround(direction(r, c)));
+    }
+  }
+  return metadata;
+}
+
+/** The kept feature layers of an image region ({1, 1, span...}) at its resolution, each model run on the region
+ * whole in one forward, `metadata` (when given) set on the configurations first; the region itself with no model.
+ * `layerCount` is what the caller keeps, checked. */
+template <unsigned int Dim>
+std::vector<torch::Tensor>
+RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
+             const torch::Tensor &                         image,
+             const torch::Device &                         device,
+             size_t                                        layerCount,
+             const ImpactImageMetadata *                   metadata,
+             const char *                                  who)
+{
+  if (configs.empty())
+  {
+    return { image };
+  }
+  std::vector<torch::Tensor> layers;
+  torch::NoGradGuard         noGrad;
+  for (const ImpactModelConfiguration & config : configs)
+  {
+    if (metadata != nullptr)
+    {
+      config.GetImpl()->imageMetadata = *metadata;
+    }
+    ModelTo(config, device);
+    torch::Tensor input = image.to(GetModelDtype(config));
+    if (config.GetNumberOfChannels() > 1)
+    {
+      std::vector<int64_t> repeats(Dim + 2, 1);
+      repeats[1] = static_cast<int64_t>(config.GetNumberOfChannels());
+      input = input.repeat(repeats);
+    }
+    const std::vector<torch::jit::IValue> outputs = Forward(config, input);
+    const std::vector<bool> &             mask = config.GetLayersMask();
+    for (size_t i = 0; i < outputs.size(); ++i)
+    {
+      if (i < mask.size() && !mask[i])
+      {
+        continue;
+      }
+      const torch::Tensor layer =
+        NormalizeFeatureChannels(outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1);
+      if (!std::equal(layer.sizes().begin() + 2, layer.sizes().end(), image.sizes().begin() + 2))
+      {
+        itkGenericExceptionMacro(<< who << ": a feature layer of another resolution than the image (" << layer.sizes()
+                                 << " for " << image.sizes()
+                                 << ") cannot be computed by regions, its lattice not lining up with the image's; "
+                                    "RegionSize takes layers at the image's resolution (MIND).");
+      }
+      layers.push_back(layer.contiguous());
+    }
+  }
+  if (layers.size() != layerCount)
+  {
+    itkGenericExceptionMacro(<< who << ": the models produced " << layers.size() << " feature layers where "
+                             << layerCount << " are kept.");
+  }
+  return layers;
 }
 
 /** The boxes of whole cells tiling a lattice of `cells` cells by `perBox` cells a box, in tensor axis order; the
