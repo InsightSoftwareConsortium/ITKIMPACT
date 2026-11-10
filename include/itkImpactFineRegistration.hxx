@@ -2741,17 +2741,20 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       drawSubsets(channels);
       if (normalizes && !normalization.IsLatched(0))
       {
-        // Each layer's value over this iteration's boxes at the starting field, without the graph.
+        // Each layer's value over this iteration's boxes at the starting field, without the graph, over the share of
+        // the cells those boxes hold: the dense run's mean estimated on the boxes drawn.
         torch::NoGradGuard  noGrad;
         std::vector<double> raw(losses.size(), 0.0);
         const torch::Tensor smoothedStart = smoothControl(theta.detach());
+        double              drawnShare = 0.0;
         for (const size_t b : drawn)
         {
           boxLoss(b, smoothedStart, &raw);
+          drawnShare += static_cast<double>(countByBox[b]) / totalCount;
         }
         for (size_t l = 0; l < losses.size(); ++l)
         {
-          normalization.Latch(l, raw[l]);
+          normalization.Latch(l, drawnShare > 0.0 ? raw[l] / drawnShare : raw[l]);
         }
       }
       // The boxes back-propagate into the smoothed field as a leaf, and its gradient crosses the smoothing passes to
