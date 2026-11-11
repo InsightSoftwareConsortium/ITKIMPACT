@@ -170,7 +170,8 @@ CoarseMaskWeight(const torch::Tensor & fixedShare, const torch::Tensor & shifted
 /** Add `weight` times one feature layer's coarse cost volume to `cost` ({L, coarse...}): for each of the L =
  * prod_a (2 halfWidths[a] + 1) candidate displacements -- `halfWidths` per tensor axis, in coarse voxels, the last
  * tensor axis (ITK x) running fastest, the order of the solver's displacement table --, the CoarseLayerCost of `moving`
- * shifted by it (zeros past the image) against `fixed`, both {1, C, coarse...}. With masks, `fixedShare` and `movingShare`
+ * shifted by it (zeros past the image) against `fixed`, both {1, C, coarse...}. With masks, `fixedShare` and
+ * `movingShare`
  * ({1, 1, coarse...}, either undefined when its mask is absent) weigh the cells, the moving one shifted with the
  * features (zero outside the image). */
 /** AccumulateCoarseCost with the moving features and share already padded by the half-widths (`padded`,
@@ -257,12 +258,11 @@ CoarseMaskSupport(const torch::Tensor &        fixedShare,
                   c10::IntArrayRef             coarse,
                   int64_t                      candidates)
 {
-  return CoarseMaskSupportPadded<Dim>(
-    fixedShare,
-    movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths) : movingShare,
-    halfWidths,
-    coarse,
-    candidates);
+  return CoarseMaskSupportPadded<Dim>(fixedShare,
+                                      movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths) : movingShare,
+                                      halfWidths,
+                                      coarse,
+                                      candidates);
 }
 
 /** A masked cost volume ({L, coarse...}) where `support` says it has no data: a candidate without data costs as much as
@@ -654,8 +654,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     // over the tail a size that is no multiple of the spacing leaves. ----
     torch::Tensor dispFull; // {1, Dim, spatial...}, full-res voxel units, z,y,x
     if constexpr (ImageDimension == 3)
-      dispFull = F::interpolate(
-        field, F::InterpolateFuncOptions().size(spatial).mode(torch::kTrilinear).align_corners(false));
+      dispFull =
+        F::interpolate(field, F::InterpolateFuncOptions().size(spatial).mode(torch::kTrilinear).align_corners(false));
     else
       dispFull =
         F::interpolate(field, F::InterpolateFuncOptions().size(spatial).mode(torch::kBilinear).align_corners(false));
@@ -727,9 +727,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
         else
         {
           const torch::Tensor cellWeight = Impact::CoarseMaskWeight(fixedShare, movingShare);
-          const torch::Tensor terms =
-            distance.IsPerPointMean() ? distance.forwardPoints(fixed[l], moving[l]).nan_to_num(1.0).unsqueeze(1)
-                                      : Impact::CoarseLayerCost<Dim>(distance, fixed[l], moving[l], cellWeight);
+          const torch::Tensor terms = distance.IsPerPointMean()
+                                        ? distance.forwardPoints(fixed[l], moving[l]).nan_to_num(1.0).unsqueeze(1)
+                                        : Impact::CoarseLayerCost<Dim>(distance, fixed[l], moving[l], cellWeight);
           value = ((terms * cellWeight).sum() / cellWeight.sum().clamp_min(1e-12)).template item<double>();
         }
         weight *= normalization.Latch(l, value);
@@ -1005,7 +1005,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     // The boxes of cells read at a time: RegionSize voxels a side, whole cells.
     const std::vector<int64_t> regionVoxels(Dim, static_cast<int64_t>(m_RegionSize));
-    std::vector<int64_t> perBox(Dim);
+    std::vector<int64_t>       perBox(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
       perBox[d] = std::max<int64_t>(1, regionVoxels[d] / cellVoxels[d]);
@@ -1019,7 +1019,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // grid likewise through the identity. An image already on the grid, with nothing to read it through, is read as
     // it is. ----
     const typename TransformType::ConstPointer identity = IdentityTransform<double, Dim>::New().GetPointer();
-    std::vector<ProcessObject::Pointer>       resamplers; // alive for as long as their outputs are read
+    std::vector<ProcessObject::Pointer>        resamplers; // alive for as long as their outputs are read
     auto onFixedGrid = [&](auto image, auto interpolator, const TransformType * transform) {
       using ImageType = std::remove_const_t<std::remove_pointer_t<decltype(image)>>;
       using ResampleType = ResampleImageFilter<ImageType, ImageType, double>;
@@ -1170,11 +1170,11 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       halo, cellVoxels, device, !m_MovingModelsConfiguration.empty(), layersOf, "ImpactCoarseRegistration");
     for (size_t b = 0; b < boxes.size(); ++b)
     {
-      const Impact::CellBox &    box = boxes[b];
-      std::vector<int64_t>       lowPad(Dim), low(Dim);
-      const RegionType           span = spanOf(box.cell0, box.cell1, lattices.reach, lowPad, lattices.align);
-      const torch::Tensor        fixedSpan = readFixed(span);
-      const torch::Tensor        movingSpan = readMoving(span);
+      const Impact::CellBox & box = boxes[b];
+      std::vector<int64_t>    lowPad(Dim), low(Dim);
+      const RegionType        span = spanOf(box.cell0, box.cell1, lattices.reach, lowPad, lattices.align);
+      const torch::Tensor     fixedSpan = readFixed(span);
+      const torch::Tensor     movingSpan = readMoving(span);
       for (unsigned int d = 0; d < Dim; ++d)
       {
         low[d] = windows[d].starts[box.cell0[d]] - lowPad[d];
@@ -1194,11 +1194,10 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         }
         const torch::Tensor share = Impact::SpanMaskShare<Dim>(mask, lattice, low, spatial);
         const torch::Tensor count = toCells(share, lattice);
-        return torch::where(
-          count > 0.0, toCells(layer * share, lattice) / torch::where(count > 0.0, count, 1.0), 0.0);
+        return torch::where(count > 0.0, toCells(layer * share, lattice) / torch::where(count > 0.0, count, 1.0), 0.0);
       };
       const Impact::LayerLattice voxels = Impact::ImageLattice(Dim);
-      torch::Tensor fixedMaskBox, movingMaskBox;
+      torch::Tensor              fixedMaskBox, movingMaskBox;
       if (fixedMask.IsNotNull())
       {
         fixedMaskBox = readMask(fixedMask, span);
@@ -1219,7 +1218,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           const int64_t kept = l < m_SubsetFeatures.size() ? static_cast<int64_t>(m_SubsetFeatures[l]) : 0;
           if (kept > 0 && kept < channels)
           {
-            subset[l] = torch::randperm(channels, torch::TensorOptions().dtype(torch::kLong)).narrow(0, 0, kept).to(device);
+            subset[l] =
+              torch::randperm(channels, torch::TensorOptions().dtype(torch::kLong)).narrow(0, 0, kept).to(device);
           }
           std::vector<int64_t> shape{ 1, subset[l].defined() ? kept : channels };
           shape.insert(shape.end(), coarse.begin(), coarse.end());
@@ -1250,9 +1250,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // to the box. ----
     const int64_t margin = 2;
     const double  perCell = 8.0 * static_cast<double>(L); // the cost over the candidates, and as much in transients
-    const double  side =
-      std::pow(static_cast<double>(std::max<SizeValueType>(m_CostBoxBytes, 1)) / perCell, 1.0 / static_cast<double>(Dim)) -
-      2.0 * static_cast<double>(margin);
+    const double  side = std::pow(static_cast<double>(std::max<SizeValueType>(m_CostBoxBytes, 1)) / perCell,
+                                 1.0 / static_cast<double>(Dim)) -
+                        2.0 * static_cast<double>(margin);
     const std::vector<int64_t>         perCost(Dim, std::max<int64_t>(1, static_cast<int64_t>(std::floor(side))));
     const std::vector<Impact::CellBox> costBoxes = Impact::TileCells(coarse, perCost);
     // `only` >= 0: that layer alone, unweighed (BalanceLosses measures each layer's spread); `support` comes back as
@@ -1283,7 +1283,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       auto shiftWindow = [&](const torch::Tensor & t) {
         return F::pad(Impact::NarrowTo(t, loM, hiM, 2), F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
       };
-      const torch::Tensor  refShare = referenceShare.defined() ? Impact::NarrowTo(referenceShare, lo, hi, 2) : referenceShare;
+      const torch::Tensor refShare =
+        referenceShare.defined() ? Impact::NarrowTo(referenceShare, lo, hi, 2) : referenceShare;
       const torch::Tensor  paddedShare = shiftShare.defined() ? shiftWindow(shiftShare) : shiftShare;
       std::vector<int64_t> shape{ L };
       for (unsigned int d = 0; d < Dim; ++d)

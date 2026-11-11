@@ -234,8 +234,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   if (control->GetDisplacementField()->GetLargestPossibleRegion().GetSize()[0] != 28)
   {
     std::cerr << "The control grid has " << control->GetDisplacementField()->GetLargestPossibleRegion().GetSize()
-              << " samples where 28 x 24 x 20 were expected: 24 x 20 x 16 cells, two of border each side."
-              << std::endl;
+              << " samples where 28 x 24 x 20 were expected: 24 x 20 x 16 cells, two of border each side." << std::endl;
     return EXIT_FAILURE;
   }
   {
@@ -358,8 +357,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     itk::ImageRegionIteratorWithIndex<FieldType> cell(coarse, coarseRegion);
     for (cell.GoToBegin(); !cell.IsAtEnd(); ++cell)
     {
-      const auto            index = cell.GetIndex();
-      FieldType::PixelType  value;
+      const auto           index = cell.GetIndex();
+      FieldType::PixelType value;
       value[0] = static_cast<float>(2.0 * std::sin(index[0] / 1.3));
       value[1] = static_cast<float>(2.0 * std::cos(index[1] / 1.7));
       value[2] = static_cast<float>(std::sin((index[0] + index[2]) / 1.1));

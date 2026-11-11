@@ -333,9 +333,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       itkExceptionMacro("InitialDisplacementField must be defined on the fixed-image grid.");
     }
-    torch::Tensor initField =
-      Impact::DisplacementToVoxelField<ImageDimension>(
-        m_InitialDisplacementField, m_FixedImage->GetSpacing(), m_FixedImage->GetDirection(), device); // voxels
+    torch::Tensor initField = Impact::DisplacementToVoxelField<ImageDimension>(
+      m_InitialDisplacementField, m_FixedImage->GetSpacing(), m_FixedImage->GetDirection(), device); // voxels
     if (coarseSpatial != spatial)
     {
       if constexpr (ImageDimension == 3)
@@ -434,7 +433,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       return F::interpolate(field,
                             F::InterpolateFuncOptions().size(target).mode(torch::kTrilinear).align_corners(false));
     else
-      return F::interpolate(field, F::InterpolateFuncOptions().size(target).mode(torch::kBilinear).align_corners(false));
+      return F::interpolate(field,
+                            F::InterpolateFuncOptions().size(target).mode(torch::kBilinear).align_corners(false));
   };
 
   // Map the (optionally low-resolution) control grid to a full-resolution displacement field:
@@ -584,18 +584,19 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     return (l < subsets.size() && subsets[l].defined()) ? layer.index_select(1, subsets[l]) : layer;
   };
   // Layer l's loss between two feature maps on one grid ({1, C, spatial...}): a spatial distance (LNCC) reads the
-  // maps whole (its window LNCCKernel voxels of the image along every axis), the others compare their feature vectors voxel by voxel; over the voxels `mask` keeps, when given.
+  // maps whole (its window LNCCKernel voxels of the image along every axis), the others compare their feature vectors
+  // voxel by voxel; over the voxels `mask` keeps, when given.
   auto layerLoss = [&](size_t                l,
                        const torch::Tensor & fixedMap,
                        const torch::Tensor & movingMap,
                        const torch::Tensor & mask = {}) -> torch::Tensor {
-    return Impact::MapLoss<ImageDimension>(
-      *losses[l],
-      fixedMap,
-      movingMap,
-      mask,
-      losses[l]->IsSpatial() ? Impact::IsotropicWindow(spatial, fixedMap.sizes(), m_LNCCKernel)
-                             : std::vector<int64_t>{});
+    return Impact::MapLoss<ImageDimension>(*losses[l],
+                                           fixedMap,
+                                           movingMap,
+                                           mask,
+                                           losses[l]->IsSpatial()
+                                             ? Impact::IsotropicWindow(spatial, fixedMap.sizes(), m_LNCCKernel)
+                                             : std::vector<int64_t>{});
   };
   // The masks on a grid of `size` voxels: the fixed one as bool (its share of each voxel >= 0.5), the moving one as its
   // share, to be warped; undefined when absent.
@@ -994,10 +995,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
 
   // ---- 4. Adam loop (entirely on device; no host copies). ----
   torch::optim::Adam optimizer(
-    { theta }, torch::optim::AdamOptions(m_LearningRate)
-                 .betas(std::make_tuple(m_Beta1, m_Beta2))
-                 // Epsilon weighs against the gradient per control cell, as in ConvexAdam, whose parameters count cells.
-                 .eps(m_Epsilon / static_cast<double>(std::max(1u, m_GridShrinkFactor))));
+    { theta },
+    torch::optim::AdamOptions(m_LearningRate)
+      .betas(std::make_tuple(m_Beta1, m_Beta2))
+      // Epsilon weighs against the gradient per control cell, as in ConvexAdam, whose parameters count cells.
+      .eps(m_Epsilon / static_cast<double>(std::max(1u, m_GridShrinkFactor))));
 
   m_MetricValuesPerIteration.clear();
   m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
@@ -1124,9 +1126,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           const torch::Tensor displacement = F::grid_sample(smoothedControl.detach(), centres, controlOpts)
                                                .reshape({ static_cast<int64_t>(ImageDimension), kept.size(0) })
                                                .t();
-          const torch::Tensor holds =
-            F::grid_sample(movingMaskShare, centres + (displacement / imageScale).flip(-1).reshape(where), sampleOpts) >=
-            0.5;
+          const torch::Tensor holds = F::grid_sample(movingMaskShare,
+                                                     centres + (displacement / imageScale).flip(-1).reshape(where),
+                                                     sampleOpts) >= 0.5;
           kept = kept.index_select(0, holds.flatten().nonzero().flatten().to(torch::kCPU));
         }
         const int64_t n = kept.size(0);
@@ -1142,16 +1144,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           // moving image as the field warps it (differentiable, so the gradient reaches the control grid). The patch
           // voxels are placed a batch at a time, as grid_sample coordinates (x, y, z: ITK order).
           auto patchesOf = [&](size_t i, int64_t begin, int64_t end, bool moving) {
-            const torch::Tensor grid = (Impact::SampledPatchPositions<ImageDimension>(m_FixedModelsConfiguration[i],
-                                                                                     kept.narrow(0, begin, end - begin),
-                                                                                     fixedSpacing,
-                                                                                     m_Seed,
-                                                                                     i,
-                                                                                     {},
-                                                                                     onDevice) +
-                                          0.5) /
-                                         toGridOnDevice -
-                                       1.0;
+            const torch::Tensor grid =
+              (Impact::SampledPatchPositions<ImageDimension>(m_FixedModelsConfiguration[i],
+                                                             kept.narrow(0, begin, end - begin),
+                                                             fixedSpacing,
+                                                             m_Seed,
+                                                             i,
+                                                             {},
+                                                             onDevice) +
+               0.5) /
+                toGridOnDevice -
+              1.0;
             const int64_t        samples = grid.size(0) * grid.size(1);
             std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, samples, Dim}
             where[ImageDimension] = samples;
@@ -1159,8 +1162,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             torch::Tensor at = grid.reshape(where);
             if (moving)
             {
-              const torch::Tensor displacement =
-                F::grid_sample(smoothed, at, controlOpts).reshape({ static_cast<int64_t>(ImageDimension), samples }).t();
+              const torch::Tensor displacement = F::grid_sample(smoothed, at, controlOpts)
+                                                   .reshape({ static_cast<int64_t>(ImageDimension), samples })
+                                                   .t();
               at = at + (displacement / imageScale).flip(-1).reshape(where);
             }
             std::vector<int64_t> shape{ end - begin, 1 };
@@ -1599,18 +1603,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   output->SetDirection(m_FixedImage->GetDirection());
   output->Allocate();
 
-  Impact::WriteVoxelFieldToDisplacement<ImageDimension>(controlGridToFullField(theta.detach()),
-                                                        m_FixedImage->GetSpacing(),
-                                                        m_FixedImage->GetDirection(),
-                                                        output);
+  Impact::WriteVoxelFieldToDisplacement<ImageDimension>(
+    controlGridToFullField(theta.detach()), m_FixedImage->GetSpacing(), m_FixedImage->GetDirection(), output);
 
   // Wrap the field in a ready-to-use transform.
   m_DisplacementFieldTransform = DisplacementFieldTransformType::New();
   m_DisplacementFieldTransform->SetDisplacementField(output);
   {
     torch::NoGradGuard noGrad;
-    m_ControlGrid =
-      Impact::BuildCellGrid<ImageDimension>(smoothControl(theta), m_FixedImage.GetPointer());
+    m_ControlGrid = Impact::BuildCellGrid<ImageDimension>(smoothControl(theta), m_FixedImage.GetPointer());
     m_ControlGridTransform = nullptr;
   }
 
@@ -1703,8 +1704,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // What grows with the image when the pooled maps are not resident; declared before the tensors it maps.
   Impact::ScratchFiles scratch(m_ScratchDirectory);
   m_BytesRead = 0;
-  const auto                          onDevice = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-  const auto                          sampleOpts =
+  const auto onDevice = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  const auto sampleOpts =
     F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(true);
   const auto nearestOpts =
     F::GridSampleFuncOptions().mode(torch::kNearest).padding_mode(torch::kZeros).align_corners(true);
@@ -1731,9 +1732,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     cells[d] = std::max<int64_t>(1, spatial[d] / shrink[d]);
     cellCountTotal *= cells[d];
     // The dense run divides the field by shrink * (cells - 1) / 2 voxels a grid_sample unit of cells / 2 cells.
-    cellsPerVoxel[d] = cells[d] > 1 ? static_cast<float>(static_cast<double>(cells[d]) /
-                                                         (static_cast<double>(shrink[d]) * static_cast<double>(cells[d] - 1)))
-                                    : 0.0f;
+    cellsPerVoxel[d] = cells[d] > 1
+                         ? static_cast<float>(static_cast<double>(cells[d]) /
+                                              (static_cast<double>(shrink[d]) * static_cast<double>(cells[d] - 1)))
+                         : 0.0f;
     windows[d] = Impact::UniformPoolWindows(cells[d], std::min(shrink[d], spatial[d]));
   }
   std::vector<int64_t> componentShape(Dim + 2, 1);
@@ -2005,7 +2007,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // The fixed features pooled over the cells [c0, c1): {1, C, n...} per layer.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<int64_t>       lowPad(Dim);
-    std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, lattices.reach, lowPad, lattices.align)), false);
+    std::vector<torch::Tensor> layers =
+      layersOf(readFixed(spanOf(c0, c1, lattices.reach, lowPad, lattices.align)), false);
     pooledToCells(layers, lattices.fixed, lowPad, c0, c1);
     return layers;
   };
@@ -2193,11 +2196,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       std::vector<int64_t> lowPad(Dim);
       const RegionType     span = spanOf(box.cell0, box.cell1, noHalo, lowPad);
-      const torch::Tensor  on = toCells(readMask(m_FixedMask.GetPointer(), span),
-                                       Impact::ImageLattice(Dim),
-                                       lowPad,
-                                       box.cell0,
-                                       box.cell1) >= 0.5;
+      const torch::Tensor  on =
+        toCells(readMask(m_FixedMask.GetPointer(), span), Impact::ImageLattice(Dim), lowPad, box.cell0, box.cell1) >=
+        0.5;
       Impact::WriteCells(fixedOn, box.cell0, on);
       count = on.sum().template item<int64_t>();
     }
@@ -2237,9 +2238,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       // Resizing the dense field to the control grid blends, along each axis, the two voxels around the cell's
       // centre. The field is read at those voxels: one given on a coarser grid is then its dense field, resized.
-      int64_t                     rest = flat;
-      std::array<int64_t, Dim>    below{};
-      std::array<double, Dim>     share{};
+      int64_t                  rest = flat;
+      std::array<int64_t, Dim> below{};
+      std::array<double, Dim>  share{};
       for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
       {
         const int64_t c = rest % cells[d];
@@ -2254,7 +2255,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       bool inside = true;
       for (unsigned int corner = 0; inside && corner < (1u << Dim); ++corner)
       {
-        double                          weight = 1.0;
+        double                             weight = 1.0;
         typename FixedImageType::IndexType voxel;
         for (unsigned int a = 0; a < Dim; ++a)
         {
@@ -2298,8 +2299,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     theta = m_ResidentFeatures ? start.to(device) : start;
   }
   // Epsilon weighs against the gradient per control cell, as in the dense run.
-  const double     adamEpsilon = m_Epsilon / static_cast<double>(std::max(1u, m_GridShrinkFactor));
-  auto             smoothControl = [&](const torch::Tensor & control) {
+  const double adamEpsilon = m_Epsilon / static_cast<double>(std::max(1u, m_GridShrinkFactor));
+  auto         smoothControl = [&](const torch::Tensor & control) {
     return Impact::SmoothControlField<Dim>(control, m_ControlGridSmoothingIterations);
   };
   // The diffusion regularizer over the differences along `ax` between `first` and `second` ({1, Dim, ...}, the
@@ -2391,8 +2392,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     // ---- The dense iterations on the pooled maps. ----
     theta.set_requires_grad(true);
-    Impact::CellAdam    adam{ torch::zeros_like(theta), torch::zeros_like(theta), m_LearningRate, m_Beta1, m_Beta2,
-                           adamEpsilon };
+    Impact::CellAdam adam{
+      torch::zeros_like(theta), torch::zeros_like(theta), m_LearningRate, m_Beta1, m_Beta2, adamEpsilon
+    };
     const torch::Tensor base = cellPositions(wholeStart, cells);
     m_MetricValuesPerIteration.clear();
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
@@ -2445,9 +2447,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // regularizer's differences whose first cell lies in it. An iteration brings to the device the cells its bricks
     // touch, one brick at a time: the control grid, its gradient and Adam's moments are mapped like the maps. ----
     torch::Tensor    gradient = scratch.Zeros(thetaShape);
-    Impact::CellAdam adam{ scratch.Zeros(thetaShape), scratch.Zeros(thetaShape), m_LearningRate, m_Beta1, m_Beta2,
-                           adamEpsilon };
-    auto             cellCountOf = [&](const Impact::CellBox & box) {
+    Impact::CellAdam adam{
+      scratch.Zeros(thetaShape), scratch.Zeros(thetaShape), m_LearningRate, m_Beta1, m_Beta2, adamEpsilon
+    };
+    auto cellCountOf = [&](const Impact::CellBox & box) {
       int64_t count = 1;
       for (unsigned int d = 0; d < Dim; ++d)
       {
@@ -2591,7 +2594,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         for (size_t b = 0; b < bricks.size(); ++b)
         {
           const Impact::CellBox window = touchedBy(bricks[b]);
-          brickLoss(b, smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
+          brickLoss(
+            b, smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
         }
         for (size_t l = 0; l < losses.size(); ++l)
         {

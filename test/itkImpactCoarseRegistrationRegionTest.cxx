@@ -401,7 +401,8 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
         }
         return coarse;
       };
-      if (CompareRuns(run(false), run(true), masked ? "half-resolution layers, masked" : "half-resolution layers", 1e-3) !=
+      if (CompareRuns(
+            run(false), run(true), masked ? "half-resolution layers, masked" : "half-resolution layers", 1e-3) !=
           EXIT_SUCCESS)
       {
         return EXIT_FAILURE;

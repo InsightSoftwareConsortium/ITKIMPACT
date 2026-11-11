@@ -315,14 +315,14 @@ private:
   unsigned int m_DisplacementHalfWidth{ 3 };
   bool         m_InverseConsistency{ true };
 
-  unsigned int     m_RegionSize{ 0 };
-  unsigned int     m_RegionHalo{ 0 };
+  unsigned int                         m_RegionSize{ 0 };
+  unsigned int                         m_RegionHalo{ 0 };
   typename TransformType::ConstPointer m_MovingTransform{ nullptr };
-  SizeValueType    m_CostBoxBytes{ static_cast<SizeValueType>(1) << 30 };
-  SizeValueType    m_BytesRead{ 0 };
-  bool             m_FixedImageStreamed{ false };
-  bool             m_MovingImageStreamed{ false };
-  ModifiedTimeType m_SolvedTime{ 0 };
+  SizeValueType                        m_CostBoxBytes{ static_cast<SizeValueType>(1) << 30 };
+  SizeValueType                        m_BytesRead{ 0 };
+  bool                                 m_FixedImageStreamed{ false };
+  bool                                 m_MovingImageStreamed{ false };
+  ModifiedTimeType                     m_SolvedTime{ 0 };
 
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };
   typename DisplacementFieldType::Pointer          m_CoarseGrid{ nullptr };

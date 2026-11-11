@@ -187,16 +187,16 @@ SameGrid(const TA * a, const TB * b)
  * from the grid's first: `lowPad` what that left of the margin on the low side. */
 template <typename TRegion>
 TRegion
-CellSpan(const std::vector<int64_t> &     c0,
-         const std::vector<int64_t> &     c1,
-         const std::vector<int64_t> &     extra,
-         const std::vector<PoolWindows> & windows,
-         const std::vector<int64_t> &     spatial,
+CellSpan(const std::vector<int64_t> &        c0,
+         const std::vector<int64_t> &        c1,
+         const std::vector<int64_t> &        extra,
+         const std::vector<PoolWindows> &    windows,
+         const std::vector<int64_t> &        spatial,
          const typename TRegion::IndexType & index,
-         std::vector<int64_t> &           lowPad,
-         int64_t                          align = 1)
+         std::vector<int64_t> &              lowPad,
+         int64_t                             align = 1)
 {
-  constexpr unsigned int Dim = TRegion::ImageDimension;
+  constexpr unsigned int      Dim = TRegion::ImageDimension;
   typename TRegion::IndexType start;
   typename TRegion::SizeType  size;
   for (unsigned int d = 0; d < Dim; ++d)
@@ -317,7 +317,7 @@ template <unsigned int Dim>
 std::vector<LayerLattice>
 LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
 {
-  auto powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
+  auto                      powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
   std::vector<LayerLattice> lattices;
   for (const torch::Tensor & layer : layers)
   {
@@ -342,7 +342,8 @@ LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
       else
       {
         itkGenericExceptionMacro(<< who << ": a feature layer of " << layer.sizes() << " for an image of "
-                                 << LatticeProbe << " voxels a side lies on no lattice of the image's (a power of "
+                                 << LatticeProbe
+                                 << " voxels a side lies on no lattice of the image's (a power of "
                                     "two of its voxels), which RegionSize needs to compute it by regions.");
       }
     }
@@ -495,8 +496,9 @@ CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
 {
   if (std::any_of(pca.begin(), pca.end(), [](unsigned int components) { return components > 0; }))
   {
-    itkGenericExceptionMacro(<< who << ": PCA fits its basis on the whole fixed feature map; set it to 0 with "
-                                       "RegionSize.");
+    itkGenericExceptionMacro(<< who
+                             << ": PCA fits its basis on the whole fixed feature map; set it to 0 with "
+                                "RegionSize.");
   }
   RegionModels models;
   for (const ImpactModelConfiguration & config : configs)

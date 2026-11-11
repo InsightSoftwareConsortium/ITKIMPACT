@@ -3976,8 +3976,8 @@ TEST(ImpactConvexAdam, NormalizedCoarseCostIgnoresTheFeatureRange)
 
 // The coarse cost volume compares each layer with its distance, over the cell window around every coarse voxel --
 // the two 3^3 box passes ConvexAdam smooths its cost with --, for every candidate displacement of the moving
-// features, zeros past the image, in a box of its own half-width per axis. Checked for every distance against loops in double
-// precision: a point-wise distance's terms averaged over the window, NCC and LNCC correlated over it from the
+// features, zeros past the image, in a box of its own half-width per axis. Checked for every distance against loops in
+// double precision: a point-wise distance's terms averaged over the window, NCC and LNCC correlated over it from the
 // window's weighted moments.
 TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
 {
@@ -4026,8 +4026,8 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
       const int64_t dx = l % sx - halfWidths[2], dy = (l / sx) % sy - halfWidths[1], dz = l / (sx * sy) - halfWidths[0];
       auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
         return inside(z + dz, Z) && inside(y + dy, Y) && inside(x + dx, X)
-                 ? static_cast<double>(M[0][c][z + dz][y + dy][x + dx])
-                 : 0.0; // past the image the moving features are zeros, as ConvexAdam pads them
+                          ? static_cast<double>(M[0][c][z + dz][y + dy][x + dx])
+                          : 0.0; // past the image the moving features are zeros, as ConvexAdam pads them
       };
       auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
       Volume expected(Z * Y * X, 0.0);
@@ -4378,8 +4378,8 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
       const int64_t dx = l % sx - halfWidths[2], dy = (l / sx) % sy - halfWidths[1], dz = l / (sx * sy) - halfWidths[0];
       auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
         return inside(z + dz, Z) && inside(y + dy, Y) && inside(x + dx, X)
-                 ? static_cast<double>(M[0][c][z + dz][y + dy][x + dx])
-                 : 0.0; // past the image the moving features are zeros, as ConvexAdam pads them
+                          ? static_cast<double>(M[0][c][z + dz][y + dy][x + dx])
+                          : 0.0; // past the image the moving features are zeros, as ConvexAdam pads them
       };
       auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
       Volume weight(Z * Y * X, 0.0);

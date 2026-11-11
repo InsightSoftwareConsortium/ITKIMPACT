@@ -647,9 +647,9 @@ BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
  * cell grid `grid` (BuildCellGrid's). */
 template <unsigned int Dim, typename TFixedImage>
 void
-InterpolateCellGrid(const Image<Vector<float, Dim>, Dim> *                       grid,
-                    const TFixedImage *                                          fixed,
-                    Image<Vector<float, Dim>, Dim> *                             output,
+InterpolateCellGrid(const Image<Vector<float, Dim>, Dim> *                      grid,
+                    const TFixedImage *                                         fixed,
+                    Image<Vector<float, Dim>, Dim> *                            output,
                     const typename Image<Vector<float, Dim>, Dim>::RegionType & region)
 {
   using FieldType = Image<Vector<float, Dim>, Dim>;
