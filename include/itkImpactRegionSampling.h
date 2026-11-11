@@ -178,14 +178,14 @@ RelativeWindows(const std::vector<PoolWindows> & windows, const std::vector<int6
   return relative;
 }
 
-/** Whether two images share one grid: size, spacing, origin and direction. */
+/** Whether two images share one grid: region (a box of one is read from the other by its indices), spacing, origin
+ * and direction. */
 template <typename TA, typename TB>
 bool
 SameGrid(const TA * a, const TB * b)
 {
-  return a->GetLargestPossibleRegion().GetSize() == b->GetLargestPossibleRegion().GetSize() &&
-         a->GetSpacing() == b->GetSpacing() && a->GetOrigin() == b->GetOrigin() &&
-         a->GetDirection() == b->GetDirection();
+  return a->GetLargestPossibleRegion() == b->GetLargestPossibleRegion() && a->GetSpacing() == b->GetSpacing() &&
+         a->GetOrigin() == b->GetOrigin() && a->GetDirection() == b->GetDirection();
 }
 
 /** The region of a grid (`spatial` in tensor order, `index` its first index) that the cells [c0, c1) of `windows`
