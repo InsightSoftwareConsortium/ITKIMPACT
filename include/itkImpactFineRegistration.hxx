@@ -37,8 +37,6 @@
 #include <ATen/CPUGeneratorImpl.h>
 
 #include <algorithm>
-#include <map>
-#include <chrono>
 #include <array>
 #include <limits>
 #include <memory>
@@ -151,11 +149,6 @@ PatchCorners(const ImpactModelConfiguration & config)
   }
   return corners;
 }
-
-} // namespace Impact
-
-namespace Impact
-{
 
 } // namespace Impact
 
@@ -1738,24 +1731,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(true);
   const auto nearestOpts =
     F::GridSampleFuncOptions().mode(torch::kNearest).padding_mode(torch::kZeros).align_corners(true);
-  // IMPACT_REGION_PROFILE=1 prints where the time goes (device synchronised at every phase).
-  const bool                    profiling = std::getenv("IMPACT_REGION_PROFILE") != nullptr;
-  std::map<std::string, double> phases;
-  auto                          clock = [&]() {
-    if (profiling && device.is_cuda())
-    {
-      torch::cuda::synchronize(device.index());
-    }
-    return std::chrono::steady_clock::now();
-  };
-  auto lap = [&](const char * phase, std::chrono::steady_clock::time_point & since) {
-    if (profiling)
-    {
-      const auto now = clock();
-      phases[phase] += std::chrono::duration<double>(now - since).count();
-      since = now;
-    }
-  };
 
   // ---- Geometry. A reader's output knows its grid once its information is updated; nothing is read yet. ----
   auto * fixedSource = const_cast<FixedImageType *>(m_FixedImage.GetPointer());
@@ -2450,7 +2425,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     movingShare = atHome(maskShape);
   }
-  auto passStart = clock();
   for (size_t b = 0; b < boxes.size(); ++b)
   {
     const Impact::CellBox & box = boxes[b];
@@ -2473,7 +2447,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       writeCells(movingShare, box.cell0, pooled.share);
     }
   }
-  lap("pass over the boxes", passStart);
   if (m_ResidentFeatures)
   {
     // ---- The dense iterations on the pooled maps. ----
@@ -2485,7 +2458,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
-      auto since = clock();
       drawSubsets(channels);
       const torch::Tensor smoothed = smoothControl(theta);
       const torch::Tensor q = base + smoothed * voxelsToCells;
@@ -2517,9 +2489,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         loss.backward();
       }
-      lap("resident forward+backward", since);
       adam.Step(theta, touched);
-      lap("resident adam", since);
       m_MetricValuesPerIteration.push_back(loss.template item<double>());
     }
   }
@@ -2615,7 +2585,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                        const std::vector<int64_t> & origin,
                        std::vector<double> *        raw) -> torch::Tensor {
       const Impact::CellBox & box = units[b];
-      auto                    since = clock();
       if (countByUnit[b] == 0)
       {
         // Nothing of it counts: its edges alone, nothing read.
@@ -2651,14 +2620,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           }
         }
       }
-      lap("box bounds", since);
       std::vector<torch::Tensor> fixedLayers(losses.size()), movingLayers(losses.size());
       for (size_t l = 0; l < losses.size(); ++l)
       {
         fixedLayers[l] = cellsOf(fixedMaps[l], box.cell0, box.cell1).to(device);
         movingLayers[l] = cellsOf(movingMaps[l], m0, m1).to(device);
       }
-      lap("box maps", since);
       const torch::Tensor grid = gridIn(q, m0, m1);
       torch::Tensor       counted;
       if (fixedOn.defined())
@@ -2689,7 +2656,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         }
       }
       const torch::Tensor loss = total + regularizer(smoothed, box.cell0, box.cell1, origin);
-      lap("box loss", since);
       return loss;
     };
     m_MetricValuesPerIteration.clear();
@@ -2733,7 +2699,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                         .to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true)
                                         .requires_grad_(true);
         const torch::Tensor loss = boxLoss(b, smoothControl(control), window.cell0, nullptr);
-        auto                since = clock();
         if (loss.requires_grad()) // a constant for a last cell out of the fixed mask: no similarity, no difference
         {
           loss.backward();
@@ -2744,10 +2709,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           cellsOf(gradient, window.cell0, window.cell1).add_(control.grad().to(torch::kCPU));
         }
         cellsOf(touched, window.cell0, window.cell1).fill_(true);
-        lap("box backward", since);
       }
       // A cell several units touch is stepped with the first of them.
-      auto since = clock();
       for (const size_t b : drawn)
       {
         const Impact::CellBox window = touchedBy(units[b]);
@@ -2755,18 +2718,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         cellsOf(gradient, window.cell0, window.cell1).zero_();
         cellsOf(touched, window.cell0, window.cell1).fill_(false);
       }
-      lap("box adam", since);
       m_MetricValuesPerIteration.push_back(lossValue);
     }
   }
-  if (profiling)
-  {
-    for (const auto & [phase, seconds] : phases)
-    {
-      std::cerr << "IMPACT region profile: " << phase << " " << seconds << " s" << std::endl;
-    }
-  }
-
   // ---- The control grid, smoothed, as the field on its own grid, written a box at a time from the cells its
   // smoothing reads: the host holds that image alone. The dense output is interpolated from it. ----
   {
