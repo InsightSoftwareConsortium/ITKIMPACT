@@ -25,6 +25,7 @@
 #include "itkImpactOnlineInference.h" // Impact::OnlineBatch, Impact::EvaluateOnline
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <random>
 
 namespace itk
@@ -228,13 +229,18 @@ protected:
   void
   ThreadedExecution(const DomainType & domain, const ThreadIdType threadId) override;
 
-  /** Gather the points of the domain that map inside both images. Overloaded on the two
-   * domain types the v4 partitioners hand out: a region of the virtual image when the metric
-   * samples densely, a range of indices into the sampled point set when it does not. */
+  /** Gather the points of the domain that map inside both images, `capacity` at a time: `whenFull`
+   * is handed the points every time that many are gathered, and empties them; the rest come back.
+   * Overloaded on the two domain types the v4 partitioners hand out: a region of the virtual image
+   * when the metric samples densely, a range of indices into the sampled point set when it does not. */
   std::vector<Sample>
-  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region) const;
+  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region,
+                 size_t                                                               capacity,
+                 const std::function<void(std::vector<Sample> &)> &                   whenFull) const;
   std::vector<Sample>
-  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange) const;
+  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange,
+                 size_t                                                  capacity,
+                 const std::function<void(std::vector<Sample> &)> &      whenFull) const;
 
   /** Resolve one virtual point into both image spaces; false if it falls outside either. */
   bool

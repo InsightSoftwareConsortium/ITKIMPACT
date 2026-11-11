@@ -187,35 +187,40 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   // few small tensor operations each, and the framework's walk also computed an image gradient
   // per point that IMPACT never reads.
   const Impact::OneOpenMPThread oneThread(this->GetNumberOfWorkUnitsUsed() > 1);
-  std::vector<Sample>           samples = this->CollectSamples(domain);
   LossPerThreadStruct &         loss = this->m_LossThreadStruct[threadId];
+  const bool                    online = this->m_ImpactAssociate->GetMode() == "Jacobian";
 
   // ProcessVirtualPoint() would have kept these counts and we bypassed it: the first is what
   // the base metric reduces into GetNumberOfValidPoints(), the second what normalizes the loss.
-  this->m_GetValueAndDerivativePerThreadVariables[threadId].NumberOfValidPoints += samples.size();
-  loss.m_numberOfPixelsCounted += samples.size();
-
-  if (this->m_ImpactAssociate->GetMode() == "Jacobian")
+  auto count = [&](const std::vector<Sample> & samples) {
+    this->m_GetValueAndDerivativePerThreadVariables[threadId].NumberOfValidPoints += samples.size();
+    loss.m_numberOfPixelsCounted += samples.size();
+  };
+  // Static, a batch holds a [batch, channels, parameters] Jacobian: about 4 MB per work unit, so that a dense
+  // domain under a B-spline transform stays bounded, and the points are evaluated as they are gathered, a batch
+  // at a time. Online the work unit gathers them all, for EvaluateOnline().
+  size_t channels = 1;
+  for (const std::vector<unsigned int> & subset : this->m_SubsetsOfFeatures)
   {
-    this->m_OnlineSamples[threadId] = std::move(samples); // for EvaluateOnline()
+    channels = std::max(channels, subset.size());
   }
-  else
+  const size_t parameters = this->GetComputeDerivative() ? this->GetCachedNumberOfLocalParameters() : 1;
+  const size_t batch = std::max<size_t>(1, (size_t{ 1 } << 20) / std::max<size_t>(1, channels * parameters));
+  auto         evaluate = [&](std::vector<Sample> & samples) {
+    count(samples);
+    this->EvaluateStaticBatch(samples.begin(), samples.end(), threadId, loss);
+    samples.clear();
+  };
+  std::vector<Sample> samples =
+    this->CollectSamples(domain, online ? std::numeric_limits<size_t>::max() : batch, evaluate);
+  if (online)
   {
-    // A batch holds a [batch, channels, parameters] Jacobian: about 4 MB per work unit, so that a
-    // dense domain under a B-spline transform stays bounded.
-    size_t channels = 1;
-    for (const std::vector<unsigned int> & subset : this->m_SubsetsOfFeatures)
-    {
-      channels = std::max(channels, subset.size());
-    }
-    const size_t parameters = this->GetComputeDerivative() ? this->GetCachedNumberOfLocalParameters() : 1;
-    const auto batch = static_cast<std::ptrdiff_t>(std::max<size_t>(1, (size_t{ 1 } << 20) / (channels * parameters)));
-    for (auto first = samples.begin(); first != samples.end();)
-    {
-      const auto last = first + std::min(batch, samples.end() - first);
-      this->EvaluateStaticBatch(first, last, threadId, loss);
-      first = last;
-    }
+    count(samples);
+    this->m_OnlineSamples[threadId] = std::move(samples);
+  }
+  else if (!samples.empty())
+  {
+    evaluate(samples);
   }
 
   this->m_Associate->FinalizeThread(threadId);
@@ -245,13 +250,14 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 auto
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region) const
-  -> std::vector<Sample>
+  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region,
+                 size_t                                                               capacity,
+                 const std::function<void(std::vector<Sample> &)> & whenFull) const -> std::vector<Sample>
 {
   const typename VirtualImageType::ConstPointer virtualImage = this->m_ImpactAssociate->GetVirtualImage();
 
   std::vector<Sample> samples;
-  samples.reserve(region.GetNumberOfPixels());
+  samples.reserve(std::min<size_t>(region.GetNumberOfPixels(), capacity));
   Sample           sample;
   VirtualPointType virtualPoint;
   for (ImageRegionConstIteratorWithIndex<VirtualImageType> it(virtualImage, region); !it.IsAtEnd(); ++it)
@@ -260,6 +266,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     if (this->ResolveSample(it.GetIndex(), virtualPoint, sample))
     {
       samples.push_back(sample);
+      if (samples.size() == capacity)
+      {
+        whenFull(samples);
+      }
     }
   }
   return samples;
@@ -269,7 +279,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 auto
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange) const -> std::vector<Sample>
+  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange,
+                 size_t                                                  capacity,
+                 const std::function<void(std::vector<Sample> &)> &      whenFull) const -> std::vector<Sample>
 {
   using PointIdentifierType = typename ImageToImageMetricv4Type::VirtualPointSetType::MeshTraits::PointIdentifier;
   const typename VirtualImageType::ConstPointer virtualImage = this->m_ImpactAssociate->GetVirtualImage();
@@ -279,7 +291,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   const auto end = static_cast<PointIdentifierType>(indexRange[1]);
 
   std::vector<Sample> samples;
-  samples.reserve(static_cast<size_t>(end - begin + 1));
+  samples.reserve(std::min(static_cast<size_t>(end - begin + 1), capacity));
   Sample sample;
   for (PointIdentifierType i = begin; i <= end; ++i)
   {
@@ -288,6 +300,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     {
       sample.m_Id = static_cast<SizeValueType>(i);
       samples.push_back(sample);
+      if (samples.size() == capacity)
+      {
+        whenFull(samples);
+      }
     }
   }
   return samples;
