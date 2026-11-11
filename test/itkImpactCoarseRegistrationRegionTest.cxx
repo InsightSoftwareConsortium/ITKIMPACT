@@ -30,6 +30,7 @@
 #include "itkTranslationTransform.h"
 
 #include <cmath>
+#include <limits>
 #include <string>
 
 namespace
@@ -104,7 +105,12 @@ MaxDifference(const FieldType * a, const FieldType * b, const FieldType::RegionT
     const auto vb = b->GetPixel(it.GetIndex());
     for (unsigned int c = 0; c < 3; ++c)
     {
-      largest = std::max(largest, static_cast<double>(std::abs(va[c] - vb[c])));
+      const double difference = std::abs(va[c] - vb[c]);
+      if (!std::isfinite(difference))
+      {
+        return std::numeric_limits<double>::infinity(); // which std::max would drop
+      }
+      largest = std::max(largest, difference);
     }
   }
   return largest;
