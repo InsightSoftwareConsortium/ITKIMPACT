@@ -169,9 +169,12 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   `UseStreamingOn()`, or an image in memory, same code) and holds the control grid alone on the
   device. One pass over the boxes pools each image's features to the control grid; when the pooled
   maps fit `ResidentFeatureBudget` (half the free device memory by default) every iteration
-  compares them whole, the dense run on them; otherwise they stay in host memory and every
-  iteration steps `RegionsPerIteration` boxes, each box `NumberOfIterations` times, Adam stepping
-  the cells it touched. Either way the images are read once. Visiting every
+  compares them whole, the dense run on them; otherwise they stay, with the control grid and the
+  optimizer's state, in files of `ScratchDirectory` mapped to memory (give a directory on a disk for
+  an image larger than the memory), and every iteration steps `RegionsPerIteration` boxes, each box
+  `NumberOfIterations` times, Adam stepping the cells it touched; `RegionsPerIteration` 0 steps
+  every cell at every iteration, by bricks of boxes sized to the device. Either way the images are
+  read once. Visiting every
   box at every iteration is the whole-image run, to float precision. `SetMovingTransform` applies a
   transform (an affine, a coarser pass's field) to the moving side outside the optimization;
   `GetControlGridTransform()` is the result on the control grid, `GetOutput()` the dense field,

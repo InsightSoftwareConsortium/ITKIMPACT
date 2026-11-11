@@ -17,8 +17,9 @@
  *=========================================================================*/
 
 // The region-sampled run of ImpactFineRegistration against its whole-image run, on the intensity similarity:
-// every box at every iteration reproduces the dense field; a streaming reader gives the same field as the image in
-// memory and is read by regions; a transform set on the moving side is applied outside the field.
+// every box at every iteration reproduces the dense field, from mapped files that the run removes; a streaming reader
+// gives the same field as the image in memory and is read by regions; a transform set on the moving side is applied
+// outside the field.
 
 #include "itkImpactFineRegistration.h"
 
@@ -30,6 +31,7 @@
 #include "itkVectorLinearInterpolateImageFunction.h"
 
 #include <cmath>
+#include <filesystem>
 #include <string>
 
 namespace
@@ -143,7 +145,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   const FieldType * denseField = dense->GetOutput();
 
   // 2. By regions, the pooled maps resident (one pass over the boxes, then the dense iterations on them): the same
-  // field. Then box by box, every box at every iteration: the same field again.
+  // field. Then box by box, every box at every iteration, from files mapped in a scratch directory and gone with the
+  // run: the same field again, as with every cell at every iteration by bricks.
   auto regions = FineType::New();
   regions->SetFixedImage(fixed);
   regions->SetMovingImage(moving);
@@ -169,10 +172,25 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   boxes->SetRegionsPerIteration(1000);
   boxes->SetResidentFeatureBudget(1); // nothing fits: box by box
   ITK_TEST_SET_GET_VALUE(1u, boxes->GetResidentFeatureBudget());
+  const std::string scratch = temporary + "/itkImpactFineRegistrationRegionTest_scratch";
+  std::filesystem::create_directories(scratch);
+  boxes->SetScratchDirectory(scratch);
+  ITK_TEST_SET_GET_VALUE(scratch, std::string(boxes->GetScratchDirectory()));
   ITK_TRY_EXPECT_NO_EXCEPTION(boxes->Update());
   if (boxes->GetResidentFeatures())
   {
     std::cerr << "A budget of one byte should leave nothing resident." << std::endl;
+    return EXIT_FAILURE;
+  }
+  if (boxes->GetScratchBytes() == 0 || regions->GetScratchBytes() != 0)
+  {
+    std::cerr << "Box by box, the maps and the control grid should be mapped files, and none with the maps resident: "
+              << boxes->GetScratchBytes() << " bytes against " << regions->GetScratchBytes() << "." << std::endl;
+    return EXIT_FAILURE;
+  }
+  if (!std::filesystem::is_empty(scratch))
+  {
+    std::cerr << "The run left files in its scratch directory." << std::endl;
     return EXIT_FAILURE;
   }
   if (boxes->GetBytesRead() != regions->GetBytesRead())
@@ -186,6 +204,23 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   if (boxDifference > 1e-5)
   {
     std::cerr << "The box-by-box field differs from the dense one by " << boxDifference << " mm." << std::endl;
+    return EXIT_FAILURE;
+  }
+  auto bricks = FineType::New();
+  bricks->SetFixedImage(fixed);
+  bricks->SetMovingImage(moving);
+  bricks->SetInitialDisplacementField(start);
+  Configure(bricks, 6);
+  bricks->SetRegionSize(16);
+  bricks->SetRegionsPerIteration(0);
+  bricks->SetResidentFeatureBudget(1);
+  ITK_TRY_EXPECT_NO_EXCEPTION(bricks->Update());
+  const double brickDifference = MaxDifference(denseField, bricks->GetOutput(), fixed->GetLargestPossibleRegion());
+  std::cout << "dense vs every cell by bricks: max |difference| = " << brickDifference << " mm" << std::endl;
+  if (brickDifference > 1e-5)
+  {
+    std::cerr << "The field of every cell by bricks differs from the dense one by " << brickDifference << " mm."
+              << std::endl;
     return EXIT_FAILURE;
   }
   {

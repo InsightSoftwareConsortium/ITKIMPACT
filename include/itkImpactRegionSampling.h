@@ -20,7 +20,8 @@
 
 // The pieces of ImpactFineRegistration's region-sampled (out-of-core) run that do not depend on the filter:
 // reading a region through an image's own pipeline, the cell lattice its boxes tile, the pooling windows of the
-// cells, and Adam on the cells an iteration touched. LibTorch-backed: included by the .hxx only.
+// cells, Adam on the cells an iteration touched, and the mapped files of what grows with the image. LibTorch-backed:
+// included by the .hxx only.
 
 #include "itkImpactModelConfiguration.h"
 #include "itkImpactTorchRegistrationHelpers.h"
@@ -41,8 +42,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
+#include <random>
 #include <string>
+#include <system_error>
 #include <vector>
 #if !defined(_WIN32)
 #  include <unistd.h>
@@ -585,23 +589,72 @@ struct LazyAdam
   double        epsilon;
 
   LazyAdam(const torch::Tensor & theta, double lr, double b1, double b2, double eps)
-    : exponentialAverage(torch::zeros_like(theta))
-    , exponentialAverageSquare(torch::zeros_like(theta))
-    , learningRate(lr)
-    , beta1(b1)
-    , beta2(b2)
-    , epsilon(eps)
+    : LazyAdam(torch::zeros_like(theta), torch::zeros_like(theta), torch::Tensor(), lr, b1, b2, eps)
   {
     std::vector<int64_t> shape(theta.sizes().begin(), theta.sizes().end());
     shape[1] = 1;
     steps = torch::zeros(shape, theta.options());
   }
 
+  /** On a state of zeros the caller allocated: the moments like the parameters, the step count one a cell. */
+  LazyAdam(torch::Tensor average,
+           torch::Tensor averageSquare,
+           torch::Tensor count,
+           double        lr,
+           double        b1,
+           double        b2,
+           double        eps)
+    : exponentialAverage(std::move(average))
+    , exponentialAverageSquare(std::move(averageSquare))
+    , steps(std::move(count))
+    , learningRate(lr)
+    , beta1(b1)
+    , beta2(b2)
+    , epsilon(eps)
+  {}
+
+  /** A step on `theta` with its own gradient, which it zeroes. */
   void
   Step(torch::Tensor & theta, const torch::Tensor & touched)
   {
-    torch::NoGradGuard  noGrad;
-    const torch::Tensor gradient = theta.grad().defined() ? theta.grad() : torch::zeros_like(theta);
+    torch::NoGradGuard noGrad;
+    this->Step(theta, theta.grad().defined() ? theta.grad() : torch::zeros_like(theta), touched);
+    if (theta.grad().defined())
+    {
+      theta.grad().zero_();
+    }
+  }
+
+  /** Step() on the cells [c0, c1) alone, brought to `device` for it: `theta`, its `gradient`, `touched` and the
+   * state may be mapped files, of which a step then reads and writes those cells only. */
+  void
+  StepCells(torch::Tensor &              theta,
+            const torch::Tensor &        gradient,
+            const torch::Tensor &        touched,
+            const std::vector<int64_t> & c0,
+            const std::vector<int64_t> & c1,
+            const torch::Device &        device)
+  {
+    torch::NoGradGuard noGrad;
+    LazyAdam           window(CellsOf(exponentialAverage, c0, c1).to(device),
+                    CellsOf(exponentialAverageSquare, c0, c1).to(device),
+                    CellsOf(steps, c0, c1).to(device),
+                    learningRate,
+                    beta1,
+                    beta2,
+                    epsilon);
+    torch::Tensor      cells = CellsOf(theta, c0, c1).to(device);
+    window.Step(cells, CellsOf(gradient, c0, c1).to(device), CellsOf(touched, c0, c1).to(device));
+    WriteCells(exponentialAverage, c0, window.exponentialAverage);
+    WriteCells(exponentialAverageSquare, c0, window.exponentialAverageSquare);
+    WriteCells(steps, c0, window.steps);
+    WriteCells(theta, c0, cells);
+  }
+
+  void
+  Step(torch::Tensor & theta, const torch::Tensor & gradient, const torch::Tensor & touched)
+  {
+    torch::NoGradGuard noGrad;
     steps = torch::where(touched, steps + 1.0, steps);
     exponentialAverage =
       torch::where(touched, beta1 * exponentialAverage + (1.0 - beta1) * gradient, exponentialAverage);
@@ -613,11 +666,93 @@ struct LazyAdam
     const torch::Tensor denominator = exponentialAverageSquare.sqrt() / correction2.sqrt() + epsilon;
     const torch::Tensor update = (learningRate / correction1) * exponentialAverage / denominator;
     theta.copy_(torch::where(touched, theta - update, theta));
-    if (theta.grad().defined())
+  }
+};
+
+/** \class ScratchFiles
+ * \ingroup Impact
+ * \brief Tensors of zeros in files of a directory, mapped shared.
+ *
+ * The kernel pages them in and out, so what grows with the image need not fit the memory. The files go with the
+ * object, which the tensors must not outlive. */
+class ScratchFiles
+{
+public:
+  /** In `directory`, the system's temporary one when empty. */
+  explicit ScratchFiles(const std::string & directory)
+    : m_Directory(directory)
+  {}
+  ScratchFiles(const ScratchFiles &) = delete;
+  ScratchFiles &
+  operator=(const ScratchFiles &) = delete;
+  ~ScratchFiles()
+  {
+    for (const std::filesystem::path & path : m_Paths)
     {
-      theta.grad().zero_();
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored);
     }
   }
+
+  torch::Tensor
+  Zeros(const std::vector<int64_t> & shape, torch::ScalarType dtype = torch::kFloat32)
+  {
+    int64_t count = 1;
+    for (const int64_t n : shape)
+    {
+      count *= n;
+    }
+    const std::uintmax_t bytes = static_cast<std::uintmax_t>(count) * torch::elementSize(dtype);
+    std::error_code      error;
+    if (m_Paths.empty())
+    {
+      if (m_Directory.empty())
+      {
+        m_Directory = std::filesystem::temp_directory_path(error);
+      }
+      m_Available = error ? 0 : std::filesystem::space(m_Directory, error).available;
+    }
+    if (error)
+    {
+      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
+                               << " cannot be used: " << error.message() << ".");
+    }
+    // A mapped file is sparse: a file system that fills up under it kills the process at a write.
+    if (m_Bytes + bytes > m_Available)
+    {
+      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory << " has "
+                               << m_Available << " bytes free where the run maps " << m_Bytes + bytes
+                               << "; set ScratchDirectory to a directory of a larger disk.");
+    }
+    std::random_device          random;
+    const std::filesystem::path path = m_Directory / ("itkImpactScratch-" + std::to_string(random()) + "-" +
+                                                      std::to_string(random()) + "-" + std::to_string(m_Paths.size()));
+    if (std::filesystem::exists(path))
+    {
+      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch file " << path << " exists.");
+    }
+    m_Paths.push_back(path);
+    // A new file is zeros.
+    torch::Tensor tensor = torch::from_file(path.string(), true, count, torch::TensorOptions().dtype(dtype));
+#if !defined(_WIN32)
+    std::filesystem::remove(path, error); // the mapping keeps it: a killed process leaves nothing behind
+#endif
+    m_Bytes += bytes;
+    return tensor.view(shape);
+  }
+
+  /** The bytes mapped so far. */
+  std::uintmax_t
+  GetBytes() const
+  {
+    return m_Bytes;
+  }
+
+private:
+  std::filesystem::path              m_Directory;
+  std::vector<std::filesystem::path> m_Paths;
+  std::uintmax_t                     m_Available{ 0 };
+  std::uintmax_t                     m_Bytes{ 0 };
 };
 
 /** What the pooled feature maps of a region-sampled run may take to stay resident on `device`, when the caller sets

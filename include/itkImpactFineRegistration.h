@@ -259,7 +259,8 @@ public:
    * moving image each reads, through the images' own pipelines (SetRequestedRegion then Update: an
    * itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them from its
    * buffer), and keeps their features pooled to the control grid. The iterations read no image. Where the pooled maps
-   * do not fit the device they stay in host memory and an iteration steps RegionsPerIteration boxes, visited in
+   * do not fit the device they stay in files of ScratchDirectory mapped to memory, with the control grid and the
+   * optimizer's state, and an iteration steps RegionsPerIteration boxes, visited in
    * epochs in an order drawn from Seed; one the fixed mask does not reach costs its share of the regularizer alone.
    * A box's loss is the dense loss restricted to its cells,
    * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
@@ -278,7 +279,10 @@ public:
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
   /** Boxes stepped at every iteration when the pooled maps are not resident (default 1); NumberOfIterations then counts
-   * the visits of every box, so that a cell is stepped as many times as in the dense run. */
+   * the visits of every box, so that a cell is stepped as many times as in the dense run. The boxes of an iteration
+   * go to the device one at a time: the count sets the schedule, not the memory. 0: every cell at every iteration,
+   * the whole-image run's schedule, by bricks of as many boxes a side as the device holds (a brick brings to it at
+   * most an eighth of what ResidentFeatureBudget's default lets the maps take). */
   itkSetMacro(RegionsPerIteration, unsigned int);
   itkGetConstMacro(RegionsPerIteration, unsigned int);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
@@ -296,13 +300,21 @@ public:
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
   /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it every
-   * iteration compares them whole (the dense run on the pooled maps); past it they stay in host memory and every
+   * iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped files and every
    * iteration brings the cells of its RegionsPerIteration boxes to the device. 0 (the default): half the
    * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
    * which route a run took. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);
+  /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks' cells,
+   * the control grid and the optimizer's state, in files mapped to memory that the system pages in and out, removed
+   * when the run ends. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs)
+   * keeps them there: give one on a disk for an image larger than the memory. GetScratchBytes() is what the last
+   * run mapped, 0 with the maps resident. */
+  itkSetStringMacro(ScratchDirectory);
+  itkGetStringMacro(ScratchDirectory);
+  itkGetConstMacro(ScratchBytes, SizeValueType);
   /** Bytes requested from the images and masks over the run. */
   itkGetConstMacro(BytesRead, SizeValueType);
   /** Whether the fixed (moving) image served its regions without buffering it whole. */
@@ -399,6 +411,8 @@ private:
   unsigned int  m_RegionHalo{ 0 };
   SizeValueType m_ResidentFeatureBudget{ 0 };
   bool          m_ResidentFeatures{ false };
+  std::string   m_ScratchDirectory;
+  SizeValueType m_ScratchBytes{ 0 };
 
   typename TransformType::ConstPointer m_MovingTransform{ nullptr };
   SizeValueType                        m_BytesRead{ 0 };
