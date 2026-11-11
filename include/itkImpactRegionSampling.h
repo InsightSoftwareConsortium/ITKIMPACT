@@ -368,6 +368,50 @@ LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
   return lattices;
 }
 
+/** The lattices of the kept layers of the fixed and of the moving models, and what the regions read for the features
+ * take from them: a layer coarser than the image lies on the image's lattice every `align` voxels, so the regions
+ * start on it, and they reach, past the models' halo, what pooling the whole layer to the cells reads beyond a cell's
+ * own voxels. */
+struct RegionLattices
+{
+  std::vector<LayerLattice> fixed;
+  std::vector<LayerLattice> moving;
+  int64_t                   align{ 1 };
+  std::vector<int64_t>      reach;
+};
+
+/** Probed with `layersOf(image, moving)`, the layers of an image region (the image itself without a model); the
+ * moving models are probed when they are not the fixed ones (`ownMovingModels`). `cellVoxels` is a cell's side. */
+template <unsigned int Dim, typename TLayersOf>
+RegionLattices
+ProbeRegionLattices(const std::vector<int64_t> & halo,
+                    const std::vector<int64_t> & cellVoxels,
+                    const torch::Device &        device,
+                    bool                         ownMovingModels,
+                    TLayersOf &&                 layersOf,
+                    const char *                 who)
+{
+  std::vector<int64_t> shape(Dim + 2, LatticeProbe);
+  shape[0] = shape[1] = 1;
+  const torch::Tensor probe = torch::zeros(shape, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  RegionLattices      lattices;
+  lattices.fixed = LayerLattices<Dim>(layersOf(probe, false), who);
+  lattices.moving = ownMovingModels ? LayerLattices<Dim>(layersOf(probe, true), who) : lattices.fixed;
+  for (const auto * side : { &lattices.fixed, &lattices.moving })
+  {
+    for (const LayerLattice & lattice : *side)
+    {
+      lattices.align = std::max(lattices.align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+    }
+  }
+  lattices.reach = halo;
+  for (unsigned int d = 0; d < Dim && lattices.align > 1; ++d)
+  {
+    lattices.reach[d] += cellVoxels[d] + 2 * lattices.align;
+  }
+  return lattices;
+}
+
 /** A layer ({1, C, samples...}) of a span of the image, pooled over the cells [c0, c1) as the whole-image run pools
  * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. One coarser along any axis:
  * the whole layer is adaptive-average pooled to the cells along every axis, so each cell takes the samples that
@@ -450,8 +494,8 @@ SpanMaskShare(const torch::Tensor &        mask,
 }
 
 /** What the feature models of a region-sampled run must be: run at the image's resolution (no voxel size of
- * their own, whose lattice a region does not line up with) and of the image's dimension. The kept layers over the
- * models, and whether one reads the image's statistics. */
+ * their own, whose lattice a region does not line up with), of the image's dimension and without PCA (`pca`, the
+ * components kept per layer). The kept layers over the models, and whether one reads the image's statistics. */
 struct RegionModels
 {
   size_t layerCount{ 0 };
@@ -463,8 +507,14 @@ RegionModels
 CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
                   const TSpacing &                              spacing,
                   unsigned int                                  dim,
+                  const std::vector<unsigned int> &             pca,
                   const char *                                  who)
 {
+  if (std::any_of(pca.begin(), pca.end(), [](unsigned int components) { return components > 0; }))
+  {
+    itkGenericExceptionMacro(<< who << ": PCA fits its basis on the whole fixed feature map; set it to 0 with "
+                                       "RegionSize.");
+  }
   RegionModels models;
   for (const ImpactModelConfiguration & config : configs)
   {

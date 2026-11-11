@@ -1684,14 +1684,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     itkExceptionMacro("ImpactFineRegistration: FeatureMapUpdateInterval re-extracts the features of the whole warped "
                       "image; leave it at -1 with RegionSize.");
   }
-  for (const unsigned int components : m_PCA)
-  {
-    if (components > 0)
-    {
-      itkExceptionMacro("ImpactFineRegistration: PCA fits its basis on the whole fixed feature map; set it to 0 with "
-                        "RegionSize.");
-    }
-  }
   if (!(m_SamplingPercentage > 0.0 && m_SamplingPercentage <= 1.0))
   {
     itkExceptionMacro("ImpactFineRegistration: SamplingPercentage must lie in (0, 1], got " << m_SamplingPercentage
@@ -1908,8 +1900,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   bool                                       takesMetadata = false; // a model that reads the image's statistics
   if (featureMode)
   {
-    const Impact::RegionModels models =
-      Impact::CheckRegionModels(m_FixedModelsConfiguration, m_FixedImage->GetSpacing(), Dim, "ImpactFineRegistration");
+    const Impact::RegionModels models = Impact::CheckRegionModels(
+      m_FixedModelsConfiguration, m_FixedImage->GetSpacing(), Dim, m_PCA, "ImpactFineRegistration");
     const size_t layerCount = models.layerCount;
     takesMetadata = models.takesMetadata;
     for (size_t l = 0; l < layerCount; ++l)
@@ -1987,33 +1979,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                      takesMetadata ? &(moving ? movingMetadata : fixedMetadata) : nullptr,
                                      "ImpactFineRegistration");
   };
-  // A layer coarser than the image lies on the image's lattice every `align` voxels: the regions read for the
-  // features start on it, and reach what pooling the whole layer to the cells reads past a cell's own voxels.
-  int64_t                           align = 1;
-  std::vector<int64_t>              reach = halo;
-  std::vector<Impact::LayerLattice> lattices(losses.size(), Impact::ImageLattice(Dim));
-  std::vector<Impact::LayerLattice> movingLattices = lattices; // the moving models' own, when they differ
-  if (featureMode)
+  std::vector<int64_t> cellVoxels(Dim);
+  for (unsigned int d = 0; d < Dim; ++d)
   {
-    std::vector<int64_t> probe(Dim + 2, Impact::LatticeProbe);
-    probe[0] = probe[1] = 1;
-    lattices = Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), false), "ImpactFineRegistration");
-    movingLattices =
-      m_MovingModelsConfiguration.empty()
-        ? lattices
-        : Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), true), "ImpactFineRegistration");
-    for (const auto * side : { &lattices, &movingLattices })
-    {
-      for (const Impact::LayerLattice & lattice : *side)
-      {
-        align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
-      }
-    }
-    for (unsigned int d = 0; d < Dim && align > 1; ++d)
-    {
-      reach[d] += windows[d].ends[0] - windows[d].starts[0] + 2 * align;
-    }
+    cellVoxels[d] = windows[d].ends[0] - windows[d].starts[0];
   }
+  const Impact::RegionLattices lattices = Impact::ProbeRegionLattices<Dim>(
+    halo, cellVoxels, device, !m_MovingModelsConfiguration.empty(), layersOf, "ImpactFineRegistration");
   auto pooledToCells = [&](std::vector<torch::Tensor> &              layers,
                            const std::vector<Impact::LayerLattice> & on,
                            const std::vector<int64_t> &              lowPad,
@@ -2027,8 +1999,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // The fixed features pooled over the cells [c0, c1): {1, C, n...} per layer.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<int64_t>       lowPad(Dim);
-    std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, reach, lowPad, align)), false);
-    pooledToCells(layers, lattices, lowPad, c0, c1);
+    std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, lattices.reach, lowPad, lattices.align)), false);
+    pooledToCells(layers, lattices.fixed, lowPad, c0, c1);
     return layers;
   };
   // The moving features pooled over the cells [c0, c1) of the fixed grid, the moving image brought there through
@@ -2041,7 +2013,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   };
   auto pooledMoving = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) -> PooledMoving {
     std::vector<int64_t> lowPad(Dim);
-    const RegionType     span = spanOf(c0, c1, reach, lowPad, align);
+    const RegionType     span = spanOf(c0, c1, lattices.reach, lowPad, lattices.align);
     const torch::Tensor  movingIndex = movingIndexField(span); // {1, Dim, span...} on the device
     std::vector<int64_t> spanSize(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
@@ -2096,7 +2068,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     PooledMoving pooled;
     pooled.layers = layersOf(window, true);
-    pooledToCells(pooled.layers, movingLattices, lowPad, c0, c1);
+    pooledToCells(pooled.layers, lattices.moving, lowPad, c0, c1);
     if (maskWindow.defined())
     {
       pooled.share = toCells(maskWindow, Impact::ImageLattice(Dim), lowPad, c0, c1);
