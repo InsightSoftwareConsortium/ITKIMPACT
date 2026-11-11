@@ -74,17 +74,65 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   }
 
   m_LossThreadStruct = make_unique_for_overwrite<AlignedLossPerThreadStruct[]>(numWorkUnitsUsed);
+  this->m_OnlineSamples.assign(numWorkUnitsUsed, {});
 
   for (ThreadIdType i = 0; i < numWorkUnitsUsed; ++i)
   {
-    // The feature subset follows the same seed as the planes above: with Seed set it is that
-    // seed, with Seed zero it is the clock drawn once. Reseeding from the clock here on every
-    // evaluation made the subset change across a second boundary, so two evaluations of the
-    // same parameters did not return the same value.
-    this->m_LossThreadStruct[i].init(this->m_ImpactAssociate->GetDistance(),
-                                     this->m_ImpactAssociate->GetLayersWeight(),
-                                     this->m_PlaneSeed,
-                                     globalDerivativeSize);
+    this->m_LossThreadStruct[i].init(
+      this->m_ImpactAssociate->GetDistance(), this->m_ImpactAssociate->GetLayersWeight(), globalDerivativeSize);
+  }
+
+  // The feature subsets follow the same seed as the planes above, drawn afresh from it on every
+  // evaluation, so two evaluations of the same parameters compare the same channels.
+  std::mt19937        generator(this->m_PlaneSeed);
+  const torch::Device device(this->m_ImpactAssociate->GetDevice());
+  this->m_SubsetsOfFeatures = this->m_ImpactAssociate->m_features_indexes;
+  this->m_SubsetsOfFeaturesOnDevice.clear();
+  for (size_t comparison = 0; comparison < this->m_SubsetsOfFeatures.size(); ++comparison)
+  {
+    std::vector<unsigned int> & subset = this->m_SubsetsOfFeatures[comparison];
+    const unsigned int          kept = this->m_ImpactAssociate->GetSubsetFeatures()[comparison];
+    if (kept < subset.size())
+    {
+      std::shuffle(subset.begin(), subset.end(), generator);
+      subset.resize(kept);
+    }
+    this->m_SubsetsOfFeaturesOnDevice.push_back(
+      torch::tensor(std::vector<int64_t>(subset.begin(), subset.end()), torch::kInt64).to(device));
+  }
+  // Static mode reads exactly these channels at every point: have the maps lay them side by side.
+  auto & internals = *this->m_ImpactAssociate->m_Internals;
+  for (size_t comparison = 0; comparison < internals.m_FixedFeaturesMaps.size(); ++comparison)
+  {
+    internals.m_FixedFeaturesMaps[comparison].m_FeaturesMapInterpolator->SetActiveChannels(
+      this->m_SubsetsOfFeatures[comparison]);
+    internals.m_MovingFeaturesMaps[comparison].m_FeaturesMapInterpolator->SetActiveChannels(
+      this->m_SubsetsOfFeatures[comparison]);
+  }
+  // The fixed features kept over a sampled point set (Internals::m_FixedFeatures), sized here, on
+  // one thread, and dropped when what they depend on has moved.
+  if (this->m_ImpactAssociate->GetMode() == "Jacobian" && this->m_ImpactAssociate->GetUseSampledPointSet())
+  {
+    const auto points = static_cast<int64_t>(this->m_ImpactAssociate->GetNumberOfDomainPoints());
+    // PointSet::SetPoint() modifies the container alone.
+    const typename TImpactMetric::Internals::FixedFeaturesKey key{
+      this->m_ImpactAssociate->GetMTime(),
+      this->m_ImpactAssociate->GetVirtualSampledPointSet()->GetPoints()->GetMTime(),
+      this->m_ImpactAssociate->GetFixedImage()->GetMTime(),
+      this->m_ImpactAssociate->GetFixedTransform()->GetMTime(),
+      this->m_PlaneSeed,
+      this->m_SubsetsOfFeatures
+    };
+    if (internals.m_FixedFeaturesKnown.size() != static_cast<size_t>(points) || internals.m_FixedFeaturesKey != key)
+    {
+      internals.m_FixedFeaturesKnown.assign(static_cast<size_t>(points), 0);
+      internals.m_FixedFeatures.clear();
+      for (const torch::Tensor & subset : this->m_SubsetsOfFeaturesOnDevice)
+      {
+        internals.m_FixedFeatures.push_back(torch::empty({ points, subset.numel() }, torch::kFloat32));
+      }
+      internals.m_FixedFeaturesKey = key;
+    }
   }
 }
 
@@ -93,10 +141,18 @@ void
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
   AfterThreadedExecution()
 {
+  // The reductions below, and the small operations of the online passes, are not worth a team.
+  const Impact::OneOpenMPThread oneThread(this->GetNumberOfWorkUnitsUsed() > 1);
+
   // Let the base reduce the valid-point count (and per-point derivative contributions,
   // if any). It also sets m_Value from the per-point measures, which we leave at zero
   // and override below with the IMPACT loss value.
   Superclass::AfterThreadedExecution();
+
+  if (this->m_ImpactAssociate->GetMode() == "Jacobian")
+  {
+    this->EvaluateOnline();
+  }
 
   // Reduce the per-work-unit loss accumulators into work unit 0.
   const ThreadIdType numWorkUnitsUsed = this->GetNumberOfWorkUnitsUsed();
@@ -128,83 +184,51 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 }
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
-std::vector<unsigned int>
-ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  GetSubsetOfFeatures(const std::vector<unsigned int> & features_index, std::mt19937 & randomGenerator, int n) const
-{
-  if (features_index.size() == static_cast<size_t>(n))
-    return features_index;
-
-  std::vector<unsigned int> shuffled = features_index;
-  std::shuffle(shuffled.begin(), shuffled.end(), randomGenerator);
-  shuffled.resize(n);
-  return shuffled;
-}
-
-template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 void
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
   ThreadedExecution(const DomainType & domain, const ThreadIdType threadId)
 {
-  // Static mode reads a precomputed feature map, so a point costs one interpolation and the
-  // framework's own walk -- which ends in ProcessPoint() -- is the right granularity.
-  if (this->m_ImpactAssociate->GetMode() != "Jacobian")
-  {
-    Superclass::ThreadedExecution(domain, threadId);
-    return;
-  }
-
-  // Online mode instead runs the network on a patch cut around every point, so walking point
-  // by point costs one forward and one backward pass each. Gather this work unit's points
-  // first and push them through the models in batches, which is the shape the elastix metric
-  // has: there the sampler hands its whole point set over in a single call.
-  const std::vector<Sample> samples = this->CollectSamples(domain);
-  LossPerThreadStruct &     loss = this->m_LossThreadStruct[threadId];
-
-  // BatchSize capped by the device budget (itkImpactBatchBudget.h); 0 = the budget alone, or
-  // the whole work unit on the CPU. A batch that runs out of memory is halved and replayed
-  // after the losses have been rewound.
-  const auto &        movingConfigs = this->m_ImpactAssociate->GetMovingModelsConfiguration();
-  const torch::Device device(this->m_ImpactAssociate->GetDevice());
-  const auto          requested = static_cast<int64_t>(this->m_ImpactAssociate->GetBatchSize());
-  for (auto first = samples.begin(); first != samples.end();)
-  {
-    const int64_t bound = Impact::EffectiveBatchSize(movingConfigs);
-    int64_t       batch = requested > 0 ? requested : static_cast<int64_t>(samples.size());
-    batch = std::max<int64_t>(bound > 0 ? std::min(batch, bound) : batch, 1);
-    const auto last = first + std::min<std::ptrdiff_t>(batch, samples.end() - first);
-
-    std::vector<Impact::Loss::State> before;
-    for (const auto & l : loss.m_losses)
-    {
-      before.push_back(l->SaveState());
-    }
-    try
-    {
-      this->EvaluateJacobianBatch(first, last, threadId, loss);
-      first = last;
-    }
-    catch (const std::exception & error)
-    {
-      if (!Impact::IsDeviceOutOfMemory(error) || last - first <= 1)
-      {
-        throw;
-      }
-      for (size_t l = 0; l < loss.m_losses.size(); ++l)
-      {
-        loss.m_losses[l]->RestoreState(before[l]);
-      }
-      for (const ImpactModelConfiguration & config : movingConfigs)
-      {
-        Impact::ShrinkBatchSize(config, last - first, device);
-      }
-    }
-  }
+  // Gather this work unit's points first and evaluate them in batches, which is the shape the
+  // elastix metric has: there the sampler hands its whole point set over in a single call.
+  // Online, walking point by point would cost one forward and one backward pass each; Static, a
+  // few small tensor operations each, and the framework's walk also computed an image gradient
+  // per point that IMPACT never reads.
+  const Impact::OneOpenMPThread oneThread(this->GetNumberOfWorkUnitsUsed() > 1);
+  LossPerThreadStruct &         loss = this->m_LossThreadStruct[threadId];
+  const bool                    online = this->m_ImpactAssociate->GetMode() == "Jacobian";
 
   // ProcessVirtualPoint() would have kept these counts and we bypassed it: the first is what
   // the base metric reduces into GetNumberOfValidPoints(), the second what normalizes the loss.
-  this->m_GetValueAndDerivativePerThreadVariables[threadId].NumberOfValidPoints += samples.size();
-  loss.m_numberOfPixelsCounted += samples.size();
+  auto count = [&](const std::vector<Sample> & samples) {
+    this->m_GetValueAndDerivativePerThreadVariables[threadId].NumberOfValidPoints += samples.size();
+    loss.m_numberOfPixelsCounted += samples.size();
+  };
+  // Static, a batch holds a [batch, channels, parameters] Jacobian: about 4 MB per work unit, so that a dense
+  // domain under a B-spline transform stays bounded, and the points are evaluated as they are gathered, a batch
+  // at a time. Online the work unit gathers them all, for EvaluateOnline().
+  size_t channels = 1;
+  for (const std::vector<unsigned int> & subset : this->m_SubsetsOfFeatures)
+  {
+    channels = std::max(channels, subset.size());
+  }
+  const size_t parameters = this->GetComputeDerivative() ? this->GetCachedNumberOfLocalParameters() : 1;
+  const size_t batch = std::max<size_t>(1, (size_t{ 1 } << 20) / std::max<size_t>(1, channels * parameters));
+  auto         evaluate = [&](std::vector<Sample> & samples) {
+    count(samples);
+    this->EvaluateStaticBatch(samples.begin(), samples.end(), threadId, loss);
+    samples.clear();
+  };
+  std::vector<Sample> samples =
+    this->CollectSamples(domain, online ? std::numeric_limits<size_t>::max() : batch, evaluate);
+  if (online)
+  {
+    count(samples);
+    this->m_OnlineSamples[threadId] = std::move(samples);
+  }
+  else if (!samples.empty())
+  {
+    evaluate(samples);
+  }
 
   this->m_Associate->FinalizeThread(threadId);
 }
@@ -233,13 +257,14 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 auto
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region) const
-  -> std::vector<Sample>
+  CollectSamples(const ImageRegion<ImageToImageMetricv4Type::VirtualImageDimension> & region,
+                 size_t                                                               capacity,
+                 const std::function<void(std::vector<Sample> &)> & whenFull) const -> std::vector<Sample>
 {
   const typename VirtualImageType::ConstPointer virtualImage = this->m_ImpactAssociate->GetVirtualImage();
 
   std::vector<Sample> samples;
-  samples.reserve(region.GetNumberOfPixels());
+  samples.reserve(std::min<size_t>(region.GetNumberOfPixels(), capacity));
   Sample           sample;
   VirtualPointType virtualPoint;
   for (ImageRegionConstIteratorWithIndex<VirtualImageType> it(virtualImage, region); !it.IsAtEnd(); ++it)
@@ -248,6 +273,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
     if (this->ResolveSample(it.GetIndex(), virtualPoint, sample))
     {
       samples.push_back(sample);
+      if (samples.size() == capacity)
+      {
+        whenFull(samples);
+      }
     }
   }
   return samples;
@@ -257,7 +286,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
 auto
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange) const -> std::vector<Sample>
+  CollectSamples(const ThreadedIndexedContainerPartitioner::DomainType & indexRange,
+                 size_t                                                  capacity,
+                 const std::function<void(std::vector<Sample> &)> &      whenFull) const -> std::vector<Sample>
 {
   using PointIdentifierType = typename ImageToImageMetricv4Type::VirtualPointSetType::MeshTraits::PointIdentifier;
   const typename VirtualImageType::ConstPointer virtualImage = this->m_ImpactAssociate->GetVirtualImage();
@@ -267,14 +298,19 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   const auto end = static_cast<PointIdentifierType>(indexRange[1]);
 
   std::vector<Sample> samples;
-  samples.reserve(static_cast<size_t>(end - begin + 1));
+  samples.reserve(std::min(static_cast<size_t>(end - begin + 1), capacity));
   Sample sample;
   for (PointIdentifierType i = begin; i <= end; ++i)
   {
     const VirtualPointType virtualPoint = sampledPointSet->GetPoint(i);
     if (this->ResolveSample(virtualImage->TransformPhysicalPointToIndex(virtualPoint), virtualPoint, sample))
     {
+      sample.m_Id = static_cast<SizeValueType>(i);
       samples.push_back(sample);
+      if (samples.size() == capacity)
+      {
+        whenFull(samples);
+      }
     }
   }
   return samples;
@@ -343,11 +379,12 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   const auto &         movingDirection = this->m_ImpactAssociate->GetMovingImage()->GetDirection();
   const PatchPlaneType plane = this->PatchPlane(sample.m_VirtualIndex, modelIndex, dim);
 
-  auto fixedAccessor = fixedPatches.accessor<float, 2>();
+  float * const fixedRow =
+    fixedPatches.defined() ? fixedPatches.template data_ptr<float>() + row * fixedPatches.size(1) : nullptr;
   auto movingAccessor = movingPatches.accessor<float, 2>();
   auto gradientAccessor = movingGradients.accessor<float, 3>();
 
-  for (int64_t flat = 0; flat < fixedPatches.size(1); ++flat)
+  for (int64_t flat = 0; flat < movingPatches.size(1); ++flat)
   {
     // Decode the multi-index with image axis 0 varying FASTEST, so that reshaping the row to
     // the reversed extents reproduces the Static path's tensor layout.
@@ -388,9 +425,9 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       }
     }
 
-    if (this->m_ImpactAssociate->m_FixedInterpolator->IsInsideBuffer(fixedPoint))
+    if (fixedRow != nullptr && this->m_ImpactAssociate->m_FixedInterpolator->IsInsideBuffer(fixedPoint))
     {
-      fixedAccessor[row][flat] = static_cast<float>(this->m_ImpactAssociate->m_FixedInterpolator->Evaluate(fixedPoint));
+      fixedRow[flat] = static_cast<float>(this->m_ImpactAssociate->m_FixedInterpolator->Evaluate(fixedPoint));
     }
     if (!this->m_ImpactAssociate->m_MovingInterpolator->IsInsideBuffer(movingPoint))
     {
@@ -424,348 +461,307 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
 
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
-void
+auto
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  EvaluateJacobianBatch(typename std::vector<Sample>::const_iterator first,
-                        typename std::vector<Sample>::const_iterator last,
-                        const ThreadIdType                           threadId,
-                        LossPerThreadStruct &                        loss) const
+  SampleBatch(typename std::vector<Sample>::const_iterator first,
+              typename std::vector<Sample>::const_iterator last,
+              bool                                         parallel,
+              bool                                         derivative,
+              bool                                         fixed) const -> Impact::OnlineBatch
 {
+  using JacobianType = typename TImageToImageMetric::JacobianType;
   constexpr unsigned int movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
 
-  const auto                   batchSize = static_cast<int64_t>(std::distance(first, last));
-  const bool                   computeDerivative = this->GetComputeDerivative();
-  const torch::Device          device(this->m_ImpactAssociate->GetDevice());
-  std::unique_lock<std::mutex> deviceLock(Impact::DeviceForwardMutex(), std::defer_lock);
+  const auto   size = static_cast<int64_t>(last - first);
+  const auto & configs = this->m_ImpactAssociate->GetFixedModelsConfiguration();
 
-  // d(moving coordinate)/d(parameter) at every point of the batch, and the global parameter
-  // index each of its columns belongs to.
-  torch::Tensor transformJacobian;      // [B, MovingDim, P]
-  torch::Tensor nonZeroJacobianIndices; // [B, P]
-  if (computeDerivative)
+  Impact::OnlineBatch batch;
+  for (const ImpactModelConfiguration & config : configs)
   {
-    using JacobianType = typename TImageToImageMetric::JacobianType;
-    using MovingTransformType = typename TImageToImageMetric::MovingTransformType;
-    JacobianType & jacobian = this->m_GetValueAndDerivativePerThreadVariables[threadId].MovingTransformJacobian;
-    JacobianType & jacobianPositional =
-      this->m_GetValueAndDerivativePerThreadVariables[threadId].MovingTransformJacobianPositional;
-
-    const NumberOfParametersType parameterCount = this->GetCachedNumberOfLocalParameters();
-    transformJacobian = torch::empty(
-      { batchSize, static_cast<int64_t>(movingDimension), static_cast<int64_t>(parameterCount) }, torch::kFloat32);
-    nonZeroJacobianIndices = torch::empty({ batchSize, static_cast<int64_t>(parameterCount) }, torch::kInt64);
-    auto jacobianAccessor = transformJacobian.accessor<float, 3>();
-    auto indexAccessor = nonZeroJacobianIndices.accessor<int64_t, 2>();
-
-    for (int64_t row = 0; row < batchSize; ++row)
-    {
-      const Sample & sample = *(first + row);
-      this->m_ImpactAssociate->GetMovingTransform()->ComputeJacobianWithRespectToParametersCachedTemporaries(
-        sample.m_VirtualPoint, jacobian, jacobianPositional);
-      for (unsigned int dimension = 0; dimension < movingDimension; ++dimension)
-      {
-        for (NumberOfParametersType parameter = 0; parameter < parameterCount; ++parameter)
-        {
-          jacobianAccessor[row][dimension][parameter] = static_cast<float>(jacobian(dimension, parameter));
-        }
-      }
-      // Map local parameter indices to global ones. A global transform (affine, rigid) has
-      // offset 0; a local-support displacement field only affects the parameter block of this
-      // point's own virtual voxel.
-      int64_t parameterOffset = 0;
-      if (this->m_ImpactAssociate->GetMovingTransform()->GetTransformCategory() ==
-          MovingTransformType::TransformCategoryEnum::DisplacementField)
-      {
-        parameterOffset = static_cast<int64_t>(
-          this->m_ImpactAssociate->ComputeParameterOffsetFromVirtualIndex(sample.m_VirtualIndex, parameterCount));
-      }
-      for (NumberOfParametersType parameter = 0; parameter < parameterCount; ++parameter)
-      {
-        indexAccessor[row][parameter] = parameterOffset + static_cast<int64_t>(parameter);
-      }
-    }
+    const std::vector<int64_t> & patchSize = config.GetPatchSize();
+    const int64_t voxels = std::accumulate(patchSize.begin(), patchSize.end(), int64_t{ 1 }, std::multiplies<>());
+    batch.fixedPatches.push_back(fixed ? torch::zeros({ size, voxels }, torch::kFloat32) : torch::Tensor());
+    batch.movingPatches.push_back(torch::zeros({ size, voxels }, torch::kFloat32));
+    batch.movingGradients.push_back(torch::zeros({ size, voxels, movingDimension }, torch::kFloat32));
   }
 
-  // The layers the metric compares, in mask order: one feature map, one loss and one weight
-  // each, appended to the same flat list across models that Static builds.
-  auto keptLayers = [](std::vector<torch::jit::IValue> & outputs, const ImpactModelConfiguration & config) {
-    std::vector<torch::Tensor> layers;
-    const auto &               mask = config.GetLayersMask();
-    for (size_t it = 0; it < mask.size(); ++it)
-    {
-      if (mask[it])
-      {
-        layers.push_back(outputs[it].toTensor());
-      }
-    }
-    return layers;
-  };
-  // The central feature vector of every point of a layer tensor [B, C, s...] -> [B, C].
-  auto centerFeatures = [](torch::Tensor layer) {
-    while (layer.dim() > 2)
-    {
-      layer = layer.select(2, layer.size(2) / 2);
-    }
-    return layer;
-  };
-
-  const auto & fixedConfigs = this->m_ImpactAssociate->GetFixedModelsConfiguration();
-  const auto & movingConfigs = this->m_ImpactAssociate->GetMovingModelsConfiguration();
-  // One configuration serves both images, so each image's metadata travels with its patches.
-  const ImpactImageMetadata & fixedMetadata = this->m_ImpactAssociate->m_Internals->m_FixedImageMetadata;
-  const ImpactImageMetadata & movingMetadata = this->m_ImpactAssociate->m_Internals->m_MovingImageMetadata;
-
-  size_t comparison = 0; // flat index over (model, kept layer), the one the losses are read at
-  for (size_t i = 0; i < fixedConfigs.size(); ++i)
+  // d(moving coordinate)/d(parameter) at every point, and the global parameter index of each of
+  // its columns.
+  const auto parameters = static_cast<int64_t>(this->GetCachedNumberOfLocalParameters());
+  float *    jacobianOut = nullptr;
+  int64_t *  indicesOut = nullptr;
+  if (derivative)
   {
-    const ImpactModelConfiguration & fixedConfig = fixedConfigs[i];
-    const ImpactModelConfiguration & movingConfig = movingConfigs[i];
-    const auto                       channels = static_cast<int64_t>(fixedConfig.GetNumberOfChannels());
+    batch.transformJacobian = torch::empty({ size, movingDimension, parameters }, torch::kFloat32);
+    batch.nonZeroJacobianIndices = torch::empty({ size, parameters }, torch::kInt64);
+    jacobianOut = batch.transformJacobian.template data_ptr<float>();
+    indicesOut = batch.nonZeroJacobianIndices.template data_ptr<int64_t>();
+  }
 
-    const std::vector<int64_t> & patchSize = fixedConfig.GetPatchSize();
-    const int64_t voxelCount = std::accumulate(patchSize.begin(), patchSize.end(), int64_t{ 1 }, std::multiplies<>());
-
-    torch::Tensor fixedPatches = torch::zeros({ batchSize, voxelCount }, torch::kFloat32);
-    torch::Tensor movingPatches = torch::zeros({ batchSize, voxelCount }, torch::kFloat32);
-    torch::Tensor movingGradients =
-      torch::zeros({ batchSize, voxelCount, static_cast<int64_t>(movingDimension) }, torch::kFloat32);
-    for (int64_t row = 0; row < batchSize; ++row)
+  auto sampleRows = [&](int64_t begin, int64_t end) {
+    JacobianType jacobian(movingDimension, parameters);
+    JacobianType jacobianPositional(movingDimension, movingDimension);
+    for (int64_t row = begin; row < end; ++row)
     {
-      this->SamplePatch(*(first + row), i, row, fixedPatches, movingPatches, movingGradients, computeDerivative);
-    }
-
-    // [B, C, s...]. PatchTensorShape is the one place that knows the spatial extents are
-    // reversed (image axis 0 innermost): SamplePatch fills each row with image axis 0 varying
-    // fastest, which is the layout ImageToTensorFilter produces and the one the TorchScript
-    // models are trained on. The single intensity channel is then repeated to the channel
-    // count the model expects.
-    const std::vector<int64_t> tensorShape = Impact::PatchTensorShape(fixedConfig);
-    std::vector<int64_t>       patchShape{ batchSize, 1 };
-    patchShape.insert(patchShape.end(), tensorShape.begin(), tensorShape.end());
-    std::vector<int64_t> channelRepeat(patchShape.size(), 1);
-    channelRepeat[1] = channels;
-
-    auto toModelPatch = [&](const torch::Tensor & values, const ImpactModelConfiguration & config) {
-      return values.reshape(patchShape).repeat(channelRepeat).to(device).to(GetModelDtype(config));
-    };
-    // The feature vector of one kept layer, restricted to the channels this comparison samples.
-    auto featuresOf = [&](const torch::Tensor & layer, const torch::Tensor & subsetIndices) {
-      return centerFeatures(layer).index_select(1, subsetIndices).to(torch::kFloat32);
-    };
-    // Which channels of comparison `a` are compared. Drawn once per batch and per comparison,
-    // from the work unit's own generator.
-    auto subsetIndicesOf = [&](size_t a) {
-      const std::vector<unsigned int> subsetOfFeatures =
-        this->GetSubsetOfFeatures(this->m_ImpactAssociate->m_features_indexes[a],
-                                  loss.m_randomGenerator,
-                                  this->m_ImpactAssociate->GetSubsetFeatures()[a]);
-      return torch::tensor(std::vector<int64_t>(subsetOfFeatures.begin(), subsetOfFeatures.end()), torch::kInt64)
-        .to(device);
-    };
-
-    // One work unit at a time on the device, so the budget holds whatever the thread count.
-    if (device.is_cuda() && !deviceLock.owns_lock())
-    {
-      deviceLock.lock();
-    }
-
-    // No gradient ever flows through the fixed image.
-    std::vector<torch::Tensor> fixedLayers;
-    {
-      torch::NoGradGuard noGrad;
-      auto               outputs = Forward(fixedConfig, toModelPatch(fixedPatches, fixedConfig), fixedMetadata);
-      fixedLayers = keptLayers(outputs, fixedConfig);
-    }
-    const auto layerCount = static_cast<size_t>(fixedLayers.size());
-
-    if (!computeDerivative)
-    {
-      torch::NoGradGuard noGrad;
-      auto               outputs = Forward(movingConfig, toModelPatch(movingPatches, movingConfig), movingMetadata);
-      const std::vector<torch::Tensor> movingLayers = keptLayers(outputs, movingConfig);
-      for (size_t layer = 0; layer < layerCount; ++layer, ++comparison)
+      const Sample & sample = *(first + row);
+      for (size_t i = 0; i < configs.size(); ++i)
       {
-        const torch::Tensor subsetIndices = subsetIndicesOf(comparison);
-        torch::Tensor       fixedFeatures = featuresOf(fixedLayers[layer], subsetIndices).to(torch::kCPU);
-        torch::Tensor       movingFeatures = featuresOf(movingLayers[layer], subsetIndices).to(torch::kCPU);
-        loss.m_losses[comparison]->updateValue(fixedFeatures, movingFeatures);
+        this->SamplePatch(
+          sample, i, row, batch.fixedPatches[i], batch.movingPatches[i], batch.movingGradients[i], derivative);
       }
-      continue;
-    }
-
-    // The patch values are the autograd leaf, as in the elastix metric: differentiating the
-    // features with respect to them and contracting with the moving interpolator's spatial
-    // gradients gives d(feature)/d(moving coordinate) for the whole batch at once. One forward
-    // pass serves every kept layer, so the graph has to survive until the last of them is done.
-    torch::Tensor movingPatch = toModelPatch(movingPatches, movingConfig).detach().set_requires_grad(true);
-    auto          movingOutputs = Forward(movingConfig, movingPatch, movingMetadata);
-    const std::vector<torch::Tensor> movingLayers = keptLayers(movingOutputs, movingConfig);
-    // d(patch value)/d(moving coordinate), tiled once per repeated channel so that it lines up
-    // with the flattened gradient below: summing over the copies sums over the channel axis,
-    // which is exactly the derivative with respect to the underlying intensity.
-    torch::Tensor patchGradients = movingGradients.to(device).repeat({ 1, channels, 1 }); // [B, C * nVox, MovingDim]
-
-    // ... and then into d(.)/d(parameter), which is what the losses accumulate.
-    auto toParameterJacobian = [&](const torch::Tensor & featureCoordinateJacobian) {
-      return torch::bmm(featureCoordinateJacobian.to(torch::kCPU).to(torch::kFloat32), transformJacobian);
-    };
-
-    for (size_t layer = 0; layer < layerCount; ++layer, ++comparison)
-    {
-      const torch::Tensor subsetIndices = subsetIndicesOf(comparison);
-      torch::Tensor       fixedFeatures = featuresOf(fixedLayers[layer], subsetIndices).to(torch::kCPU);
-      torch::Tensor       movingFeatures = featuresOf(movingLayers[layer], subsetIndices); // [B, C], on the device
-      torch::Tensor       movingFeaturesOnCpu = movingFeatures.detach().to(torch::kCPU);
-      const bool          laterLayersFollow = layer + 1 < layerCount;
-
-      // One backward pass over the batch, seeded by `seed`, contracted into d(.)/d(coordinate).
-      auto backward = [&](const torch::Tensor & seed, bool retainGraph) {
-        const torch::Tensor gradient =
-          torch::autograd::grad({ movingFeatures }, { movingPatch }, { seed }, retainGraph, false)[0];
-        return torch::bmm(gradient.flatten(1).unsqueeze(1).to(torch::kFloat32), patchGradients); // [B, 1, MovingDim]
-      };
-
-      if (loss.m_losses[comparison]->IsPerPointMean())
+      if (derivative)
       {
-        // The loss is a mean of independent per-point terms, so its gradient with respect to the
-        // features is known before any backward pass: seeding the pass with it yields
-        // d(loss)/d(moving coordinate) directly, in ONE pass for the whole batch. This is what
-        // the elastix metric does.
-        torch::Tensor modulator =
-          loss.m_losses[comparison]->updateValueAndGetGradientModulator(fixedFeatures, movingFeaturesOnCpu);
-        torch::Tensor jacobian =
-          toParameterJacobian(backward(modulator.to(device).to(movingFeatures.dtype()), laterLayersFollow));
-        loss.m_losses[comparison]->updateDerivativeInJacobianMode(jacobian, nonZeroJacobianIndices);
-      }
-      else
-      {
-        // A global statistic (NCC) mixes the points together: its gradient with respect to the
-        // features is only known once every point has been seen, so it cannot seed the pass --
-        // seeded per batch it would measure the correlation within that batch alone, which at one
-        // point is a zero variance and hence an identically zero gradient. Recover the full
-        // per-channel Jacobian instead -- one pass per kept channel, each still over the whole
-        // batch -- and let the loss fold it into the statistics it accumulates itself. That is
-        // the closed form Static mode uses, and it stays exact whatever the batch size and
-        // however the work units split the domain.
-        const int64_t              keptChannels = movingFeatures.size(1);
-        std::vector<torch::Tensor> perChannel;
-        perChannel.reserve(static_cast<size_t>(keptChannels));
-        torch::Tensor seed = torch::zeros_like(movingFeatures);
-        for (int64_t channel = 0; channel < keptChannels; ++channel)
-        {
-          seed.zero_();
-          seed.select(1, channel).fill_(1.0);
-          perChannel.push_back(backward(seed, channel + 1 < keptChannels || laterLayersFollow).squeeze(1));
-        }
-        torch::Tensor jacobian = toParameterJacobian(torch::stack(perChannel, 1)); // [B, C, MovingDim] -> [B, C, P]
-        loss.m_losses[comparison]->updateValueAndDerivativeInStaticMode(
-          fixedFeatures, movingFeaturesOnCpu, jacobian, nonZeroJacobianIndices);
+        this->FillTransformJacobian(sample,
+                                    jacobian,
+                                    jacobianPositional,
+                                    jacobianOut + row * movingDimension * parameters,
+                                    indicesOut + row * parameters);
       }
     }
+  };
+  if (!parallel)
+  {
+    sampleRows(0, size);
+    return batch;
+  }
+  // The rows are independent: spread them over the threads, idle between two evaluations.
+  MultiThreaderBase * const threader = this->GetMultiThreader();
+  const auto                parts = std::min<int64_t>(size, threader->GetNumberOfWorkUnits());
+  threader->ParallelizeArray(
+    0, parts, [&](SizeValueType part) { sampleRows(size * part / parts, size * (part + 1) / parts); }, nullptr);
+  return batch;
+}
+
+
+template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
+void
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  EvaluateOnline()
+{
+  std::vector<Sample> samples;
+  for (const std::vector<Sample> & unit : this->m_OnlineSamples)
+  {
+    samples.insert(samples.end(), unit.begin(), unit.end());
+  }
+  this->m_OnlineSamples.clear();
+
+  // The points as Impact::EvaluateOnline asks for them. Over a sampled point set the fixed features are kept from one
+  // evaluation to the next (Internals::m_FixedFeatures): a batch whose points all have theirs cuts no fixed patch.
+  class Host : public Impact::OnlineHost
+  {
+  public:
+    Host(const Self & threader, const std::vector<typename Self::Sample> & samples)
+      : m_Threader(threader)
+      , m_Samples(samples)
+      , m_Internals(*threader.m_ImpactAssociate->m_Internals)
+      , m_Keep(threader.m_ImpactAssociate->GetUseSampledPointSet())
+    {}
+    Impact::OnlineBatch
+    Sample(int64_t begin, int64_t end, bool parallel, bool derivative, bool fixed) const override
+    {
+      const auto first = m_Samples.begin() + begin, last = m_Samples.begin() + end;
+      fixed = fixed && !(m_Keep && std::all_of(first, last, [&](const auto & s) {
+                           return m_Internals.m_FixedFeaturesKnown[s.m_Id] != 0;
+                         }));
+      return m_Threader.SampleBatch(first, last, parallel, derivative, fixed);
+    }
+    void
+    Parallelize(int64_t parts, const std::function<void(int64_t)> & body) const override
+    {
+      m_Threader.GetMultiThreader()->ParallelizeArray(
+        0, parts, [&](SizeValueType part) { body(static_cast<int64_t>(part)); }, nullptr);
+    }
+    std::vector<torch::Tensor>
+    KeptFixedFeatures(int64_t begin, int64_t end) const override
+    {
+      std::vector<torch::Tensor> fixed;
+      for (const torch::Tensor & kept : m_Internals.m_FixedFeatures)
+      {
+        fixed.push_back(kept.index_select(0, Ids(begin, end)));
+      }
+      return fixed;
+    }
+    void
+    KeepFixedFeatures(int64_t begin, int64_t end, const std::vector<torch::Tensor> & fixed) const override
+    {
+      if (!m_Keep)
+      {
+        return;
+      }
+      const torch::Tensor ids = Ids(begin, end);
+      for (size_t c = 0; c < fixed.size(); ++c)
+      {
+        m_Internals.m_FixedFeatures[c].index_copy_(0, ids, fixed[c]);
+      }
+      for (auto it = m_Samples.begin() + begin; it != m_Samples.begin() + end; ++it)
+      {
+        m_Internals.m_FixedFeaturesKnown[it->m_Id] = 1;
+      }
+    }
+
+  private:
+    torch::Tensor
+    Ids(int64_t begin, int64_t end) const
+    {
+      torch::Tensor ids = torch::empty({ end - begin }, torch::kInt64);
+      std::transform(m_Samples.begin() + begin, m_Samples.begin() + end, ids.data_ptr<int64_t>(), [](const auto & s) {
+        return static_cast<int64_t>(s.m_Id);
+      });
+      return ids;
+    }
+    const Self &                               m_Threader;
+    const std::vector<typename Self::Sample> & m_Samples;
+    typename TImpactMetric::Internals &        m_Internals;
+    const bool                                 m_Keep;
+  };
+
+  const Impact::OnlineSettings settings{ this->m_ImpactAssociate->GetFixedModelsConfiguration(),
+                                         this->m_ImpactAssociate->GetMovingModelsConfiguration(),
+                                         this->m_SubsetsOfFeaturesOnDevice,
+                                         torch::Device(this->m_ImpactAssociate->GetDevice()),
+                                         static_cast<int64_t>(this->m_ImpactAssociate->GetBatchSize()),
+                                         static_cast<int64_t>(this->GetNumberOfWorkUnitsUsed()),
+                                         &this->m_ImpactAssociate->m_Internals->m_FixedImageMetadata,
+                                         &this->m_ImpactAssociate->m_Internals->m_MovingImageMetadata };
+  Impact::EvaluateOnline(settings,
+                         Host(*this, samples),
+                         static_cast<int64_t>(samples.size()),
+                         this->GetComputeDerivative(),
+                         [&](int64_t part) -> std::vector<std::unique_ptr<Impact::Loss>> & {
+                           return this->m_LossThreadStruct[part].m_losses;
+                         });
+}
+
+template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
+void
+ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
+  FillTransformJacobian(const Sample &                               sample,
+                        typename TImageToImageMetric::JacobianType & jacobian,
+                        typename TImageToImageMetric::JacobianType & jacobianPositional,
+                        float *                                      jacobianOut,
+                        int64_t *                                    indicesOut) const
+{
+  using MovingTransformType = typename TImageToImageMetric::MovingTransformType;
+  const auto transform = this->m_ImpactAssociate->GetMovingTransform();
+  const auto parameters = static_cast<int64_t>(this->GetCachedNumberOfLocalParameters());
+  transform->ComputeJacobianWithRespectToParametersCachedTemporaries(
+    sample.m_VirtualPoint, jacobian, jacobianPositional);
+  for (unsigned int d = 0; d < ImageToImageMetricv4Type::MovingImageDimension; ++d)
+  {
+    for (int64_t parameter = 0; parameter < parameters; ++parameter)
+    {
+      *jacobianOut++ = static_cast<float>(jacobian(d, parameter));
+    }
+  }
+  // A global transform (affine, rigid) has offset 0; a local-support displacement field only
+  // affects the parameter block of the point's own virtual voxel.
+  const int64_t offset =
+    transform->GetTransformCategory() == MovingTransformType::TransformCategoryEnum::DisplacementField
+      ? static_cast<int64_t>(
+          this->m_ImpactAssociate->ComputeParameterOffsetFromVirtualIndex(sample.m_VirtualIndex, parameters))
+      : 0;
+  for (int64_t parameter = 0; parameter < parameters; ++parameter)
+  {
+    *indicesOut++ = offset + parameter;
   }
 }
 
 
 template <typename TDomainPartitioner, typename TImageToImageMetric, typename TImpactMetric>
-bool
+void
 ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TImageToImageMetric, TImpactMetric>::
-  ProcessPoint(const VirtualIndexType &    virtualIndex,
-               const VirtualPointType &    virtualPoint,
-               const FixedImagePointType & mappedFixedPoint,
-               const FixedImagePixelType &,
-               const FixedImageGradientType &,
-               const MovingImagePointType & mappedMovingPoint,
-               const MovingImagePixelType &,
-               const MovingImageGradientType &,
-               MeasureType & metricValueReturn,
-               DerivativeType &,
-               const ThreadIdType threadId) const
+  EvaluateStaticBatch(typename std::vector<Sample>::const_iterator first,
+                      typename std::vector<Sample>::const_iterator last,
+                      const ThreadIdType                           threadId,
+                      LossPerThreadStruct &                        loss) const
 {
-  // Static mode only: interpolate the (optionally subsampled) per-layer feature vector at the
-  // mapped fixed/moving point and accumulate the per-layer loss. When a derivative is
-  // requested, chain the moving feature spatial gradient with the moving-transform Jacobian.
-  // Value and derivative are reduced and normalized in AfterThreadedExecution. Online mode
-  // never reaches here: ThreadedExecution() walks its points itself, in batches.
-  LossPerThreadStruct & loss = this->m_LossThreadStruct[threadId];
+  // Interpolate the per-layer feature vectors at the mapped fixed and moving points and
+  // accumulate the per-layer losses. When a derivative is requested, chain the moving
+  // features' spatial gradient with the moving-transform Jacobian. Value and derivative are
+  // reduced and normalized in AfterThreadedExecution.
+  const auto             count = static_cast<int64_t>(last - first);
+  const bool             computeDerivative = this->GetComputeDerivative();
+  constexpr unsigned int movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
+  const auto &           internals = *this->m_ImpactAssociate->m_Internals;
 
-  const bool computeDerivative = this->GetComputeDerivative();
+  // A map rebuilt through T_k holds the features of M(T_k(p)): read it at x + (T(x) - T_k(x)),
+  // which is x at the moment of the refresh and moves with the parameters exactly as T(x) does.
+  // The map built at Initialize() holds the features of M itself and is read at T(x).
+  std::vector<MovingImagePointType> movingReadPoints;
+  movingReadPoints.reserve(count);
+  for (auto sample = first; sample != last; ++sample)
+  {
+    MovingImagePointType movingReadPoint = sample->m_MovingPoint;
+    if (internals.m_RefreshTransform.IsNotNull())
+    {
+      const auto anchored = internals.m_RefreshTransform->TransformPoint(sample->m_VirtualPoint);
+      for (unsigned int d = 0; d < movingDimension; ++d)
+      {
+        movingReadPoint[d] = sample->m_VirtualPoint[d] + (sample->m_MovingPoint[d] - anchored[d]);
+      }
+    }
+    movingReadPoints.push_back(movingReadPoint);
+  }
 
-  torch::Tensor transformJacobian;      // [1, MovingDim, P]
-  torch::Tensor nonZeroJacobianIndices; // [1, P]
+  torch::Tensor transformJacobian;      // [B, MovingDim, P]
+  torch::Tensor nonZeroJacobianIndices; // [B, P]
   if (computeDerivative)
   {
     using JacobianType = typename TImageToImageMetric::JacobianType;
     JacobianType & jacobian = this->m_GetValueAndDerivativePerThreadVariables[threadId].MovingTransformJacobian;
     JacobianType & jacobianPositional =
       this->m_GetValueAndDerivativePerThreadVariables[threadId].MovingTransformJacobianPositional;
-    // For a dense/global transform this is the full Jacobian and every parameter
-    // contributes at every point (handled below via an identity index list).
-    this->m_ImpactAssociate->GetMovingTransform()->ComputeJacobianWithRespectToParametersCachedTemporaries(
-      virtualPoint, jacobian, jacobianPositional);
+    const auto parameters = static_cast<int64_t>(this->GetCachedNumberOfLocalParameters());
 
-    constexpr unsigned int       movingDimension = ImageToImageMetricv4Type::MovingImageDimension;
-    const NumberOfParametersType numberOfLocalParameters = this->GetCachedNumberOfLocalParameters();
-    transformJacobian = torch::empty(
-      { 1, static_cast<int64_t>(movingDimension), static_cast<int64_t>(numberOfLocalParameters) }, torch::kFloat32);
-    auto jacobianAccessor = transformJacobian.accessor<float, 3>();
-    for (unsigned int dimension = 0; dimension < movingDimension; ++dimension)
+    transformJacobian = torch::empty({ count, movingDimension, parameters }, torch::kFloat32);
+    nonZeroJacobianIndices = torch::empty({ count, parameters }, torch::kInt64);
+    float *   jacobianOut = transformJacobian.data_ptr<float>();
+    int64_t * indicesOut = nonZeroJacobianIndices.data_ptr<int64_t>();
+    for (auto sample = first; sample != last; ++sample)
     {
-      for (NumberOfParametersType parameter = 0; parameter < numberOfLocalParameters; ++parameter)
+      this->FillTransformJacobian(*sample, jacobian, jacobianPositional, jacobianOut, indicesOut);
+      jacobianOut += movingDimension * parameters;
+      indicesOut += parameters;
+    }
+  }
+
+  for (size_t i = 0; i < internals.m_FixedFeaturesMaps.size(); ++i)
+  {
+    const std::vector<unsigned int> & subset = this->m_SubsetsOfFeatures[i];
+    const auto                        channels = static_cast<int64_t>(subset.size());
+    const auto &                      fixedMap = *internals.m_FixedFeaturesMaps[i].m_FeaturesMapInterpolator;
+    const auto &                      movingMap = *internals.m_MovingFeaturesMaps[i].m_FeaturesMapInterpolator;
+
+    torch::Tensor fixedFeatures = torch::empty({ count, channels }, torch::kFloat32);
+    torch::Tensor movingFeatures = torch::empty({ count, channels }, torch::kFloat32);
+    torch::Tensor movingDerivatives; // d(feature)/d(moving coordinate) : [B, C, MovingDim]
+    float *       fixedOut = fixedFeatures.data_ptr<float>();
+    float *       movingOut = movingFeatures.data_ptr<float>();
+    float *       derivativeOut = nullptr;
+    if (computeDerivative)
+    {
+      movingDerivatives = torch::empty({ count, channels, movingDimension }, torch::kFloat32);
+      derivativeOut = movingDerivatives.data_ptr<float>();
+    }
+    int64_t row = 0;
+    for (auto sample = first; sample != last; ++sample, ++row)
+    {
+      fixedMap.Evaluate(sample->m_FixedPoint, subset, fixedOut + row * channels);
+      if (computeDerivative)
       {
-        jacobianAccessor[0][dimension][parameter] = static_cast<float>(jacobian(dimension, parameter));
+        movingMap.EvaluateValueAndDerivative(
+          movingReadPoints[row], subset, movingOut + row * channels, derivativeOut + row * channels * movingDimension);
+      }
+      else
+      {
+        movingMap.Evaluate(movingReadPoints[row], subset, movingOut + row * channels);
       }
     }
-    // Map local parameter indices to global ones. A global transform (affine, rigid) has
-    // offset 0. A local-support displacement field only affects the parameter block of
-    // this point's own virtual voxel, at ComputeParameterOffsetFromVirtualIndex.
-    int64_t parameterOffset = 0;
-    using MovingTransformType = typename TImageToImageMetric::MovingTransformType;
-    if (this->m_ImpactAssociate->GetMovingTransform()->GetTransformCategory() ==
-        MovingTransformType::TransformCategoryEnum::DisplacementField)
-    {
-      parameterOffset = static_cast<int64_t>(
-        this->m_ImpactAssociate->ComputeParameterOffsetFromVirtualIndex(virtualIndex, numberOfLocalParameters));
-    }
-    nonZeroJacobianIndices =
-      (torch::arange(static_cast<int64_t>(numberOfLocalParameters), torch::kInt64) + parameterOffset).unsqueeze(0);
-  }
-
-  // A map rebuilt through T_k holds the features of M(T_k(p)): read it at x + (T(x) - T_k(x)),
-  // which is x at the moment of the refresh and moves with the parameters exactly as T(x) does.
-  // The map built at Initialize() holds the features of M itself and is read at T(x).
-  MovingImagePointType movingReadPoint = mappedMovingPoint;
-  if (const auto & refresh = this->m_ImpactAssociate->m_Internals->m_RefreshTransform; refresh.IsNotNull())
-  {
-    const auto anchored = refresh->TransformPoint(virtualPoint);
-    for (unsigned int d = 0; d < MovingImagePointType::PointDimension; ++d)
-    {
-      movingReadPoint[d] = virtualPoint[d] + (mappedMovingPoint[d] - anchored[d]);
-    }
-  }
-
-  for (size_t i = 0; i < this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps.size(); ++i)
-  {
-    const std::vector<unsigned int> subsetOfFeatures =
-      this->GetSubsetOfFeatures(this->m_ImpactAssociate->m_features_indexes[i],
-                                loss.m_randomGenerator,
-                                this->m_ImpactAssociate->GetSubsetFeatures()[i]);
-
-    torch::Tensor fixedFeatures = this->m_ImpactAssociate->m_Internals->m_FixedFeaturesMaps[i]
-                                    .m_FeaturesMapInterpolator->Evaluate(mappedFixedPoint, subsetOfFeatures)
-                                    .unsqueeze(0);
-    torch::Tensor movingFeatures = this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i]
-                                     .m_FeaturesMapInterpolator->Evaluate(movingReadPoint, subsetOfFeatures)
-                                     .unsqueeze(0);
 
     if (computeDerivative)
     {
-      // d(feature)/d(moving coordinate) : [1, C, MovingDim]
-      torch::Tensor movingFeatureDerivative =
-        this->m_ImpactAssociate->m_Internals->m_MovingFeaturesMaps[i]
-          .m_FeaturesMapInterpolator->EvaluateDerivative(movingReadPoint, subsetOfFeatures)
-          .unsqueeze(0);
-      // chain with d(moving coordinate)/d(parameter) : [1, C, P]
-      torch::Tensor featureParameterJacobian = torch::bmm(movingFeatureDerivative, transformJacobian);
+      // chained with d(moving coordinate)/d(parameter) : [B, C, P]
+      torch::Tensor featureParameterJacobian = torch::bmm(movingDerivatives, transformJacobian);
       loss.m_losses[i]->updateValueAndDerivativeInStaticMode(
         fixedFeatures, movingFeatures, featureParameterJacobian, nonZeroJacobianIndices);
     }
@@ -774,10 +770,6 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       loss.m_losses[i]->updateValue(fixedFeatures, movingFeatures);
     }
   }
-  ++loss.m_numberOfPixelsCounted;
-
-  metricValueReturn = MeasureType{};
-  return true;
 }
 
 } // end namespace itk

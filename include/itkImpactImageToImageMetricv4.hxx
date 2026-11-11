@@ -27,6 +27,7 @@
 #include "itkImpactModelConfigurationDetail.h" // ComputeImageMetadata
 #include "itkImpactBatchBudget.h"              // ConfigureBatchSize
 #include <itkImageFileWriter.h>
+#include <tuple>
 
 namespace itk
 {
@@ -74,6 +75,24 @@ struct ImpactImageToImageMetricv4<TFixedImage,
   // one configuration serves both.
   ImpactImageMetadata m_FixedImageMetadata;
   ImpactImageMetadata m_MovingImageMetadata;
+  // Online, over a sampled point set: each point's fixed feature vectors, [points, C] per
+  // comparison, and whether the point has them yet. Nothing they depend on moves from one
+  // evaluation to the next -- the fixed image and transform, the point, its plane, the channels --
+  // so the fixed model runs once per point and not once per evaluation. Initialize() drops them,
+  // and so does a key that differs from the one they were computed under.
+  std::vector<torch::Tensor> m_FixedFeatures;
+  std::vector<char>          m_FixedFeaturesKnown;
+  // In order: the modification times of the metric (whatever is set on it: the models, and which
+  // image, transform and point set), of the points, of the fixed image and of the fixed transform,
+  // then the plane seed and the channels. ITK draws every modification time from one counter, so
+  // a time names the object as well as its state.
+  using FixedFeaturesKey = std::tuple<ModifiedTimeType,
+                                      ModifiedTimeType,
+                                      ModifiedTimeType,
+                                      ModifiedTimeType,
+                                      unsigned int,
+                                      std::vector<std::vector<unsigned int>>>;
+  FixedFeaturesKey m_FixedFeaturesKey;
 };
 
 template <typename TFixedImage,
@@ -95,6 +114,10 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
     ImpactImageToImageMetricv4GetValueAndDerivativeThreader<ThreadedIndexedContainerPartitioner, Superclass, Self>;
   this->m_DenseGetValueAndDerivativeThreader = ImpactDenseGetValueAndDerivativeThreaderType::New();
   this->m_SparseGetValueAndDerivativeThreader = ImpactSparseGetValueAndDerivativeThreaderType::New();
+
+  // IMPACT compares features and never reads the images' gradients: with the filter on, Initialize()
+  // smoothed the whole moving image into a gradient image that nothing used.
+  this->SetUseMovingImageGradientFilter(false);
 }
 
 template <typename TFixedImage,
@@ -405,6 +428,8 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
     this->m_Internals->m_FixedFeaturesMaps.clear();
     this->m_Internals->m_MovingFeaturesMaps.clear();
     this->m_Internals->m_Principal_components.clear();
+    this->m_Internals->m_FixedFeatures.clear();
+    this->m_Internals->m_FixedFeaturesKnown.clear();
 
     if (m_FixedModelsConfiguration.size() != m_MovingModelsConfiguration.size())
     {
@@ -489,10 +514,13 @@ ImpactImageToImageMetricv4<TFixedImage, TMovingImage, TVirtualImage, TInternalCo
       }
     }
 
-    // Device budget per model (itkImpactBatchBudget.h); its backward pass refuses the GIL.
+    // Device budget per model (itkImpactBatchBudget.h), up to the largest batch an evaluation can
+    // run: BatchSize, or all the points; its backward pass refuses the GIL.
+    const auto largest =
+      static_cast<int64_t>(this->m_BatchSize > 0 ? this->m_BatchSize : this->GetNumberOfDomainPoints());
     Impact::PythonGilReleaseGuard noGil;
-    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
-    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, static_cast<int64_t>(this->m_BatchSize));
+    Impact::ConfigureBatchSize(this->m_MovingModelsConfiguration, device, largest);
+    Impact::ConfigureBatchSize(this->m_FixedModelsConfiguration, device, largest);
   }
   else
   {

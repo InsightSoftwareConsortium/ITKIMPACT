@@ -17,6 +17,7 @@
  *=========================================================================*/
 
 #include "gtest/gtest.h"
+#include <ATen/record_function.h>
 
 #include <chrono>
 #include <thread>
@@ -51,10 +52,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <random>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -153,7 +156,7 @@ TEST(ImpactBackend, ImageToTensorFilterResampling)
 // --- A4: Dice loss is soft, NaN-safe and does not mutate its inputs ----------
 TEST(ImpactBackend, ImpactLossFactoryHasAllLosses)
 {
-  for (const char * name : { "L1", "L2", "Dice", "L1Cosine", "Cosine", "NCC" })
+  for (const char * name : { "L1", "L2", "Dice", "OrganDice", "L1Cosine", "Cosine", "NCC" })
   {
     std::unique_ptr<itk::Impact::Loss> loss;
     ASSERT_NO_THROW(loss = itk::Impact::LossFactory::Instance().Create(name)) << name;
@@ -607,8 +610,9 @@ TEST(ImpactMetric, StaticDerivativeMatchesFiniteDifferences)
     EXPECT_GT(norm, 1e-8) << "derivative should be non-zero for misaligned images";
   };
 
-  checkLoss("Cosine"); // d(1 - cosine)/dm with the full dot-product cross term
-  checkLoss("NCC");    // cross-point statistics path (closed-form derivative)
+  checkLoss("Cosine");    // d(1 - cosine)/dm with the full dot-product cross term
+  checkLoss("NCC");       // cross-point statistics path (closed-form derivative)
+  checkLoss("OrganDice"); // per-channel sums over all the points (closed-form derivative)
   checkLoss("L1");
   checkLoss("L2");
   checkLoss("L1Cosine");
@@ -930,67 +934,78 @@ TEST(ImpactMetric, JacobianDerivativeMatchesFiniteDifferences)
     EXPECT_GT(norm, 1e-8) << "derivative should be non-zero for misaligned images";
   };
 
-  checkLoss("Cosine"); // normalized cross term
-  checkLoss("NCC");    // cross-point statistics path
+  checkLoss("Cosine");    // normalized cross term
+  checkLoss("NCC");       // cross-point statistics path
+  checkLoss("OrganDice"); // per-channel sums over all the points
   checkLoss("L1");
   checkLoss("L2");
   checkLoss("L1Cosine");
   checkLoss("Dice");
 }
 
-// Online mode runs the model on a batch of points at a time, so what a point contributes must not
-// depend on which batch it happened to land in. For a loss that is a mean of per-point terms that
-// is arithmetic. For NCC it is not: NCC correlates the sampled points with one another, and it
-// holds only because the derivative is accumulated as sums and combined in closed form once every
-// point has been seen. Seeding the backward pass with NCC's own gradient instead would measure the
-// correlation WITHIN a batch -- which at a batch of one is a zero variance, hence an identically
-// zero gradient, silently.
-TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
+// The metric of the three invariance tests below, left for the caller to initialize: the toy model
+// on two 8^3 ramps (different, so the gradient is non-trivial) and two of the four channels, so
+// that every point of an evaluation compares the same two whatever the batches or work units (NCC
+// accumulates its statistics channel by channel). Jacobian mode reads 3^3 patches online through a
+// cubic B-spline of the moving image; Static mode compares feature maps computed once at overlap 2
+// and never refreshed.
+using RampMetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, itk::Image<double, 3>, double>;
+
+static RampMetricType::Pointer
+MakeMetric(const char * lossName, const char * mode, const char * device, itk::Transform<double, 3, 3> * transform)
 {
-  using VirtualImageType = itk::Image<double, 3>;
-  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
-  using TransformType = itk::TranslationTransform<double, 3>;
-
-  auto fixed = MakeRampImage(8, 0);
-  auto moving = MakeRampImage(8, 1); // different => non-trivial gradient
-  auto identityFixed = itk::IdentityTransform<double, 3>::New();
-
-  auto evaluate = [&](const char * lossName, unsigned int batchSize, MetricType::DerivativeType & derivative) {
-    auto                                       metric = MetricType::New();
-    std::vector<itk::ImpactModelConfiguration> configs;
-    configs.emplace_back(ToyModelPath(),
-                         3,
-                         1,
-                         std::vector<unsigned int>{ 3, 3, 3 },
-                         std::vector<float>{ 1.f, 1.f, 1.f },
-                         std::vector<unsigned int>{ 0, 0, 0 },
-                         std::vector<bool>{ true, false },
-                         false);
-    metric->SetModelsConfiguration(configs);
-    metric->SetDistance({ std::string(lossName) });
-    metric->SetLayersWeight({ 1.f });
-    // All four channels: the feature subset is then drawn without consuming the generator, so a
-    // different number of batches cannot shift the random sequence and confound the comparison.
-    metric->SetSubsetFeatures({ 4 });
-    metric->SetPCA({ 0 });
-    metric->SetMode("Jacobian");
-    metric->SetSeed(1);
-    metric->SetDevice("cpu");
-    metric->SetBatchSize(batchSize);
-
-    auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+  const bool                                 jacobian = std::string(mode) == "Jacobian";
+  auto                                       metric = RampMetricType::New();
+  std::vector<itk::ImpactModelConfiguration> configs;
+  configs.emplace_back(ToyModelPath(),
+                       3,
+                       1,
+                       std::vector<unsigned int>(3, jacobian ? 3u : 0u),
+                       std::vector<float>{ 1.f, 1.f, 1.f },
+                       std::vector<unsigned int>(3, jacobian ? 0u : 2u),
+                       std::vector<bool>{ true, false },
+                       false);
+  metric->SetModelsConfiguration(configs);
+  metric->SetDistance({ std::string(lossName) });
+  metric->SetLayersWeight({ 1.f });
+  metric->SetSubsetFeatures({ 2 });
+  metric->SetPCA({ 0 });
+  metric->SetMode(mode);
+  metric->SetSeed(1);
+  metric->SetDevice(device);
+  if (jacobian)
+  {
+    auto movingInterp = InterpolatorType::New();
     movingInterp->SetSplineOrder(3);
     metric->SetMovingInterpolator(movingInterp);
+  }
+  else
+  {
+    metric->SetFeaturesMapUpdateInterval(-1);
+  }
+  metric->SetFixedImage(MakeRampImage(8, 0));
+  metric->SetMovingImage(MakeRampImage(8, 1));
+  metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+  metric->SetMovingTransform(transform);
+  return metric;
+}
 
-    auto transform = TransformType::New();
+// Online mode runs the model on a batch of points at a time, so what a point contributes must not
+// depend on which batch it happened to land in. For a loss that is a mean of per-point terms that
+// is arithmetic. For NCC it is not: NCC correlates the sampled points with one another, so its
+// gradient with respect to one point's features is only known once every point has been seen, and
+// a first pass sees them all before the backward passes. Seeding them with the gradient of NCC
+// within a batch would measure the correlation WITHIN that batch -- which at a batch of one is a
+// zero variance, hence an identically zero gradient, silently.
+TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
+{
+  using MetricType = RampMetricType;
+
+  auto evaluate = [](const char * lossName, unsigned int batchSize, MetricType::DerivativeType & derivative) {
+    auto transform = itk::TranslationTransform<double, 3>::New();
     transform->SetIdentity();
-
-    metric->SetFixedImage(fixed);
-    metric->SetMovingImage(moving);
-    metric->SetFixedTransform(identityFixed);
-    metric->SetMovingTransform(transform);
-    metric->SetUseFixedImageGradientFilter(false);
-    metric->SetUseMovingImageGradientFilter(false);
+    auto metric = MakeMetric(lossName, "Jacobian", "cpu", transform);
+    metric->SetBatchSize(batchSize);
     metric->SetMaximumNumberOfWorkUnits(1);
     metric->Initialize();
 
@@ -1026,6 +1041,317 @@ TEST(ImpactMetric, JacobianResultIsIndependentOfBatchSize)
     {
       EXPECT_NEAR(ragged[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
       EXPECT_NEAR(single[j], perPoint[j], 1e-4 * std::abs(perPoint[j])) << "parameter " << j;
+    }
+  }
+}
+
+// On a GPU the online mode runs every point through the models in batches as large as the device
+// holds: the value and the derivative have to be the CPU's, up to the TF32 arithmetic of CUDA
+// convolutions. Skipped without a CUDA device.
+TEST(ImpactMetric, JacobianOnTheGpuMatchesTheCpu)
+{
+  if (!torch::cuda::is_available())
+  {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  using MetricType = RampMetricType;
+
+  auto evaluate = [](const char * lossName, const char * device, MetricType::DerivativeType & derivative) {
+    auto transform = itk::TranslationTransform<double, 3>::New();
+    transform->SetIdentity();
+    auto metric = MakeMetric(lossName, "Jacobian", device, transform);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType cpu, gpu;
+    const double               cpuValue = evaluate(lossName, "cpu", cpu);
+    const double               gpuValue = evaluate(lossName, "cuda", gpu);
+    EXPECT_NEAR(gpuValue, cpuValue, 1e-3 * std::abs(cpuValue));
+    ASSERT_EQ(gpu.GetSize(), cpu.GetSize());
+    double difference = 0.0, norm = 0.0;
+    for (unsigned int j = 0; j < cpu.GetSize(); ++j)
+    {
+      difference += (gpu[j] - cpu[j]) * (gpu[j] - cpu[j]);
+      norm += cpu[j] * cpu[j];
+    }
+    ASSERT_GT(norm, 1e-12);
+    EXPECT_LT(std::sqrt(difference / norm), 1e-2);
+  }
+}
+
+// The passes a model makes, counted as the convolutions run forward and backward, on every thread,
+// while the counter lives. The toy model is one convolution, so a count is a number of passes: a
+// cost that no machine and no load changes, which a test can hold exactly.
+class ModelPassCounter
+{
+public:
+  ModelPassCounter()
+    : m_Handle(at::addGlobalCallback(at::RecordFunctionCallback(&ModelPassCounter::Count)))
+  {
+    Reset();
+  }
+  ~ModelPassCounter() { at::removeCallback(m_Handle); }
+  ModelPassCounter(const ModelPassCounter &) = delete;
+  ModelPassCounter &
+  operator=(const ModelPassCounter &) = delete;
+
+  static std::atomic<int> &
+  Forward()
+  {
+    static std::atomic<int> count{ 0 };
+    return count;
+  }
+  static std::atomic<int> &
+  Backward()
+  {
+    static std::atomic<int> count{ 0 };
+    return count;
+  }
+  static void
+  Reset()
+  {
+    Forward() = 0;
+    Backward() = 0;
+  }
+
+private:
+  static std::unique_ptr<at::ObserverContext>
+  Count(const at::RecordFunction & function)
+  {
+    const std::string_view name = function.name();
+    if (name == "aten::convolution")
+    {
+      ++Forward();
+    }
+    else if (name == "aten::convolution_backward")
+    {
+      ++Backward();
+    }
+    return nullptr;
+  }
+
+  at::CallbackHandle m_Handle;
+};
+
+// What the online mode costs on any machine is how often it runs the models. A batch takes one
+// forward pass of each model and one backward pass for a loss that is a mean of per-point terms
+// (L2); a global one (NCC) takes one more forward pass of the moving model, the first pass that
+// sees every point before the backward ones, unless one batch holds every point, as on a GPU, where
+// the whole evaluation is one batch; a value alone takes no backward pass. A backward pass per
+// channel, or batches of a few points, multiply these counts.
+TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
+{
+  using VirtualImageType = itk::Image<double, 3>;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+
+  auto check = [&](const char * lossName, const char * device, unsigned int batchSize) {
+    SCOPED_TRACE(std::string(lossName) + " on " + device);
+    auto                                       metric = MetricType::New();
+    std::vector<itk::ImpactModelConfiguration> configs;
+    configs.emplace_back(ToyModelPath(),
+                         3,
+                         1,
+                         std::vector<unsigned int>{ 3, 3, 3 },
+                         std::vector<float>{ 1.f, 1.f, 1.f },
+                         std::vector<unsigned int>{ 0, 0, 0 },
+                         std::vector<bool>{ true, false },
+                         false);
+    metric->SetModelsConfiguration(configs);
+    metric->SetDistance({ std::string(lossName) });
+    metric->SetLayersWeight({ 1.f });
+    metric->SetSubsetFeatures({ 4 });
+    metric->SetPCA({ 0 });
+    metric->SetMode("Jacobian");
+    metric->SetSeed(1);
+    metric->SetDevice(device);
+    metric->SetBatchSize(batchSize);
+    auto transform = itk::TranslationTransform<double, 3>::New();
+    transform->SetIdentity();
+    metric->SetFixedImage(fixed);
+    metric->SetMovingImage(moving);
+    metric->SetFixedTransform(itk::IdentityTransform<double, 3>::New());
+    metric->SetMovingTransform(transform);
+    metric->SetMaximumNumberOfWorkUnits(1);
+    metric->Initialize();
+
+    MetricType::MeasureType    value;
+    MetricType::DerivativeType derivative;
+    ModelPassCounter           counter;
+    metric->GetValueAndDerivative(value, derivative);
+    const auto points = static_cast<int>(metric->GetNumberOfValidPoints());
+    const int  batches = batchSize > 0 ? (points + static_cast<int>(batchSize) - 1) / static_cast<int>(batchSize) : 1;
+    ASSERT_GT(points, 0);
+    const bool twoPasses = std::string(lossName) == "NCC" && (std::string(device) == "cpu" || batches > 1);
+    EXPECT_EQ(ModelPassCounter::Forward(), (twoPasses ? 3 : 2) * batches);
+    EXPECT_EQ(ModelPassCounter::Backward(), batches);
+
+    ModelPassCounter::Reset();
+    metric->GetValue();
+    EXPECT_EQ(ModelPassCounter::Forward(), 2 * batches);
+    EXPECT_EQ(ModelPassCounter::Backward(), 0);
+  };
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    check(lossName, "cpu", 100);
+    if (torch::cuda::is_available())
+    {
+      check(lossName, "cuda", 0);
+      check(lossName, "cuda", 100);
+    }
+  }
+}
+
+// Over a sampled point set nothing the fixed features depend on moves between two evaluations, so
+// the online mode computes them once: from the second evaluation on, the fixed model no longer
+// runs, and the value and the derivative are those of a metric evaluating afresh. A modified fixed
+// transform has them computed again, and so does another point set of the same size.
+TEST(ImpactMetric, OnlineModeKeepsTheFixedFeaturesOfASampledPointSet)
+{
+  using VirtualImageType = ImageType;
+  using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
+  using TransformType = itk::TranslationTransform<double, 3>;
+
+  auto fixed = MakeRampImage(8, 0);
+  auto moving = MakeRampImage(8, 1);
+  auto points = MetricType::FixedSampledPointSetType::New();
+  for (unsigned int n = 0; n < 64; ++n)
+  {
+    ImageType::PointType point;
+    fixed->TransformIndexToPhysicalPoint(ImageType::IndexType{ { 2 + n % 4, 2 + n / 4 % 4, 2 + n / 16 } }, point);
+    points->SetPoint(n, point);
+  }
+
+  auto make =
+    [&](const char * lossName, TransformType * transform, itk::IdentityTransform<double, 3> * fixedTransform) {
+      auto                                       metric = MetricType::New();
+      std::vector<itk::ImpactModelConfiguration> configs;
+      configs.emplace_back(ToyModelPath(),
+                           3,
+                           1,
+                           std::vector<unsigned int>{ 3, 3, 3 },
+                           std::vector<float>{ 1.f, 1.f, 1.f },
+                           std::vector<unsigned int>{ 0, 0, 0 },
+                           std::vector<bool>{ true, false },
+                           false);
+      metric->SetModelsConfiguration(configs);
+      metric->SetDistance({ std::string(lossName) });
+      metric->SetLayersWeight({ 1.f });
+      metric->SetSubsetFeatures({ 4 });
+      metric->SetPCA({ 0 });
+      metric->SetMode("Jacobian");
+      metric->SetSeed(1);
+      metric->SetDevice("cpu");
+      metric->SetBatchSize(16);
+      metric->SetNormalizeLosses(false); // a fresh metric latches its own first value
+      auto movingInterp = itk::BSplineInterpolateImageFunction<ImageType, double>::New();
+      movingInterp->SetSplineOrder(3);
+      metric->SetMovingInterpolator(movingInterp);
+      metric->SetFixedImage(fixed);
+      metric->SetMovingImage(moving);
+      metric->SetFixedTransform(fixedTransform);
+      metric->SetMovingTransform(transform);
+      metric->SetFixedSampledPointSet(points);
+      metric->SetUseSampledPointSet(true);
+      metric->SetVirtualDomainFromImage(fixed);
+      metric->SetMaximumNumberOfWorkUnits(1);
+      metric->Initialize();
+      return metric;
+    };
+
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    const int movingPasses = std::string(lossName) == "NCC" ? 2 : 1;
+    auto      transform = TransformType::New();
+    transform->SetIdentity();
+    auto fixedTransform = itk::IdentityTransform<double, 3>::New();
+    auto metric = make(lossName, transform, fixedTransform);
+
+    MetricType::MeasureType    value;
+    MetricType::DerivativeType derivative;
+    ModelPassCounter           counter;
+    metric->GetValueAndDerivative(value, derivative);
+    ASSERT_EQ(metric->GetNumberOfValidPoints(), 64u);
+    EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);
+
+    TransformType::ParametersType shift(3);
+    shift[0] = 0.3;
+    shift[1] = -0.2;
+    shift[2] = 0.1;
+    transform->SetParameters(shift);
+    ModelPassCounter::Reset();
+    metric->GetValueAndDerivative(value, derivative);
+    EXPECT_EQ(ModelPassCounter::Forward(), movingPasses * 4);
+    EXPECT_EQ(ModelPassCounter::Backward(), 4);
+
+    MetricType::MeasureType    freshValue;
+    MetricType::DerivativeType freshDerivative;
+    make(lossName, transform, fixedTransform)->GetValueAndDerivative(freshValue, freshDerivative);
+    EXPECT_NEAR(value, freshValue, 1e-9 * std::abs(freshValue));
+    ASSERT_EQ(derivative.GetSize(), freshDerivative.GetSize());
+    for (unsigned int j = 0; j < derivative.GetSize(); ++j)
+    {
+      EXPECT_NEAR(derivative[j], freshDerivative[j], 1e-9 * std::abs(freshDerivative[j])) << "parameter " << j;
+    }
+
+    fixedTransform->Modified();
+    ModelPassCounter::Reset();
+    metric->GetValueAndDerivative(value, derivative);
+    EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);
+
+    auto others = MetricType::VirtualPointSetType::New();
+    for (unsigned int n = 0; n < 64; ++n)
+    {
+      others->SetPoint(n, points->GetPoint(63 - n));
+    }
+    metric->SetVirtualSampledPointSet(others);
+    ModelPassCounter::Reset();
+    metric->GetValueAndDerivative(value, derivative);
+    EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);
+  }
+}
+
+// The Static analogue: the points are split over the work units, and a feature subset drawn per
+// point from each work unit's own generator gave every point a subset that depended on its rank in
+// that split. All points of an evaluation now compare the same channels.
+TEST(ImpactMetric, StaticResultIsIndependentOfTheNumberOfWorkUnits)
+{
+  using MetricType = RampMetricType;
+
+  auto evaluate = [](const char * lossName, unsigned int workUnits, MetricType::DerivativeType & derivative) {
+    auto affine = itk::AffineTransform<double, 3>::New();
+    affine->SetIdentity();
+    auto metric = MakeMetric(lossName, "Static", "cpu", affine);
+    metric->SetMaximumNumberOfWorkUnits(workUnits);
+    metric->Initialize();
+
+    MetricType::MeasureType value;
+    metric->GetValueAndDerivative(value, derivative);
+    return static_cast<double>(value);
+  };
+
+  // Relative bars, as for the batches: the work units only regroup the float sums.
+  for (const char * lossName : { "L2", "NCC" })
+  {
+    SCOPED_TRACE(lossName);
+    MetricType::DerivativeType one, four;
+    const double               oneValue = evaluate(lossName, 1, one);
+    const double               fourValue = evaluate(lossName, 4, four);
+
+    EXPECT_NEAR(fourValue, oneValue, 1e-6 * std::abs(oneValue));
+    for (unsigned int j = 0; j < one.GetSize(); ++j)
+    {
+      EXPECT_NEAR(four[j], one[j], 1e-4 * std::abs(one[j]) + 1e-12) << "parameter " << j;
     }
   }
 }
@@ -1422,7 +1748,7 @@ TEST(ImpactMetric, AnEvenPatchIsCentredOnTheVoxelThatIsReadBack)
 // energy exactly 1.0 at every transform: this test passed on NCC and would have failed on L1.
 TEST(ImpactMetric, TranslationRegistrationConvergesForEveryDistance)
 {
-  for (const std::string distance : { "NCC", "L1", "L2", "Cosine", "L1Cosine" })
+  for (const std::string distance : { "NCC", "OrganDice", "L1", "L2", "Cosine", "L1Cosine" })
   {
     using VirtualImageType = itk::Image<double, 3>;
     using MetricType = itk::ImpactImageToImageMetricv4<ImageType, ImageType, VirtualImageType, double>;
@@ -1701,17 +2027,17 @@ TEST(ImpactBackend, AnisotropicPatchIsTiledInItkAxisOrder)
   EXPECT_LT(diffAt(4, 8, 8), 1e-3) << "x = 4 is interior to its patch: no seam may appear";
 }
 
-// Online mode runs its samples through the model in batches bounded by the device budget
-// (itkImpactBatchBudget.h); nothing may depend on where the batches are cut.
+// Online mode runs its samples through the models in batches (the threads' shares on the CPU, bounded by the device
+// budget on a GPU, itkImpactBatchBudget.h); nothing may depend on where the batches are cut, not even the derivative of
+// a global loss such as NCC, which takes every point.
 namespace
 {
 struct OnlineFixture
 {
-  std::vector<itk::ImpactModelConfiguration>                configs;
-  std::vector<itk::Point<double, 3>>                        points;
-  std::vector<std::vector<std::vector<std::vector<float>>>> patchIndex{ 1 };
-  std::vector<torch::Tensor> subset{ torch::arange(4, torch::kInt64), torch::arange(1, torch::kInt64) };
-  torch::Device              device{ torch::kCPU };
+  std::vector<itk::ImpactModelConfiguration> configs;
+  std::vector<itk::Point<double, 3>>         points;
+  std::vector<torch::Tensor>                 subset{ torch::arange(4, torch::kInt64), torch::arange(1, torch::kInt64) };
+  torch::Device                              device{ torch::kCPU };
 
   explicit OnlineFixture(size_t samples)
   {
@@ -1727,7 +2053,6 @@ struct OnlineFixture
     for (size_t s = 0; s < samples; ++s)
     {
       points.emplace_back(itk::MakePoint(static_cast<double>(s), 0.0, 0.0)); // the sample rides on x
-      patchIndex[0].push_back(configs[0].GetPatchIndex());
     }
   }
   // Intensities that depend on the sample, so batches cannot be confused by accident.
@@ -1743,55 +2068,102 @@ struct OnlineFixture
 };
 } // namespace
 
-TEST(ImpactBackend, OnlineInferenceIsIndependentOfTheBatchBound)
+TEST(ImpactBackend, OnlineEvaluationIsIndependentOfTheBatches)
 {
-  constexpr size_t samples = 7;
-  OnlineFixture    fx(samples);
-  auto             values = [](const itk::Point<double, 3> & point,
-                   const std::vector<std::vector<float>> &,
-                   const std::vector<int64_t> & shape) { return OnlineFixture::patch(point, shape, 0.0); };
-  auto             valuesAndJacobians = [](const itk::Point<double, 3> &           point,
-                               torch::Tensor &                         jacobians,
-                               const std::vector<std::vector<float>> & index,
-                               const std::vector<int64_t> &            shape,
-                               int                                     s) {
-    jacobians[s] = torch::arange(static_cast<int64_t>(index.size()), torch::kFloat32).unsqueeze(1).repeat({ 1, 3 }) *
-                     0.01f * static_cast<float>(s + 1) +
-                   0.5f;
-    return OnlineFixture::patch(point, shape, 1.0);
+  // The points of the fixture, cut by a host: patches that depend on the sample, deterministic gradients and a
+  // two-parameter transform Jacobian.
+  constexpr int64_t samples = 7, parameters = 2;
+  OnlineFixture     fx(samples);
+  class Host : public itk::Impact::OnlineHost
+  {
+  public:
+    explicit Host(const OnlineFixture & fixture)
+      : m_Fixture(fixture)
+    {}
+    itk::Impact::OnlineBatch
+    Sample(int64_t begin, int64_t end, bool, bool derivative, bool fixed) const override
+    {
+      const std::vector<int64_t> shape = itk::Impact::PatchTensorShape(m_Fixture.configs[0]);
+      std::vector<torch::Tensor> fixedRows, movingRows, gradients, jacobians;
+      for (int64_t s = begin; s < end; ++s)
+      {
+        const auto & point = m_Fixture.points[static_cast<size_t>(s)];
+        fixedRows.push_back(OnlineFixture::patch(point, shape, 0.0).flatten());
+        movingRows.push_back(OnlineFixture::patch(point, shape, 1.0).flatten());
+        const int64_t voxels = movingRows.back().numel();
+        gradients.push_back(torch::arange(voxels, torch::kFloat32).unsqueeze(1).repeat({ 1, 3 }) * 0.01f *
+                              static_cast<float>(s + 1) +
+                            0.5f);
+        jacobians.push_back(torch::arange(3 * parameters, torch::kFloat32).reshape({ 3, parameters }) * 0.1f +
+                            0.01f * static_cast<float>(s));
+      }
+      itk::Impact::OnlineBatch batch;
+      batch.fixedPatches.push_back(fixed ? torch::stack(fixedRows) : torch::Tensor());
+      batch.movingPatches.push_back(torch::stack(movingRows));
+      if (derivative)
+      {
+        batch.movingGradients.push_back(torch::stack(gradients));
+        batch.transformJacobian = torch::stack(jacobians);
+        batch.nonZeroJacobianIndices = torch::arange(parameters, torch::kInt64).repeat({ end - begin, 1 });
+      }
+      return batch;
+    }
+    void
+    Parallelize(int64_t parts, const std::function<void(int64_t)> & body) const override
+    {
+      for (int64_t part = 0; part < parts; ++part)
+      {
+        body(part);
+      }
+    }
+
+  private:
+    const OnlineFixture & m_Fixture;
   };
-  auto run = [&](int64_t bound) {
-    itk::SetBatchSize(fx.configs[0], bound);
-    std::vector<torch::Tensor> fixedOutputs = itk::Impact::GenerateOutputs<itk::Point<double, 3>>(
-      fx.configs, fx.points, fx.patchIndex, fx.subset, fx.device, values);
-    std::vector<std::unique_ptr<itk::Impact::Loss>> losses;
-    for (size_t i = 0; i < fixedOutputs.size(); ++i)
+  const Host host(fx);
+  // The value and the derivative of both kept layers, the parts' losses summed.
+  auto run = [&](const std::string & distance, int64_t batch, int64_t parts) {
+    std::vector<std::vector<std::unique_ptr<itk::Impact::Loss>>> losses(static_cast<size_t>(parts));
+    for (auto & part : losses)
     {
-      losses.push_back(itk::Impact::LossFactory::Instance().Create("L2"));
-      losses.back()->SetNumberOfParameters(1);
+      for (size_t layer = 0; layer < fx.subset.size(); ++layer)
+      {
+        part.push_back(itk::Impact::LossFactory::Instance().Create(distance));
+        part.back()->SetNumberOfParameters(parameters);
+      }
     }
-    std::vector<torch::Tensor> jacobians = itk::Impact::GenerateOutputsAndJacobian<itk::Point<double, 3>>(
-      fx.configs, fx.points, fx.patchIndex, fx.subset, fixedOutputs, fx.device, losses, valuesAndJacobians);
-    std::vector<double> lossValues;
-    for (const auto & loss : losses)
+    const itk::Impact::OnlineSettings settings{ fx.configs, fx.configs, fx.subset, fx.device, batch, parts };
+    itk::Impact::EvaluateOnline(
+      settings, host, samples, true, [&](int64_t part) -> std::vector<std::unique_ptr<itk::Impact::Loss>> & {
+        return losses[static_cast<size_t>(part)];
+      });
+    std::vector<std::pair<double, torch::Tensor>> layers;
+    for (size_t layer = 0; layer < fx.subset.size(); ++layer)
     {
-      lossValues.push_back(loss->GetValue(samples));
+      for (size_t part = 1; part < losses.size(); ++part)
+      {
+        *losses[0][layer] += *losses[part][layer];
+      }
+      layers.emplace_back(losses[0][layer]->GetValue(samples), losses[0][layer]->GetDerivative(samples));
     }
-    return std::make_tuple(fixedOutputs, jacobians, lossValues);
+    return layers;
   };
 
-  const auto [outputsAll, jacobiansAll, valuesAll] = run(0);
-  ASSERT_EQ(outputsAll.size(), 2u);
-  ASSERT_EQ(outputsAll[0].sizes(), (std::vector<int64_t>{ samples, 4 }));
-  EXPECT_GT(valuesAll[0], 0.0);
-  for (const int64_t bound : { 3, 1, 100 })
+  for (const std::string distance : { "L2", "NCC" })
   {
-    const auto [outputs, jacobians, lossValues] = run(bound);
-    for (size_t k = 0; k < 2; ++k)
+    const auto whole = run(distance, samples, 1);
+    ASSERT_GT(whole[0].second.abs().sum().item<double>(), 0.0) << distance << ": no derivative";
+    for (const auto & [batch, parts] : { std::pair<int64_t, int64_t>{ 3, 1 }, { 1, 3 }, { 2, 2 }, { 0, 4 } })
     {
-      EXPECT_TRUE(torch::allclose(outputs[k], outputsAll[k], 1e-6, 1e-6)) << "layer " << k << " bound " << bound;
-      EXPECT_TRUE(torch::allclose(jacobians[k], jacobiansAll[k], 1e-5, 1e-6)) << "layer " << k << " bound " << bound;
-      EXPECT_NEAR(lossValues[k], valuesAll[k], 1e-6 * std::abs(valuesAll[k]) + 1e-9) << "layer " << k;
+      const auto split = run(distance, batch, parts);
+      for (size_t layer = 0; layer < whole.size(); ++layer)
+      {
+        EXPECT_NEAR(split[layer].first, whole[layer].first, 1e-6 * std::abs(whole[layer].first) + 1e-9)
+          << distance << ", layer " << layer << ", batches of " << batch << " over " << parts << " parts";
+        EXPECT_TRUE(torch::allclose(split[layer].second, whole[layer].second, 1e-4, 1e-7))
+          << distance << ", layer " << layer << ", batches of " << batch << " over " << parts
+          << " parts: " << split[layer].second << " vs " << whole[layer].second;
+      }
     }
   }
 }
@@ -1906,12 +2278,11 @@ TEST(ImpactBackend, WholeImagePatchShrinksLargestZeroAxisFirst)
 // on a volume is run slice by slice, along the last ITK axis. The passthrough layer must
 // therefore reconstruct the volume exactly -- every slice is blended into a partition of unity
 // of its own -- and the swept axis must keep its extent and its spacing.
-// The online path exists only for the elastix metric, which samples a patch into a flat buffer
-// in GetPatchIndex() order -- ITK axis 0 fastest -- and hands it back as a tensor. A row-major
-// tensor over that buffer therefore has ITK x as its LAST, fastest axis, so its shape is the
-// patch size reversed. Give it the un-reversed shape and every axis but the middle one is
-// misread: for [3, 5, 7] the model is not handed a transposed patch but a re-partitioned one.
-// Isotropic patches hide this completely, which is why it needs a test of its own.
+// An online host (the elastix metric) samples a patch into a flat row in GetPatchIndex() order -- ITK axis 0
+// fastest -- and Impact::OnlineModelPatches shapes it for the model. A row-major tensor over that row therefore has
+// ITK x as its LAST, fastest axis, so its shape is the patch size reversed (PatchTensorShape). Give it the un-reversed
+// shape and every axis but the middle one is misread: for [3, 5, 7] the model is not handed a transposed patch but a
+// re-partitioned one. Isotropic patches hide this completely, which is why it needs a test of its own.
 TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
 {
   const std::vector<unsigned int> patch = { 3, 5, 7 }; // x, y, z -- no two axes equal
@@ -1927,8 +2298,7 @@ TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
 
   const torch::Device                        device(torch::kCPU);
   std::vector<itk::ImpactModelConfiguration> configs{ config };
-  // Probes the model and records where the center of each output layer is; GenerateOutputs
-  // needs it, and it is the same call the metric makes before its first evaluation.
+  // Probes the model, as the metric does before its first evaluation.
   ASSERT_NO_THROW(itk::Impact::GetModelOutputsExample(configs, "fixed", device));
 
   // An intensity that depends on all three axes differently, so a re-partitioned patch cannot
@@ -1951,30 +2321,25 @@ TEST(ImpactBackend, OnlineInferenceShapesAnAnisotropicPatchForTheModel)
     referenceCenter = itk::Forward(configs[0], reference)[0].toTensor().index({ "...", pz / 2, py / 2, px / 2 });
   }
 
-  // What the elastix evaluator does: fill a flat buffer in patch-offset order, then wrap it in
-  // a tensor at the shape it was handed. The offsets carry (index - patchSize/2) at unit voxel
-  // size, so the index each one came from is recoverable.
-  auto evaluator = [&](const itk::Point<double, 3> &,
-                       const std::vector<std::vector<float>> & patchIndex,
-                       const std::vector<int64_t> &            shape) {
-    std::vector<float> values(patchIndex.size(), 0.0f);
-    for (size_t i = 0; i < patchIndex.size(); ++i)
-    {
-      values[i] = intensity(static_cast<int64_t>(patchIndex[i][0]) + px / 2,
-                            static_cast<int64_t>(patchIndex[i][1]) + py / 2,
-                            static_cast<int64_t>(patchIndex[i][2]) + pz / 2);
-    }
-    return torch::from_blob(values.data(), { torch::IntArrayRef(shape) }, torch::kFloat32).unsqueeze(0).clone();
-  };
-
-  std::vector<itk::Point<double, 3>>                        fixedPoints(1);
-  std::vector<std::vector<std::vector<std::vector<float>>>> patchIndex(1);
-  patchIndex[0].push_back(configs[0].GetPatchIndex());
-  ASSERT_EQ(patchIndex[0][0].size(), static_cast<size_t>(px * py * pz));
-
-  const std::vector<torch::Tensor> subset{ torch::arange(4, torch::kInt64) };
-  std::vector<torch::Tensor>       outputs =
-    itk::Impact::GenerateOutputs<itk::Point<double, 3>>(configs, fixedPoints, patchIndex, subset, device, evaluator);
+  // What the elastix metric does: fill a row in patch-offset order. The offsets carry (index - patchSize/2) at unit
+  // voxel size, so the index each one came from is recoverable.
+  const std::vector<std::vector<float>> & offsets = configs[0].GetPatchIndex();
+  ASSERT_EQ(offsets.size(), static_cast<size_t>(px * py * pz));
+  torch::Tensor row = torch::empty({ 1, px * py * pz }, torch::kFloat32);
+  for (size_t i = 0; i < offsets.size(); ++i)
+  {
+    row[0][static_cast<int64_t>(i)] = intensity(static_cast<int64_t>(offsets[i][0]) + px / 2,
+                                                static_cast<int64_t>(offsets[i][1]) + py / 2,
+                                                static_cast<int64_t>(offsets[i][2]) + pz / 2);
+  }
+  const std::vector<torch::Tensor>  subset{ torch::arange(4, torch::kInt64) };
+  const itk::Impact::OnlineSettings settings{ configs, configs, subset, device, 0, 1 };
+  std::vector<torch::Tensor>        outputs;
+  {
+    torch::NoGradGuard noGrad;
+    outputs =
+      itk::Impact::OnlineFeatures(settings, 0, false, itk::Impact::OnlineModelPatches(settings, row, 0, false), 0);
+  }
 
   ASSERT_EQ(outputs.size(), 1u);
   ASSERT_EQ(outputs[0].sizes(), (std::vector<int64_t>{ 1, 4 }));
@@ -2403,12 +2768,38 @@ TEST(ImpactLoss, LocalNCCComparesWindowsOfDenseMaps)
   EXPECT_THROW(loss->forwardValue(points, points), std::runtime_error);
 }
 
+// A loss sums its value over the batch of points it is handed. Summed in float32, the value lost
+// digits with the size of the batch, so a work unit evaluated in one batch did not give the value
+// of the same points fed one by one, and finite differences of it were mostly rounding.
+TEST(ImpactLoss, ValueOfABatchIsTheSumOfItsPoints)
+{
+  torch::manual_seed(7);
+  const int64_t N = 20000, C = 4;
+  torch::Tensor fixed = torch::rand({ N, C }) * 10; // float32, as the metric hands them over
+  torch::Tensor moving = torch::rand({ N, C }) * 10;
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice" })
+  {
+    SCOPED_TRACE(name);
+    auto batch = itk::Impact::LossFactory::Instance().Create(name);
+    batch->updateValue(fixed, moving);
+    auto pointwise = itk::Impact::LossFactory::Instance().Create(name);
+    for (int64_t i = 0; i < N; ++i)
+    {
+      torch::Tensor fixedPoint = fixed.narrow(0, i, 1);
+      torch::Tensor movingPoint = moving.narrow(0, i, 1);
+      pointwise->updateValue(fixedPoint, movingPoint);
+    }
+    const double expected = pointwise->GetValue(static_cast<double>(N));
+    EXPECT_NEAR(batch->GetValue(static_cast<double>(N)), expected, 1e-9 * std::abs(expected));
+  }
+}
+
 TEST(ImpactLoss, ForwardValueGradientFiniteDifference)
 {
   torch::manual_seed(7);
   const int64_t N = 48, C = 6;
   const auto    opts = torch::TensorOptions().dtype(torch::kFloat64);
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC" })
   {
     auto          loss = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor fixed = torch::rand({ N, C }, opts) + 0.2; // strictly positive (Dice-safe)
@@ -3615,7 +4006,7 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
   auto window = [&](const Volume & q) { return box(box(q)); };
   auto clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
 
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
     const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor cost = torch::zeros({ L, Z, Y, X });
@@ -3630,7 +4021,7 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
       };
       auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
       Volume expected(Z * Y * X, 0.0);
-      if (name == "NCC" || name == "LNCC")
+      if (name == "NCC" || name == "LNCC" || name == "OrganDice")
       {
         const Volume weight = window(Volume(Z * Y * X, 1.0));
         for (int64_t c = 0; c < C; ++c)
@@ -3656,7 +4047,8 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
             const double covariance = mfm[i] / w - meanF * meanM;
             const double varianceF = mff[i] / w - meanF * meanF, varianceM = mmm[i] / w - meanM * meanM;
             const double correlation =
-              name == "NCC"
+              name == "OrganDice" ? (mff[i] + mmm[i] > 0 ? 2.0 * mfm[i] / (mff[i] + mmm[i]) : 1.0)
+              : name == "NCC"
                 ? covariance / std::max(std::sqrt(std::max(varianceF, 0.0)) * std::sqrt(std::max(varianceM, 0.0)), 1e-8)
                 : covariance * covariance / (std::max(varianceF, 1e-5) * std::max(varianceM, 1e-5));
             expected[i] += (1.0 - correlation) / C;
@@ -3716,7 +4108,7 @@ TEST(ImpactConvexAdam, CoarseRecoversATranslationWithEveryDistance)
   expected[0] = 3.0;
   expected[1] = -2.5;
   expected[2] = 1.5;
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "OrganDice", "NCC", "LNCC" })
   {
     auto coarse = CoarseType::New();
     coarse->SetFixedImage(fixed);
@@ -3989,7 +4381,7 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
   auto                clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
   const torch::Tensor support =
     itk::Impact::CoarseMaskSupport<3>(fixedShare, movingShare, halfWidths, fixed.sizes(), L);
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
     const auto    distance = itk::Impact::LossFactory::Instance().Create(name);
     torch::Tensor cost = torch::zeros({ L, Z, Y, X });
@@ -4024,7 +4416,7 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
         return mean;
       };
       Volume expected(Z * Y * X, 0.0);
-      if (name == "NCC" || name == "LNCC")
+      if (name == "NCC" || name == "LNCC" || name == "OrganDice")
       {
         for (int64_t c = 0; c < C; ++c)
         {
@@ -4050,7 +4442,8 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
             const double covariance = mfm[i] - mf[i] * mm[i];
             const double varianceF = mff[i] - mf[i] * mf[i], varianceM = mmm[i] - mm[i] * mm[i];
             const double correlation =
-              name == "NCC"
+              name == "OrganDice" ? (mff[i] + mmm[i] > 0 ? 2.0 * mfm[i] / (mff[i] + mmm[i]) : 1.0)
+              : name == "NCC"
                 ? covariance / std::max(std::sqrt(std::max(varianceF, 0.0)) * std::sqrt(std::max(varianceM, 0.0)), 1e-8)
                 : covariance * covariance / (std::max(varianceF, 1e-5) * std::max(varianceM, 1e-5));
             expected[i] += (1.0 - correlation) / C;
@@ -4163,7 +4556,7 @@ TEST(ImpactTorchAdam, MaskedMapLossMatchesABruteForceForEveryDistance)
   auto                       F = fixed.accessor<double, 5>();
   auto                       M = moving.accessor<double, 5>();
   auto                       K = mask.accessor<bool, 5>();
-  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "NCC", "LNCC" })
+  for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
     const auto   loss = itk::Impact::LossFactory::Instance().Create(name);
     const double value = itk::Impact::MapLoss<3>(*loss, fixed, moving, mask, window).item<double>();
@@ -4190,6 +4583,25 @@ TEST(ImpactTorchAdam, MaskedMapLossMatchesABruteForceForEveryDistance)
               }
         const double covariance = sfm - sf * sm / n;
         expected += covariance / std::sqrt((sff - sf * sf / n) * (smm - sm * sm / n)) / C;
+      }
+      expected = 1.0 - expected;
+    }
+    else if (name == "OrganDice")
+    {
+      for (int64_t c = 0; c < C; ++c)
+      {
+        double sff = 0, smm = 0, sfm = 0;
+        for (int64_t z = 0; z < Z; ++z)
+          for (int64_t y = 0; y < Y; ++y)
+            for (int64_t x = 0; x < X; ++x)
+              if (K[0][0][z][y][x])
+              {
+                const double a = F[0][c][z][y][x], b = M[0][c][z][y][x];
+                sff += a * a;
+                smm += b * b;
+                sfm += a * b;
+              }
+        expected += 2.0 * sfm / (sff + smm) / C;
       }
       expected = 1.0 - expected;
     }
@@ -4420,6 +4832,49 @@ TEST(ImpactConvexAdam, CoarseTakesPCAAndASeededChannelSubset)
   const auto error = InteriorMeanError(run({}, { 2 }), expected, 8);
   for (unsigned int d = 0; d < 3; ++d)
     EXPECT_LT(error[d], 1.5) << "PCA to 2 components, axis " << d;
+}
+
+// The coarse and fine stages draw from generators of their own: running them leaves torch's global
+// generator, which a Python caller shares, where it was. Both used to call torch::manual_seed(Seed).
+TEST(ImpactConvexAdam, StagesLeaveTorchsGlobalGeneratorAlone)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  auto                                fixed = MakeTorchAdamPattern(24, 0, 0, 0, spacing, identity);
+  auto                                moving = MakeTorchAdamPattern(24, 3.0, -2.5, 1.5, spacing, identity);
+  const itk::ImpactModelConfiguration model(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, false }, false);
+
+  auto coarse = itk::ImpactCoarseRegistration<ImageType>::New();
+  coarse->SetFixedImage(fixed);
+  coarse->SetMovingImage(moving);
+  coarse->AddModelConfiguration(model);
+  coarse->SetSubsetFeatures({ 2 }); // so that the stage draws
+  coarse->SetSeed(7);
+  coarse->SetGridSpacing(2);
+  coarse->SetDisplacementHalfWidth(3);
+
+  auto fine = TorchAdamFilterType::New();
+  fine->SetFixedImage(fixed);
+  fine->SetMovingImage(moving);
+  fine->AddModelConfiguration(model);
+  fine->SetSubsetFeatures({ 2 });
+  fine->SetSamplingPercentage(0.3);
+  fine->SetNumberOfIterations(1);
+  fine->SetSeed(3);
+
+  for (itk::ProcessObject * stage :
+       { static_cast<itk::ProcessObject *>(coarse), static_cast<itk::ProcessObject *>(fine) })
+  {
+    SCOPED_TRACE(stage->GetNameOfClass());
+    torch::manual_seed(123);
+    const torch::Tensor expected = torch::rand({ 4 });
+    torch::manual_seed(123);
+    stage->Update();
+    EXPECT_TRUE(torch::equal(torch::rand({ 4 }), expected)) << "the stage moved torch's global generator";
+  }
 }
 
 namespace

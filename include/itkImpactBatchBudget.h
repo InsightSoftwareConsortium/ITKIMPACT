@@ -109,10 +109,16 @@ FitBatchToDevice(int64_t estimate, double usable, TPeakOf && peakOf)
   return batch;
 }
 
-/** Patches of `configuration` that fit on `device`, forward and backward; 0 if not measurable
- * (CPU, CPU-only LibTorch, or no strictly positive patch size). Moves the model to the device. */
+/** Patches of `configuration` that fit on `device`, forward and backward, up to `largest` if it is
+ * positive; 0 if not measurable (CPU, CPU-only LibTorch, or no strictly positive patch size). The
+ * trial batch never exceeds `largest`: on a shared GPU, a probe sized to the whole free memory
+ * took it from the other processes for a batch that would never be run. Moves the model to the
+ * device. */
 inline int64_t
-MeasureBatchBudget(const ImpactModelConfiguration & configuration, const torch::Device & device, double safety = 0.8)
+MeasureBatchBudget(const ImpactModelConfiguration & configuration,
+                   const torch::Device &            device,
+                   double                           safety = 0.8,
+                   int64_t                          largest = 0)
 {
 #if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
   const std::vector<int64_t> & patchSize = configuration.GetPatchSize();
@@ -160,27 +166,33 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration, const torch::
   const auto    stats = c10::cuda::CUDACachingAllocator::getDeviceStats(index);
   const int64_t cached = stats.reserved_bytes[aggregate].current - stats.allocated_bytes[aggregate].current;
   const double  usable = static_cast<double>(static_cast<int64_t>(freeBytes) + std::max<int64_t>(cached, 0)) * safety;
-  return FitBatchToDevice(
-    std::max<int64_t>(static_cast<int64_t>(usable / static_cast<double>(perPatch)), 1), usable, [&](int64_t batch) {
-      try
-      {
-        return peakOf(batch);
-      }
-      catch (...)
-      {
-        c10::cuda::CUDACachingAllocator::emptyCache();
-        throw;
-      }
-    });
+  int64_t       estimate = std::max<int64_t>(static_cast<int64_t>(usable / static_cast<double>(perPatch)), 1);
+  if (largest > 0)
+  {
+    estimate = std::min(estimate, largest);
+  }
+  return FitBatchToDevice(estimate, usable, [&](int64_t batch) {
+    try
+    {
+      return peakOf(batch);
+    }
+    catch (...)
+    {
+      c10::cuda::CUDACachingAllocator::emptyCache();
+      throw;
+    }
+  });
 #else
   (void)configuration;
   (void)device;
   (void)safety;
+  (void)largest;
   return 0;
 #endif
 }
 
-/** Bound every configuration by min(requested, measured budget); 0 for either means "no bound". */
+/** Bound every configuration by min(requested, measured budget); 0 for either means "no bound".
+ * The measurement tries no batch larger than `requested`. */
 inline void
 ConfigureBatchSize(std::vector<ImpactModelConfiguration> & configurations,
                    const torch::Device &                   device,
@@ -188,7 +200,7 @@ ConfigureBatchSize(std::vector<ImpactModelConfiguration> & configurations,
 {
   for (ImpactModelConfiguration & configuration : configurations)
   {
-    const int64_t budget = MeasureBatchBudget(configuration, device);
+    const int64_t budget = MeasureBatchBudget(configuration, device, 0.8, requested);
     const int64_t bound = requested > 0 && budget > 0 ? std::min(requested, budget) : std::max(requested, budget);
     SetBatchSize(configuration, bound);
   }

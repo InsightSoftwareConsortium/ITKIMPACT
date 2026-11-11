@@ -205,15 +205,16 @@ public:
    * points, so lower it for large patches and raise it for small ones. Ignored in Static
    * mode, which interpolates a precomputed map instead of running the model.
    *
-   * The default is not a compromise between speed and memory so much as a floor. A batch of a
-   * few points makes tensors that are large enough for LibTorch to hand its ops to the whole
-   * intra-op thread pool and far too small to pay for the barriers, which measured two orders
-   * of magnitude slower than either a batch of one or a batch past a few dozen. Values well
-   * below the default are best avoided whatever the memory.
+   * The default, zero, chooses: on a CUDA device as many points as it can hold, which
+   * Initialize() measures (itkImpactBatchBudget.h) -- a GPU needs thousands to be busy; on the
+   * CPU 64. On the CPU a batch of a few points makes tensors that are large enough for LibTorch
+   * to hand its ops to the whole intra-op thread pool and far too small to pay for the barriers,
+   * which measured two orders of magnitude slower than either a batch of one or a batch past a
+   * few dozen, while a batch of hundreds falls out of the caches. Values well below 64 are best
+   * avoided whatever the memory.
    *
-   * On a CUDA device the batch never exceeds what the device can hold, which Initialize()
-   * measures (itkImpactBatchBudget.h); a batch that still fails to allocate is halved and
-   * replayed. Zero means that measured bound alone, or the whole work unit on the CPU. */
+   * On a CUDA device a batch never exceeds what the device can hold; one that still fails to
+   * allocate is halved and replayed. */
   itkSetMacro(BatchSize, unsigned int);
   itkGetConstMacro(BatchSize, unsigned int);
 
@@ -310,11 +311,11 @@ private:
   /** Latched at the first evaluation after Initialize(); mutable because the evaluation is const. */
   mutable Impact::LossNormalization m_LossNormalization;
   std::string                       m_Device = "cpu";
-  // Zero means "seed from the clock", which is what the per-work-unit generator does with it.
-  // It must have a value even when the user never calls SetSeed(): it is read on every
-  // evaluation, and an indeterminate one would make the metric unreproducible at random.
+  // Zero means "seed from the clock", drawn once per metric. It must have a value even when the
+  // user never calls SetSeed(): it is read on every evaluation, and an indeterminate one would
+  // make the metric unreproducible at random.
   unsigned int m_Seed{ 0 };
-  unsigned int m_BatchSize{ 64 };
+  unsigned int m_BatchSize{ 0 };
 
   std::vector<std::vector<unsigned int>> m_features_indexes;
 };
