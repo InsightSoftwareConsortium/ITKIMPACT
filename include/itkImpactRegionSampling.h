@@ -161,23 +161,6 @@ UniformPoolWindows(int64_t cells, int64_t voxelsPerCell)
   return windows;
 }
 
-/** The windows of the cells [c0, c1), relative to their span. */
-inline std::vector<PoolWindows>
-RelativeWindows(const std::vector<PoolWindows> & windows, const std::vector<int64_t> & c0, const std::vector<int64_t> & c1)
-{
-  std::vector<PoolWindows> relative(windows.size());
-  for (size_t d = 0; d < windows.size(); ++d)
-  {
-    const int64_t base = windows[d].starts[c0[d]];
-    for (int64_t c = c0[d]; c < c1[d]; ++c)
-    {
-      relative[d].starts.push_back(windows[d].starts[c] - base);
-      relative[d].ends.push_back(windows[d].ends[c] - base);
-    }
-  }
-  return relative;
-}
-
 /** Whether two images share one grid: region (a box of one is read from the other by its indices), spacing, origin
  * and direction. */
 template <typename TA, typename TB>
@@ -190,7 +173,7 @@ SameGrid(const TA * a, const TB * b)
 
 /** The region of a grid (`spatial` in tensor order, `index` its first index) that the cells [c0, c1) of `windows`
  * span, `extra` voxels around on each tensor axis, clipped to the grid and starting on a multiple of `align` voxels
- * from the grid's first: `lowPad` what that left of the margin on the low side, `core` the cells' own extent. */
+ * from the grid's first: `lowPad` what that left of the margin on the low side. */
 template <typename TRegion>
 TRegion
 CellSpan(const std::vector<int64_t> &     c0,
@@ -200,7 +183,6 @@ CellSpan(const std::vector<int64_t> &     c0,
          const std::vector<int64_t> &     spatial,
          const typename TRegion::IndexType & index,
          std::vector<int64_t> &           lowPad,
-         std::vector<int64_t> &           core,
          int64_t                          align = 1)
 {
   constexpr unsigned int Dim = TRegion::ImageDimension;
@@ -216,20 +198,8 @@ CellSpan(const std::vector<int64_t> &     c0,
     start[Dim - 1 - d] = static_cast<IndexValueType>(low) + index[Dim - 1 - d];
     size[Dim - 1 - d] = static_cast<SizeValueType>(high - low);
     lowPad[d] = first - low;
-    core[d] = end - first;
   }
   return TRegion(start, size);
-}
-
-/** `t` ({1, C, span...}) narrowed to the cells' own extent: `lowPad` dropped on the low side, `core` kept. */
-inline torch::Tensor
-CropCore(torch::Tensor t, const std::vector<int64_t> & lowPad, const std::vector<int64_t> & core)
-{
-  for (size_t d = 0; d < core.size(); ++d)
-  {
-    t = t.narrow(2 + static_cast<int64_t>(d), lowPad[d], core[d]);
-  }
-  return t;
 }
 
 /** `t` narrowed to [lo, hi) on each spatial axis, the first of them at `firstAxis`. */

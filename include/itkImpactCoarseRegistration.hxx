@@ -1085,9 +1085,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                       const std::vector<int64_t> & c1,
                       const std::vector<int64_t> & extra,
                       std::vector<int64_t> &       lowPad,
-                      std::vector<int64_t> &       core,
                       int64_t                      align = 1) {
-      return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core, align);
+      return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, align);
     };
     const auto narrowTo = Impact::NarrowTo;
     const auto writeCells = Impact::WriteCells;
@@ -1197,8 +1196,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     for (size_t b = 0; b < boxes.size(); ++b)
     {
       const Impact::CellBox &    box = boxes[b];
-      std::vector<int64_t>       lowPad(Dim), core(Dim), low(Dim);
-      const RegionType           span = spanOf(box.cell0, box.cell1, reach, lowPad, core, align);
+      std::vector<int64_t>       lowPad(Dim), low(Dim);
+      const RegionType           span = spanOf(box.cell0, box.cell1, reach, lowPad, align);
       const torch::Tensor        fixedSpan = readFixed(span);
       const torch::Tensor        movingSpan = readMoving(span);
       for (unsigned int d = 0; d < Dim; ++d)

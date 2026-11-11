@@ -1918,18 +1918,21 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   };
 
   // The full-resolution span of the cells [c0, c1), widened by `extra` voxels along each axis within the image;
-  // `lowPad` is the widening the low side got and `core` the span of the cells themselves.
+  // `lowPad` is the widening the low side got.
   auto spanOf = [&](const std::vector<int64_t> & c0,
                     const std::vector<int64_t> & c1,
                     const std::vector<int64_t> & extra,
                     std::vector<int64_t> &       lowPad,
-                    std::vector<int64_t> &       core,
                     int64_t                      align = 1) {
-    return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core, align);
+    return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, align);
   };
-  const auto cropCore = Impact::CropCore;
-  auto       windowsOf = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
-    return Impact::RelativeWindows(windows, c0, c1);
+  // A layer of such a span ({1, C, samples...}, a mask: the image's lattice) pooled over the cells [c0, c1).
+  auto toCells = [&](const torch::Tensor &        layer,
+                     const Impact::LayerLattice & lattice,
+                     const std::vector<int64_t> & lowPad,
+                     const std::vector<int64_t> & c0,
+                     const std::vector<int64_t> & c1) {
+    return Impact::PoolLayerToCells<Dim>(layer, lattice, lowPad, c0, c1, windows, spatial, "ImpactFineRegistration");
   };
   const auto writeCells = Impact::WriteCells;
   const auto cellsOf = Impact::CellsOf;
@@ -2053,14 +2056,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                            const std::vector<int64_t> &              c1) {
     for (size_t l = 0; l < layers.size(); ++l)
     {
-      layers[l] =
-        Impact::PoolLayerToCells<Dim>(layers[l], on[l], lowPad, c0, c1, windows, spatial, "ImpactFineRegistration");
+      layers[l] = toCells(layers[l], on[l], lowPad, c0, c1);
     }
   };
   // The fixed features pooled over the cells [c0, c1): {1, C, n...} per layer.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
-    std::vector<int64_t>       lowPad(Dim), core(Dim);
-    std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, reach, lowPad, core, align)), false);
+    std::vector<int64_t>       lowPad(Dim);
+    std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, reach, lowPad, align)), false);
     pooledToCells(layers, lattices, lowPad, c0, c1);
     return layers;
   };
@@ -2073,8 +2075,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     torch::Tensor              share;
   };
   auto pooledMoving = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) -> PooledMoving {
-    std::vector<int64_t> lowPad(Dim), core(Dim);
-    const RegionType     span = spanOf(c0, c1, reach, lowPad, core, align);
+    std::vector<int64_t> lowPad(Dim);
+    const RegionType     span = spanOf(c0, c1, reach, lowPad, align);
     const torch::Tensor  movingIndex = movingIndexField(span); // {1, Dim, span...} on the device
     std::vector<int64_t> spanSize(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
@@ -2132,7 +2134,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     pooledToCells(pooled.layers, movingLattices, lowPad, c0, c1);
     if (maskWindow.defined())
     {
-      pooled.share = Impact::PoolByWindows<Dim>(cropCore(maskWindow, lowPad, core), windowsOf(c0, c1));
+      pooled.share = toCells(maskWindow, Impact::ImageLattice(Dim), lowPad, c0, c1);
     }
     return pooled;
   };
@@ -2246,10 +2248,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     if (fixedOn.defined())
     {
-      std::vector<int64_t> lowPad(Dim), core(Dim);
-      const RegionType     span = spanOf(box.cell0, box.cell1, noHalo, lowPad, core);
-      const torch::Tensor  on =
-        Impact::PoolByWindows<Dim>(readMask(m_FixedMask.GetPointer(), span), windowsOf(box.cell0, box.cell1)) >= 0.5;
+      std::vector<int64_t> lowPad(Dim);
+      const RegionType     span = spanOf(box.cell0, box.cell1, noHalo, lowPad);
+      const torch::Tensor  on = toCells(readMask(m_FixedMask.GetPointer(), span),
+                                       Impact::ImageLattice(Dim),
+                                       lowPad,
+                                       box.cell0,
+                                       box.cell1) >= 0.5;
       writeCells(fixedOn, box.cell0, on);
       count = on.sum().template item<int64_t>();
     }
