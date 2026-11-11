@@ -226,10 +226,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   {
     // The out-of-core run: solved once, then the requested region of the dense field is interpolated from the
     // control grid (ImageSource's threaded GenerateData, through DynamicThreadedGenerateData).
-    if (!m_Solved || m_SolvedTime < this->GetMTime())
+    if (m_SolvedTime < this->GetMTime())
     {
       this->SolveByRegions();
-      m_Solved = true;
       m_SolvedTime = this->GetMTime();
     }
     Superclass::GenerateData();

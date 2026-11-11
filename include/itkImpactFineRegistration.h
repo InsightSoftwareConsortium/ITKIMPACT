@@ -419,7 +419,6 @@ private:
   SizeValueType                        m_BytesRead{ 0 };
   bool                                 m_FixedImageStreamed{ false };
   bool                                 m_MovingImageStreamed{ false };
-  bool                                 m_Solved{ false };
   ModifiedTimeType                     m_SolvedTime{ 0 };
 
   // Auxiliary outputs (the primary displacement field is the ImageSource output 0).
