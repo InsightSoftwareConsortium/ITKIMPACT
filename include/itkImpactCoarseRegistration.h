@@ -280,6 +280,19 @@ protected:
   void
   SolveByRegions();
 
+  /** The coupled-convex solve both runs end in, on the two images' features pooled to the coarse grid ({1, C,
+   * coarse...} a layer) and the masks' shares of its cells (undefined without a mask): sets the field on the coarse
+   * grid and returns it, in voxels. `cost` builds the cost volume of one of `boxes`, which tile the grid. The tensors
+   * and the boxes are LibTorch-backed types this header does not name. */
+  template <typename TTensor, typename TBox, typename TCost>
+  TTensor
+  SolveOnCoarseGrid(const std::vector<TTensor> & fixedMaps,
+                    const std::vector<TTensor> & movingMaps,
+                    const TTensor &              fixedShare,
+                    const TTensor &              movingShare,
+                    const std::vector<TBox> &    boxes,
+                    TCost &&                     cost);
+
 private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer m_MovingImage{ nullptr };
