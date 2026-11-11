@@ -23,6 +23,7 @@
 // cells, Adam stepped by parts of the cell grid, and the mapped files of what grows with the image. LibTorch-backed:
 // included by the .hxx only.
 
+#include "itkImpactBatchBudget.h" // whether the build reads the memory of a device
 #include "itkImpactModelConfiguration.h"
 #include "itkImpactTorchRegistrationHelpers.h"
 
@@ -32,13 +33,6 @@
 #include <itkMacro.h>
 
 #include <torch/torch.h>
-#if __has_include(<c10/cuda/CUDAGuard.h>) && __has_include(<cuda_runtime_api.h>)
-#  include <c10/cuda/CUDAGuard.h>
-#  include <cuda_runtime_api.h>
-#  define ITK_IMPACT_REGION_HAS_CUDA 1
-#else
-#  define ITK_IMPACT_REGION_HAS_CUDA 0
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -807,7 +801,7 @@ private:
 inline double
 ResidentBudget(const torch::Device & device)
 {
-#if ITK_IMPACT_REGION_HAS_CUDA
+#if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
   if (device.is_cuda())
   {
     c10::cuda::CUDAGuard guard(device.index());
