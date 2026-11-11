@@ -1726,6 +1726,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // What grows with the image when the pooled maps are not resident; declared before the tensors it maps.
   Impact::ScratchFiles scratch(m_ScratchDirectory);
   m_ScratchBytes = 0;
+  m_BytesRead = 0;
   const auto                          onDevice = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   const auto                          sampleOpts =
     F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(true);
