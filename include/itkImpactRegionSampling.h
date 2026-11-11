@@ -382,10 +382,10 @@ LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
 }
 
 /** A layer ({1, C, samples...}) of a span of the image, pooled over the cells [c0, c1) as the whole-image run pools
- * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. A coarser one: the whole
- * layer is adaptive-average pooled to the cells, so each cell takes the samples that pooling gives it. `lowPad` is
- * where the cells start in the span, `spatial` the image; the span starts on the layer's lattice and holds those
- * samples (CellSpan's `align` and `extra`). */
+ * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. One coarser along any axis:
+ * the whole layer is adaptive-average pooled to the cells along every axis, so each cell takes the samples that
+ * pooling gives it. `lowPad` is where the cells start in the span, `spatial` the image; the span starts on the
+ * layer's lattice and holds those samples (CellSpan's `align` and `extra`). */
 template <unsigned int Dim>
 torch::Tensor
 PoolLayerToCells(torch::Tensor                    layer,
@@ -398,6 +398,7 @@ PoolLayerToCells(torch::Tensor                    layer,
                  const char *                     who)
 {
   std::vector<PoolWindows> relative(Dim);
+  const bool               atImage = lattice.stride == std::vector<int64_t>(Dim, 1);
   for (unsigned int d = 0; d < Dim; ++d)
   {
     const int64_t axis = 2 + static_cast<int64_t>(d);
@@ -412,8 +413,8 @@ PoolLayerToCells(torch::Tensor                    layer,
                                << " cells, cannot be pooled to the cells by regions: it must be no coarser than they.");
     }
     // Cell i's samples on the whole layer: [start(i), end(i)).
-    auto start = [&](int64_t i) { return stride == 1 ? windows[d].starts[i] : i * length / cells; };
-    auto end = [&](int64_t i) { return stride == 1 ? windows[d].ends[i] : ((i + 1) * length + cells - 1) / cells; };
+    auto start = [&](int64_t i) { return atImage ? windows[d].starts[i] : i * length / cells; };
+    auto end = [&](int64_t i) { return atImage ? windows[d].ends[i] : ((i + 1) * length + cells - 1) / cells; };
     const int64_t first = start(c0[d]) - low / stride;
     const int64_t last = end(c1[d] - 1) - low / stride;
     if (first < 0 || last > layer.size(axis))
