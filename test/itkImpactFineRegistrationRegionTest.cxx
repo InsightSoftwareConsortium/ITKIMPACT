@@ -212,39 +212,6 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
               << std::endl;
     return EXIT_FAILURE;
   }
-  {
-    const auto & a = dense->GetMetricValuesPerIteration();
-    const auto & b = regions->GetMetricValuesPerIteration();
-    for (size_t i = 0; i < a.size(); ++i)
-    {
-      std::cout << "iteration " << i << ": dense " << a[i] << " regions " << b[i] << std::endl;
-    }
-    const double controlDifference =
-      MaxDifference(dense->GetControlGridTransform()->GetDisplacementField(),
-                    regions->GetControlGridTransform()->GetDisplacementField(),
-                    dense->GetControlGridTransform()->GetDisplacementField()->GetLargestPossibleRegion());
-    std::cout << "control grids: max |difference| = " << controlDifference << " mm" << std::endl;
-    {
-      const FieldType *                                 ca = dense->GetControlGridTransform()->GetDisplacementField();
-      const FieldType *                                 cb = regions->GetControlGridTransform()->GetDisplacementField();
-      double                                            sum = 0.0;
-      size_t                                            large = 0, count = 0;
-      itk::ImageRegionConstIteratorWithIndex<FieldType> it(ca, ca->GetLargestPossibleRegion());
-      for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-      {
-        const auto va = it.Get(), vb = cb->GetPixel(it.GetIndex());
-        for (unsigned int c = 0; c < 3; ++c)
-        {
-          const double d = std::abs(va[c] - vb[c]);
-          sum += d;
-          large += d > 0.05;
-          ++count;
-        }
-      }
-      std::cout << "control grids: mean |difference| = " << sum / count << " mm, " << large << " of " << count
-                << " entries differ by more than 0.05 mm" << std::endl;
-    }
-  }
   const double difference = MaxDifference(denseField, regionField, fixed->GetLargestPossibleRegion());
   std::cout << "dense vs regions: max |difference| = " << difference << " mm" << std::endl;
   if (difference > 1e-5)
