@@ -1970,48 +1970,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const auto writeCells = Impact::WriteCells;
   const auto cellsOf = Impact::CellsOf;
 
-  // ---- Occupancy: each box's cells in the fixed mask (share of their voxels >= 0.5), all of them without one. ----
   const std::vector<int64_t> noHalo(Dim, 0);
-  std::vector<int64_t>       countByBox(boxes.size());
-  std::vector<size_t>        occupied;
-  double                     totalCount = 0.0;
-  std::vector<int64_t>       maskShape{ 1, 1 };
-  maskShape.insert(maskShape.end(), cells.begin(), cells.end());
-  torch::Tensor fixedOn; // bool {1, 1, cells...}; undefined without a fixed mask
-  // ponytail: on the device, a byte a cell, until the route is known; mapped from the start if a device cannot hold
-  // that.
-  if (m_FixedMask.IsNotNull())
-  {
-    fixedOn = torch::zeros(maskShape, torch::TensorOptions().dtype(torch::kBool).device(device));
-  }
-  for (size_t b = 0; b < boxes.size(); ++b)
-  {
-    const Impact::CellBox & box = boxes[b];
-    int64_t                 count = 1;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      count *= box.cell1[d] - box.cell0[d];
-    }
-    if (fixedOn.defined())
-    {
-      std::vector<int64_t> lowPad(Dim), core(Dim);
-      const RegionType     span = spanOf(box.cell0, box.cell1, noHalo, lowPad, core);
-      const torch::Tensor  on =
-        Impact::PoolByWindows<Dim>(readMask(m_FixedMask.GetPointer(), span), windowsOf(box.cell0, box.cell1)) >= 0.5;
-      writeCells(fixedOn, box.cell0, on);
-      count = on.sum().template item<int64_t>();
-    }
-    countByBox[b] = count;
-    if (count > 0)
-    {
-      occupied.push_back(b);
-      totalCount += static_cast<double>(count);
-    }
-  }
-  if (occupied.empty())
-  {
-    itkExceptionMacro("ImpactFineRegistration: the fixed mask holds no voxel.");
-  }
 
   // ---- The feature models and distances. ----
   std::vector<std::unique_ptr<Impact::Loss>> losses;
@@ -2271,7 +2230,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   std::vector<int64_t> channels(losses.size(), 1);
   if (featureMode)
   {
-    const std::vector<torch::Tensor> probe = pooledFixed(boxes[occupied[0]].cell0, boxes[occupied[0]].cell1);
+    const std::vector<torch::Tensor> probe = pooledFixed(boxes[0].cell0, boxes[0].cell1);
     for (size_t l = 0; l < probe.size(); ++l)
     {
       channels[l] = probe[l].size(1);
@@ -2295,11 +2254,47 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto atHome = [&](const std::vector<int64_t> & shape) {
     return m_ResidentFeatures ? torch::zeros(shape, onDevice) : scratch.Zeros(shape);
   };
-  if (fixedOn.defined() && !m_ResidentFeatures)
+
+  // ---- Occupancy: each box's cells in the fixed mask (share of their voxels >= 0.5), all of them without one; at
+  // home like the maps. ----
+  std::vector<int64_t>       countByBox(boxes.size());
+  std::vector<size_t>        occupied;
+  double                     totalCount = 0.0;
+  std::vector<int64_t>       maskShape{ 1, 1 };
+  maskShape.insert(maskShape.end(), cells.begin(), cells.end());
+  torch::Tensor fixedOn; // bool {1, 1, cells...}; undefined without a fixed mask
+  if (m_FixedMask.IsNotNull())
   {
-    const torch::Tensor pass = fixedOn;
-    fixedOn = scratch.Zeros(maskShape, torch::kBool);
-    fixedOn.copy_(pass);
+    fixedOn = m_ResidentFeatures ? torch::zeros(maskShape, torch::TensorOptions().dtype(torch::kBool).device(device))
+                                 : scratch.Zeros(maskShape, torch::kBool);
+  }
+  for (size_t b = 0; b < boxes.size(); ++b)
+  {
+    const Impact::CellBox & box = boxes[b];
+    int64_t                 count = 1;
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      count *= box.cell1[d] - box.cell0[d];
+    }
+    if (fixedOn.defined())
+    {
+      std::vector<int64_t> lowPad(Dim), core(Dim);
+      const RegionType     span = spanOf(box.cell0, box.cell1, noHalo, lowPad, core);
+      const torch::Tensor  on =
+        Impact::PoolByWindows<Dim>(readMask(m_FixedMask.GetPointer(), span), windowsOf(box.cell0, box.cell1)) >= 0.5;
+      writeCells(fixedOn, box.cell0, on);
+      count = on.sum().template item<int64_t>();
+    }
+    countByBox[b] = count;
+    if (count > 0)
+    {
+      occupied.push_back(b);
+      totalCount += static_cast<double>(count);
+    }
+  }
+  if (occupied.empty())
+  {
+    itkExceptionMacro("ImpactFineRegistration: the fixed mask holds no voxel.");
   }
 
   // ---- The control grid {1, Dim, cells...} in voxels, warm-started from the initial field read at the
