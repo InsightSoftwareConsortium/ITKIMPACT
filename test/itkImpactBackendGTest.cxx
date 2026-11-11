@@ -1214,7 +1214,7 @@ TEST(ImpactMetric, OnlineModeRunsTheModelsOnceABatch)
 // Over a sampled point set nothing the fixed features depend on moves between two evaluations, so
 // the online mode computes them once: from the second evaluation on, the fixed model no longer
 // runs, and the value and the derivative are those of a metric evaluating afresh. A modified fixed
-// transform has them computed again.
+// transform has them computed again, and so does another point set of the same size.
 TEST(ImpactMetric, OnlineModeKeepsTheFixedFeaturesOfASampledPointSet)
 {
   using VirtualImageType = ImageType;
@@ -1305,6 +1305,16 @@ TEST(ImpactMetric, OnlineModeKeepsTheFixedFeaturesOfASampledPointSet)
     }
 
     fixedTransform->Modified();
+    ModelPassCounter::Reset();
+    metric->GetValueAndDerivative(value, derivative);
+    EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);
+
+    auto others = MetricType::VirtualPointSetType::New();
+    for (unsigned int n = 0; n < 64; ++n)
+    {
+      others->SetPoint(n, points->GetPoint(63 - n));
+    }
+    metric->SetVirtualSampledPointSet(others);
     ModelPassCounter::Reset();
     metric->GetValueAndDerivative(value, derivative);
     EXPECT_EQ(ModelPassCounter::Forward(), (movingPasses + 1) * 4);

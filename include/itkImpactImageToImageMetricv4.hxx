@@ -27,6 +27,7 @@
 #include "itkImpactModelConfigurationDetail.h" // ComputeImageMetadata
 #include "itkImpactBatchBudget.h"              // ConfigureBatchSize
 #include <itkImageFileWriter.h>
+#include <tuple>
 
 namespace itk
 {
@@ -78,10 +79,20 @@ struct ImpactImageToImageMetricv4<TFixedImage,
   // comparison, and whether the point has them yet. Nothing they depend on moves from one
   // evaluation to the next -- the fixed image and transform, the point, its plane, the channels --
   // so the fixed model runs once per point and not once per evaluation. Initialize() drops them,
-  // and so does a new plane seed or a modified fixed transform (the stamp).
-  std::vector<torch::Tensor>                m_FixedFeatures;
-  std::vector<char>                         m_FixedFeaturesKnown;
-  std::pair<unsigned int, ModifiedTimeType> m_FixedFeaturesStamp{};
+  // and so does a key that differs from the one they were computed under.
+  std::vector<torch::Tensor> m_FixedFeatures;
+  std::vector<char>          m_FixedFeaturesKnown;
+  // In order: the modification times of the metric (whatever is set on it: the models, and which
+  // image, transform and point set), of the points, of the fixed image and of the fixed transform,
+  // then the plane seed and the channels. ITK draws every modification time from one counter, so
+  // a time names the object as well as its state.
+  using FixedFeaturesKey = std::tuple<ModifiedTimeType,
+                                      ModifiedTimeType,
+                                      ModifiedTimeType,
+                                      ModifiedTimeType,
+                                      unsigned int,
+                                      std::vector<std::vector<unsigned int>>>;
+  FixedFeaturesKey m_FixedFeaturesKey;
 };
 
 template <typename TFixedImage,

@@ -114,9 +114,16 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
   if (this->m_ImpactAssociate->GetMode() == "Jacobian" && this->m_ImpactAssociate->GetUseSampledPointSet())
   {
     const auto points = static_cast<int64_t>(this->m_ImpactAssociate->GetNumberOfDomainPoints());
-    const std::pair<unsigned int, ModifiedTimeType> stamp{ this->m_PlaneSeed,
-                                                           this->m_ImpactAssociate->GetFixedTransform()->GetMTime() };
-    if (internals.m_FixedFeaturesKnown.size() != static_cast<size_t>(points) || internals.m_FixedFeaturesStamp != stamp)
+    // PointSet::SetPoint() modifies the container alone.
+    const typename TImpactMetric::Internals::FixedFeaturesKey key{
+      this->m_ImpactAssociate->GetMTime(),
+      this->m_ImpactAssociate->GetVirtualSampledPointSet()->GetPoints()->GetMTime(),
+      this->m_ImpactAssociate->GetFixedImage()->GetMTime(),
+      this->m_ImpactAssociate->GetFixedTransform()->GetMTime(),
+      this->m_PlaneSeed,
+      this->m_SubsetsOfFeatures
+    };
+    if (internals.m_FixedFeaturesKnown.size() != static_cast<size_t>(points) || internals.m_FixedFeaturesKey != key)
     {
       internals.m_FixedFeaturesKnown.assign(static_cast<size_t>(points), 0);
       internals.m_FixedFeatures.clear();
@@ -124,7 +131,7 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       {
         internals.m_FixedFeatures.push_back(torch::empty({ points, subset.numel() }, torch::kFloat32));
       }
-      internals.m_FixedFeaturesStamp = stamp;
+      internals.m_FixedFeaturesKey = key;
     }
   }
 }
