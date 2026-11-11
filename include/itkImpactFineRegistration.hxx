@@ -1959,8 +1959,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const auto writeCells = Impact::WriteCells;
   const auto cellsOf = Impact::CellsOf;
 
-  const std::vector<int64_t> noHalo(Dim, 0);
-
   // ---- The feature models and distances. ----
   std::vector<std::unique_ptr<Impact::Loss>> losses;
   std::vector<float>                         layerWeights;
@@ -1998,45 +1996,41 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   }
   const std::vector<ImpactModelConfiguration> & movingConfigs =
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
-  // A metadata-aware model (MIND reads the image's range) takes the image's statistics: one pass over each image by
-  // regions, as the dense run's StatisticsImageFilter takes them (the moving ones on its own grid, where the dense
-  // run reads it resampled onto the fixed grid).
+  // A metadata-aware model (MIND reads the image's range) takes the image's statistics: one pass over each image, all
+  // its voxels, in blocks of the box size, as the dense run's StatisticsImageFilter takes them (the moving ones on
+  // its own grid, where the dense run reads it resampled onto the fixed grid).
   ImpactImageMetadata fixedMetadata, movingMetadata;
   if (takesMetadata)
   {
-    fixedMetadata = Impact::MetadataByBlocks(m_FixedImage->GetDirection(), Dim, [&](auto && take) {
-      for (const Impact::CellBox & box : boxes)
-      {
-        std::vector<int64_t> lowPad(Dim), core(Dim);
-        take(readFixed(spanOf(box.cell0, box.cell1, noHalo, lowPad, core)));
-      }
-    });
-    movingMetadata = Impact::MetadataByBlocks(m_MovingImage->GetDirection(), Dim, [&](auto && take) {
-      // The moving image in its own grid, in blocks of the box size.
-      std::vector<int64_t> extent(Dim), step(Dim), counts(Dim);
-      size_t               total = 1;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        extent[d] = static_cast<int64_t>(movingRegion.GetSize()[Dim - 1 - d]);
-        step[d] = std::max<int64_t>(1, std::min(extent[d], regionVoxels[d]));
-        counts[d] = (extent[d] + step[d] - 1) / step[d];
-        total *= static_cast<size_t>(counts[d]);
-      }
-      for (size_t flat = 0; flat < total; ++flat)
-      {
-        typename MovingImageType::RegionType block;
-        size_t                               rest = flat;
-        for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
+    auto statistics = [&](const RegionType & whole, const auto & direction, auto && read) {
+      return Impact::MetadataByBlocks(direction, Dim, [&](auto && take) {
+        std::vector<int64_t> extent(Dim), step(Dim), counts(Dim);
+        size_t               total = 1;
+        for (unsigned int d = 0; d < Dim; ++d)
         {
-          const int64_t i = static_cast<int64_t>(rest % static_cast<size_t>(counts[d]));
-          rest /= static_cast<size_t>(counts[d]);
-          const int64_t start = i * step[d];
-          block.SetIndex(Dim - 1 - d, movingRegion.GetIndex()[Dim - 1 - d] + static_cast<IndexValueType>(start));
-          block.SetSize(Dim - 1 - d, static_cast<SizeValueType>(std::min(step[d], extent[d] - start)));
+          extent[d] = static_cast<int64_t>(whole.GetSize()[Dim - 1 - d]);
+          step[d] = std::max<int64_t>(1, std::min(extent[d], regionVoxels[d]));
+          counts[d] = (extent[d] + step[d] - 1) / step[d];
+          total *= static_cast<size_t>(counts[d]);
         }
-        take(readMoving(block));
-      }
-    });
+        for (size_t flat = 0; flat < total; ++flat)
+        {
+          RegionType block;
+          size_t     rest = flat;
+          for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
+          {
+            const int64_t i = static_cast<int64_t>(rest % static_cast<size_t>(counts[d]));
+            rest /= static_cast<size_t>(counts[d]);
+            const int64_t start = i * step[d];
+            block.SetIndex(Dim - 1 - d, whole.GetIndex()[Dim - 1 - d] + static_cast<IndexValueType>(start));
+            block.SetSize(Dim - 1 - d, static_cast<SizeValueType>(std::min(step[d], extent[d] - start)));
+          }
+          take(read(block));
+        }
+      });
+    };
+    fixedMetadata = statistics(fixedRegion, m_FixedImage->GetDirection(), readFixed);
+    movingMetadata = statistics(movingRegion, m_MovingImage->GetDirection(), readMoving);
   }
   // The feature layers of an image region {1, 1, span...}, at its resolution, each model run on the region whole in
   // one forward (a region is sized to fit the device, so the tiler ExtractFeatureLayers measures the device for at
@@ -2255,6 +2249,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
 
   // ---- Occupancy: each box's cells in the fixed mask (share of their voxels >= 0.5), all of them without one; at
   // home like the maps. ----
+  const std::vector<int64_t> noHalo(Dim, 0);
   std::vector<int64_t>       countByBox(boxes.size());
   std::vector<size_t>        occupied;
   double                     totalCount = 0.0;
