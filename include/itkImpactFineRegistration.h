@@ -260,14 +260,13 @@ public:
    * itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them from its
    * buffer), and keeps their features pooled to the control grid. The iterations read no image. Where the pooled maps
    * do not fit the device they stay in files of ScratchDirectory mapped to memory, with the control grid and the
-   * optimizer's state, and an iteration steps RegionsPerIteration boxes, visited in
-   * epochs in an order drawn from Seed; one the fixed mask does not reach costs its share of the regularizer alone.
-   * A box's loss is the dense loss restricted to its cells,
+   * optimizer's state, and an iteration steps every cell, as the whole-image run does, by bricks of boxes brought to
+   * the device one at a time; one the fixed mask does not reach costs its share of the regularizer alone.
+   * A brick's loss is the dense loss restricted to its cells,
    * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
    * mean, which the resident route keeps exact), with
-   * the regularizer's differences whose first cell lies in it; Adam steps the cells the iteration touched and leaves
-   * the others as they are. Visiting every box at every iteration reproduces the whole-image run, so the schedule is
-   * the only approximation. Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
+   * the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
+   * Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
    * a power of two coarser, no coarser than the control cells (a region then starts on the layer's lattice); the
    * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
    * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
@@ -280,13 +279,11 @@ public:
   /** Side of a box, in voxels; 0 (the default) reads the images whole. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
-  /** Boxes stepped at every iteration when the pooled maps are not resident (default 1); NumberOfIterations then counts
-   * the visits of every box, so that a cell is stepped as many times as in the dense run. The boxes of an iteration
-   * go to the device one at a time: the count sets the schedule, not the memory. 0: every cell at every iteration,
-   * the whole-image run's schedule, by bricks of as many boxes a side as the device holds (a brick brings to it at
-   * most an eighth of what ResidentFeatureBudget's default lets the maps take). */
-  itkSetMacro(RegionsPerIteration, unsigned int);
-  itkGetConstMacro(RegionsPerIteration, unsigned int);
+  /** Most bytes of the mapped files a brick may bring to the device when the pooled maps are not resident: a brick
+   * is as many boxes a side as fit it, one at least. 0 (the default): an eighth of what ResidentFeatureBudget's
+   * default lets the maps take. The bricks set the memory, not the result. */
+  itkSetMacro(BrickBytes, SizeValueType);
+  itkGetConstMacro(BrickBytes, SizeValueType);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
    * receptive field of the feature model, in its input's voxels, so that its features on the box equal those of the
    * whole image (0 for a point-wise model). */
@@ -303,7 +300,7 @@ public:
   itkGetConstObjectMacro(MovingTransform, TransformType);
   /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it every
    * iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped files and every
-   * iteration brings the cells of its RegionsPerIteration boxes to the device. 0 (the default): half the
+   * iteration brings them to the device a brick at a time. 0 (the default): half the
    * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
    * which route a run took. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
@@ -411,7 +408,7 @@ private:
   std::string   m_Mode{ "Static" };
   unsigned int  m_FeatureChunkSize{ 32 };
   unsigned int  m_RegionSize{ 0 };
-  unsigned int  m_RegionsPerIteration{ 1 };
+  SizeValueType m_BrickBytes{ 0 };
   unsigned int  m_RegionHalo{ 0 };
   SizeValueType m_ResidentFeatureBudget{ 0 };
   bool          m_ResidentFeatures{ false };

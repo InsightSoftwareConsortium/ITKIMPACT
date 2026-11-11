@@ -2191,9 +2191,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   };
 
   // ---- The route: the pooled feature maps of both images, computed once by one pass over the boxes, are compared
-  // whole at every iteration when they fit the device (the dense run on them), box by box when they do not. What
+  // whole at every iteration when they fit the device (the dense run on them), brick by brick when they do not. What
   // grows with the image is then at home on the device, or in mapped files of which an iteration brings the cells of
-  // its boxes to the device. ----
+  // a brick at a time to the device. ----
   std::vector<int64_t> channels(losses.size(), 1);
   if (featureMode)
   {
@@ -2451,9 +2451,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     // ---- The dense iterations on the pooled maps. ----
     theta.set_requires_grad(true);
-    Impact::LazyAdam    adam(theta, m_LearningRate, m_Beta1, m_Beta2, adamEpsilon);
+    Impact::CellAdam    adam{ torch::zeros_like(theta), torch::zeros_like(theta), m_LearningRate, m_Beta1, m_Beta2,
+                           adamEpsilon };
     const torch::Tensor base = cellPositions(wholeStart, cells);
-    torch::Tensor       touched = torch::ones(maskShape, torch::TensorOptions().dtype(torch::kBool).device(device));
     m_MetricValuesPerIteration.clear();
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
@@ -2489,28 +2489,24 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         loss.backward();
       }
-      adam.Step(theta, touched);
+      if (theta.grad().defined())
+      {
+        adam.Advance();
+        adam.StepCells(theta, theta.grad(), wholeStart, cells, device);
+        theta.grad().zero_();
+      }
       m_MetricValuesPerIteration.push_back(loss.template item<double>());
     }
   }
   else
   {
-    // ---- Box by box: every box visited NumberOfIterations times, RegionsPerIteration an iteration, in epochs of a
-    // permutation drawn from Seed. A box's loss is the dense loss restricted to its cells, weighed by its share of
-    // the counted cells, plus its share of the regularizer; Adam steps the cells the iteration touched. An iteration
-    // brings to the device the cells its boxes touch, one box at a time: the control grid, its gradient and Adam's
-    // state are mapped like the maps. ----
-    // ponytail: the files hold the cells in raster order, so a box read touches a page for each of its rows; files
-    // laid out by boxes if boxes in a random order outgrow the page cache (the bricks go in raster order).
+    // ---- By bricks: an iteration steps every cell, the whole-image run's schedule, a brick of boxes at a time. A
+    // brick's loss is the dense loss restricted to its cells, weighed by its share of the counted cells, plus the
+    // regularizer's differences whose first cell lies in it. An iteration brings to the device the cells its bricks
+    // touch, one brick at a time: the control grid, its gradient and Adam's moments are mapped like the maps. ----
     torch::Tensor    gradient = scratch.Zeros(thetaShape);
-    torch::Tensor    touched = scratch.Zeros(maskShape, torch::kBool);
-    Impact::LazyAdam adam(scratch.Zeros(thetaShape),
-                          scratch.Zeros(thetaShape),
-                          scratch.Zeros(maskShape),
-                          m_LearningRate,
-                          m_Beta1,
-                          m_Beta2,
-                          adamEpsilon);
+    Impact::CellAdam adam{ scratch.Zeros(thetaShape), scratch.Zeros(thetaShape), m_LearningRate, m_Beta1, m_Beta2,
+                           adamEpsilon };
     auto             cellCountOf = [&](const Impact::CellBox & box) {
       int64_t count = 1;
       for (unsigned int d = 0; d < Dim; ++d)
@@ -2519,73 +2515,57 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       return count;
     };
-    // With RegionsPerIteration 0 an iteration steps every cell, by bricks of as many boxes a side as the device
-    // holds: a cell brings its share of the mapped files, a brick an eighth of the device's budget at most, the
-    // graph on its cells taking a few times that.
-    std::vector<Impact::CellBox> bricks;
-    std::vector<int64_t>         countByBrick;
-    if (m_RegionsPerIteration == 0)
+    // As many boxes a side as BrickBytes holds: a cell brings its share of the mapped files, the graph on a brick's
+    // cells taking a few times that.
+    const double brickBytes =
+      m_BrickBytes > 0 ? static_cast<double>(m_BrickBytes) : Impact::ResidentBudget(device) / 8.0;
+    const double held = brickBytes * static_cast<double>(cellCountTotal) / static_cast<double>(scratch.GetBytes());
+    auto         brickCells = [&](int64_t boxesASide) {
+      double count = 1.0;
+      for (unsigned int d = 0; d < Dim; ++d)
+      {
+        count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d]));
+      }
+      return count;
+    };
+    int64_t boxesASide = 1;
+    while (brickCells(boxesASide) < static_cast<double>(cellCountTotal) && brickCells(boxesASide + 1) <= held)
     {
-      const double held = Impact::ResidentBudget(device) / 8.0 * static_cast<double>(cellCountTotal) /
-                          static_cast<double>(scratch.GetBytes());
-      auto brickCells = [&](int64_t boxesASide) {
-        double count = 1.0;
-        for (unsigned int d = 0; d < Dim; ++d)
-        {
-          count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d]));
-        }
-        return count;
-      };
-      int64_t boxesASide = 1;
-      while (brickCells(boxesASide) < static_cast<double>(cellCountTotal) && brickCells(boxesASide + 1) <= held)
-      {
-        ++boxesASide;
-      }
-      std::vector<int64_t> perBrick(Dim);
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        perBrick[d] = boxesASide * perBox[d];
-      }
-      bricks = Impact::TileCells(cells, perBrick);
-      for (const Impact::CellBox & brick : bricks)
-      {
-        countByBrick.push_back(fixedOn.defined()
-                                 ? cellsOf(fixedOn, brick.cell0, brick.cell1).sum().template item<int64_t>()
-                                 : cellCountOf(brick));
-      }
+      ++boxesASide;
     }
-    const std::vector<Impact::CellBox> & units = m_RegionsPerIteration == 0 ? bricks : boxes;
-    const std::vector<int64_t> &         countByUnit = m_RegionsPerIteration == 0 ? countByBrick : countByBox;
-    // Every unit, the ones the fixed mask does not reach for their share of the regularizer alone, nothing read: an
-    // epoch visits each once, in a fresh permutation, its last batch shorter when the count does not divide. Every
-    // unit at every iteration goes in the order of the files.
-    std::mt19937        scheduleGenerator(m_Seed);
-    std::vector<size_t> order(units.size());
-    std::iota(order.begin(), order.end(), 0);
-    const size_t perIteration =
-      m_RegionsPerIteration == 0 ? order.size() : std::min<size_t>(m_RegionsPerIteration, order.size());
-    const size_t perEpoch = (order.size() + perIteration - 1) / perIteration;
-    const size_t iterations = static_cast<size_t>(m_NumberOfIterations) * perEpoch;
-    // The cells a unit touches: its own, the regularizer's next one, and the smoothing's reach. Smoothed alone,
-    // they give the smoothed field of the whole grid on the unit's cells and the regularizer's next one.
+    std::vector<int64_t> perBrick(Dim);
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      perBrick[d] = boxesASide * perBox[d];
+    }
+    const std::vector<Impact::CellBox> bricks = Impact::TileCells(cells, perBrick);
+    std::vector<int64_t>               countByBrick; // the cells of each the fixed mask counts
+    for (const Impact::CellBox & brick : bricks)
+    {
+      countByBrick.push_back(fixedOn.defined()
+                               ? cellsOf(fixedOn, brick.cell0, brick.cell1).sum().template item<int64_t>()
+                               : cellCountOf(brick));
+    }
+    // The cells a brick touches: its own, the regularizer's next one, and the smoothing's reach. Smoothed alone,
+    // they give the smoothed field of the whole grid on the brick's cells and the regularizer's next one.
     const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
-    auto          touchedBy = [&](const Impact::CellBox & unit) {
-      Impact::CellBox window = unit;
+    auto          touchedBy = [&](const Impact::CellBox & brick) {
+      Impact::CellBox window = brick;
       for (unsigned int d = 0; d < Dim; ++d)
       {
-        window.cell0[d] = std::max<int64_t>(0, unit.cell0[d] - reach);
-        window.cell1[d] = std::min<int64_t>(cells[d], unit.cell1[d] + reach);
+        window.cell0[d] = std::max<int64_t>(0, brick.cell0[d] - reach);
+        window.cell1[d] = std::min<int64_t>(cells[d], brick.cell1[d] + reach);
       }
       return window;
     };
-    // One unit's loss for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when given, takes each
-    // layer's unweighted value times the unit's share.
-    auto boxLoss = [&](size_t                       b,
-                       const torch::Tensor &        smoothed,
-                       const std::vector<int64_t> & origin,
-                       std::vector<double> *        raw) -> torch::Tensor {
-      const Impact::CellBox & box = units[b];
-      if (countByUnit[b] == 0)
+    // One brick's loss for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when given, takes
+    // each layer's unweighted value times the brick's share.
+    auto brickLoss = [&](size_t                       b,
+                         const torch::Tensor &        smoothed,
+                         const std::vector<int64_t> & origin,
+                         std::vector<double> *        raw) -> torch::Tensor {
+      const Impact::CellBox & box = bricks[b];
+      if (countByBrick[b] == 0)
       {
         // Nothing of it counts: its edges alone, nothing read.
         return regularizer(smoothed, box.cell0, box.cell1, origin);
@@ -2640,7 +2620,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         counted = counted.defined() ? counted.logical_and(holds) : holds;
       }
       const torch::Tensor rows = drawRows(counted, cellCountOf(box));
-      const double        share = static_cast<double>(countByUnit[b]) / totalCount;
+      const double        share = static_cast<double>(countByBrick[b]) / totalCount;
       torch::Tensor       total = torch::zeros({}, onDevice);
       if (!rows.defined() || rows.numel() > 0)
       {
@@ -2659,46 +2639,35 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       return loss;
     };
     m_MetricValuesPerIteration.clear();
-    m_MetricValuesPerIteration.reserve(iterations);
-    for (size_t iteration = 0; iteration < iterations; ++iteration)
+    m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
+    for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
-      const size_t slot = iteration % perEpoch;
-      if (slot == 0 && m_RegionsPerIteration > 0)
-      {
-        std::shuffle(order.begin(), order.end(), scheduleGenerator);
-      }
-      const std::vector<size_t> drawn(
-        order.begin() + static_cast<std::ptrdiff_t>(slot * perIteration),
-        order.begin() + static_cast<std::ptrdiff_t>(std::min(order.size(), (slot + 1) * perIteration)));
       drawSubsets(channels);
       if (normalizes && !normalization.IsLatched(0))
       {
-        // Each layer's value over this iteration's units at the starting field, without the graph, over the share of
-        // the cells those units hold: the dense run's mean estimated on the units drawn.
+        // Each layer's value at the starting field, without the graph: the dense run's mean, summed over the bricks.
         torch::NoGradGuard  noGrad;
         std::vector<double> raw(losses.size(), 0.0);
-        double              drawnShare = 0.0;
-        for (const size_t b : drawn)
+        for (size_t b = 0; b < bricks.size(); ++b)
         {
-          const Impact::CellBox window = touchedBy(units[b]);
-          boxLoss(b, smoothControl(cellsOf(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
-          drawnShare += static_cast<double>(countByUnit[b]) / totalCount;
+          const Impact::CellBox window = touchedBy(bricks[b]);
+          brickLoss(b, smoothControl(cellsOf(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
         }
         for (size_t l = 0; l < losses.size(); ++l)
         {
-          normalization.Latch(l, drawnShare > 0.0 ? raw[l] / drawnShare : raw[l]);
+          normalization.Latch(l, raw[l]);
         }
       }
-      // Each unit back-propagates through the smoothing passes to the cells it touches; the control grid's gradient
-      // is their sum over the units, which touch one another's cells.
+      // Each brick back-propagates through the smoothing passes to the cells it touches; the control grid's gradient
+      // is their sum over the bricks, which touch one another's cells.
       double lossValue = 0.0;
-      for (const size_t b : drawn)
+      for (size_t b = 0; b < bricks.size(); ++b)
       {
-        const Impact::CellBox window = touchedBy(units[b]);
+        const Impact::CellBox window = touchedBy(bricks[b]);
         const torch::Tensor   control = cellsOf(theta, window.cell0, window.cell1)
                                         .to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true)
                                         .requires_grad_(true);
-        const torch::Tensor loss = boxLoss(b, smoothControl(control), window.cell0, nullptr);
+        const torch::Tensor loss = brickLoss(b, smoothControl(control), window.cell0, nullptr);
         if (loss.requires_grad()) // a constant for a last cell out of the fixed mask: no similarity, no difference
         {
           loss.backward();
@@ -2708,15 +2677,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         {
           cellsOf(gradient, window.cell0, window.cell1).add_(control.grad().to(torch::kCPU));
         }
-        cellsOf(touched, window.cell0, window.cell1).fill_(true);
       }
-      // A cell several units touch is stepped with the first of them.
-      for (const size_t b : drawn)
+      adam.Advance();
+      for (const Impact::CellBox & brick : bricks)
       {
-        const Impact::CellBox window = touchedBy(units[b]);
-        adam.StepCells(theta, gradient, touched, window.cell0, window.cell1, device);
-        cellsOf(gradient, window.cell0, window.cell1).zero_();
-        cellsOf(touched, window.cell0, window.cell1).fill_(false);
+        adam.StepCells(theta, gradient, brick.cell0, brick.cell1, device);
+        cellsOf(gradient, brick.cell0, brick.cell1).zero_();
       }
       m_MetricValuesPerIteration.push_back(lossValue);
     }
@@ -2764,7 +2730,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os, 
   os << indent << "NormalizeLosses: " << (m_NormalizeLosses ? "on" : "off") << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;
   os << indent << "RegionSize: " << m_RegionSize << std::endl;
-  os << indent << "RegionsPerIteration: " << m_RegionsPerIteration << std::endl;
+  os << indent << "BrickBytes: " << m_BrickBytes << std::endl;
   os << indent << "RegionHalo: " << m_RegionHalo << std::endl;
   os << indent << "ResidentFeatureBudget: " << m_ResidentFeatureBudget << std::endl;
   os << indent << "ScratchDirectory: " << m_ScratchDirectory << std::endl;

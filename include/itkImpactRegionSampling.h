@@ -20,7 +20,7 @@
 
 // The pieces of ImpactFineRegistration's region-sampled (out-of-core) run that do not depend on the filter:
 // reading a region through an image's own pipeline, the cell lattice its boxes tile, the pooling windows of the
-// cells, Adam on the cells an iteration touched, and the mapped files of what grows with the image. LibTorch-backed:
+// cells, Adam stepped by parts of the cell grid, and the mapped files of what grows with the image. LibTorch-backed:
 // included by the .hxx only.
 
 #include "itkImpactModelConfiguration.h"
@@ -632,97 +632,45 @@ TileCells(const std::vector<int64_t> & cells, const std::vector<int64_t> & perBo
   return boxes;
 }
 
-/** Adam (torch::optim::Adam's update, no weight decay) on the cells an iteration touched: the moments and the step
- * count of every other cell stay as they are, as if the cell had not been optimized that step. Touching every cell at
- * every step is torch::optim::Adam. `touched` is a bool {1, 1, cells...} broadcast over the components. */
-struct LazyAdam
+/** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: Advance() starts a step
+ * of the grid, StepCells() takes it on the cells [c0, c1), each cell once. The parameters, their gradient and the
+ * moments may be mapped files, of which a part's step reads and writes those cells alone, on `device`. */
+struct CellAdam
 {
   torch::Tensor exponentialAverage;
   torch::Tensor exponentialAverageSquare;
-  torch::Tensor steps;
   double        learningRate;
   double        beta1;
   double        beta2;
   double        epsilon;
+  int64_t       steps{ 0 };
 
-  LazyAdam(const torch::Tensor & theta, double lr, double b1, double b2, double eps)
-    : LazyAdam(torch::zeros_like(theta), torch::zeros_like(theta), torch::Tensor(), lr, b1, b2, eps)
-  {
-    std::vector<int64_t> shape(theta.sizes().begin(), theta.sizes().end());
-    shape[1] = 1;
-    steps = torch::zeros(shape, theta.options());
-  }
-
-  /** On a state of zeros the caller allocated: the moments like the parameters, the step count one a cell. */
-  LazyAdam(torch::Tensor average,
-           torch::Tensor averageSquare,
-           torch::Tensor count,
-           double        lr,
-           double        b1,
-           double        b2,
-           double        eps)
-    : exponentialAverage(std::move(average))
-    , exponentialAverageSquare(std::move(averageSquare))
-    , steps(std::move(count))
-    , learningRate(lr)
-    , beta1(b1)
-    , beta2(b2)
-    , epsilon(eps)
-  {}
-
-  /** A step on `theta` with its own gradient, which it zeroes. */
   void
-  Step(torch::Tensor & theta, const torch::Tensor & touched)
+  Advance()
   {
-    torch::NoGradGuard noGrad;
-    this->Step(theta, theta.grad().defined() ? theta.grad() : torch::zeros_like(theta), touched);
-    if (theta.grad().defined())
-    {
-      theta.grad().zero_();
-    }
+    ++steps;
   }
 
-  /** Step() on the cells [c0, c1) alone, brought to `device` for it: `theta`, its `gradient`, `touched` and the
-   * state may be mapped files, of which a step then reads and writes those cells only. */
   void
   StepCells(torch::Tensor &              theta,
             const torch::Tensor &        gradient,
-            const torch::Tensor &        touched,
             const std::vector<int64_t> & c0,
             const std::vector<int64_t> & c1,
             const torch::Device &        device)
   {
     torch::NoGradGuard noGrad;
-    LazyAdam           window(CellsOf(exponentialAverage, c0, c1).to(device),
-                    CellsOf(exponentialAverageSquare, c0, c1).to(device),
-                    CellsOf(steps, c0, c1).to(device),
-                    learningRate,
-                    beta1,
-                    beta2,
-                    epsilon);
-    torch::Tensor      cells = CellsOf(theta, c0, c1).to(device);
-    window.Step(cells, CellsOf(gradient, c0, c1).to(device), CellsOf(touched, c0, c1).to(device));
-    WriteCells(exponentialAverage, c0, window.exponentialAverage);
-    WriteCells(exponentialAverageSquare, c0, window.exponentialAverageSquare);
-    WriteCells(steps, c0, window.steps);
-    WriteCells(theta, c0, cells);
-  }
-
-  void
-  Step(torch::Tensor & theta, const torch::Tensor & gradient, const torch::Tensor & touched)
-  {
-    torch::NoGradGuard noGrad;
-    steps = torch::where(touched, steps + 1.0, steps);
-    exponentialAverage =
-      torch::where(touched, beta1 * exponentialAverage + (1.0 - beta1) * gradient, exponentialAverage);
-    exponentialAverageSquare = torch::where(
-      touched, beta2 * exponentialAverageSquare + (1.0 - beta2) * gradient * gradient, exponentialAverageSquare);
-    // The bias corrections of a cell never touched are 0: kept out of the division by the mask.
-    const torch::Tensor correction1 = (1.0 - torch::pow(beta1, steps)).clamp_min(1e-30);
-    const torch::Tensor correction2 = (1.0 - torch::pow(beta2, steps)).clamp_min(1e-30);
-    const torch::Tensor denominator = exponentialAverageSquare.sqrt() / correction2.sqrt() + epsilon;
-    const torch::Tensor update = (learningRate / correction1) * exponentialAverage / denominator;
-    theta.copy_(torch::where(touched, theta - update, theta));
+    auto               onDevice = [&](const torch::Tensor & whole) { // a copy, never the mapped cells themselves
+      return CellsOf(whole, c0, c1).to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true);
+    };
+    const torch::Tensor g = onDevice(gradient);
+    const torch::Tensor average = onDevice(exponentialAverage).mul_(beta1).add_(g, 1.0 - beta1);
+    const torch::Tensor averageSquare = onDevice(exponentialAverageSquare).mul_(beta2).addcmul_(g, g, 1.0 - beta2);
+    const double        correction1 = 1.0 - std::pow(beta1, static_cast<double>(steps));
+    const double        correction2 = 1.0 - std::pow(beta2, static_cast<double>(steps));
+    const torch::Tensor denominator = (averageSquare.sqrt() / std::sqrt(correction2)).add_(epsilon);
+    WriteCells(theta, c0, onDevice(theta).addcdiv_(average, denominator, -learningRate / correction1));
+    WriteCells(exponentialAverage, c0, average);
+    WriteCells(exponentialAverageSquare, c0, averageSquare);
   }
 };
 

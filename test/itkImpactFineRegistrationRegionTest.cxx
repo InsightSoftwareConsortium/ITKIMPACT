@@ -16,10 +16,10 @@
  *
  *=========================================================================*/
 
-// The region-sampled run of ImpactFineRegistration against its whole-image run, on the intensity similarity:
-// every box at every iteration reproduces the dense field, from mapped files that the run removes; a streaming reader
-// gives the same field as the image in memory and is read by regions; a transform set on the moving side is applied
-// outside the field.
+// The region-sampled run of ImpactFineRegistration against its whole-image run, on the intensity similarity: it
+// reproduces the dense field, with the pooled maps resident and by bricks from mapped files that the run removes; a
+// streaming reader gives the same field as the image in memory and is read by regions; a transform set on the moving
+// side is applied outside the field.
 
 #include "itkImpactFineRegistration.h"
 
@@ -151,17 +151,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   const FieldType * denseField = dense->GetOutput();
 
   // 2. By regions, the pooled maps resident (one pass over the boxes, then the dense iterations on them): the same
-  // field. Then box by box, every box at every iteration, from files mapped in a scratch directory and gone with the
-  // run: the same field again, as with every cell at every iteration by bricks.
+  // field. Then with nothing resident, every cell at every iteration by bricks of one box, from files mapped in a
+  // scratch directory and gone with the run: the same field again.
   auto regions = FineType::New();
   regions->SetFixedImage(fixed);
   regions->SetMovingImage(moving);
   regions->SetInitialDisplacementField(start);
   Configure(regions, 6);
   regions->SetRegionSize(16);
-  regions->SetRegionsPerIteration(1000);
   ITK_TEST_SET_GET_VALUE(16u, regions->GetRegionSize());
-  ITK_TEST_SET_GET_VALUE(1000u, regions->GetRegionsPerIteration());
   ITK_TRY_EXPECT_NO_EXCEPTION(regions->Update());
   if (!regions->GetResidentFeatures())
   {
@@ -169,29 +167,30 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     return EXIT_FAILURE;
   }
   const FieldType * regionField = regions->GetOutput();
-  auto              boxes = FineType::New();
-  boxes->SetFixedImage(fixed);
-  boxes->SetMovingImage(moving);
-  boxes->SetInitialDisplacementField(start);
-  Configure(boxes, 6);
-  boxes->SetRegionSize(16);
-  boxes->SetRegionsPerIteration(1000);
-  boxes->SetResidentFeatureBudget(1); // nothing fits: box by box
-  ITK_TEST_SET_GET_VALUE(1u, boxes->GetResidentFeatureBudget());
+  auto              bricks = FineType::New();
+  bricks->SetFixedImage(fixed);
+  bricks->SetMovingImage(moving);
+  bricks->SetInitialDisplacementField(start);
+  Configure(bricks, 6);
+  bricks->SetRegionSize(16);
+  bricks->SetResidentFeatureBudget(1); // nothing fits: by bricks
+  bricks->SetBrickBytes(1);            // of one box
+  ITK_TEST_SET_GET_VALUE(1u, bricks->GetResidentFeatureBudget());
+  ITK_TEST_SET_GET_VALUE(1u, bricks->GetBrickBytes());
   const std::string scratch = temporary + "/itkImpactFineRegistrationRegionTest_scratch";
   std::filesystem::create_directories(scratch);
-  boxes->SetScratchDirectory(scratch);
-  ITK_TEST_SET_GET_VALUE(scratch, std::string(boxes->GetScratchDirectory()));
-  ITK_TRY_EXPECT_NO_EXCEPTION(boxes->Update());
-  if (boxes->GetResidentFeatures())
+  bricks->SetScratchDirectory(scratch);
+  ITK_TEST_SET_GET_VALUE(scratch, std::string(bricks->GetScratchDirectory()));
+  ITK_TRY_EXPECT_NO_EXCEPTION(bricks->Update());
+  if (bricks->GetResidentFeatures())
   {
     std::cerr << "A budget of one byte should leave nothing resident." << std::endl;
     return EXIT_FAILURE;
   }
-  if (boxes->GetScratchBytes() == 0 || regions->GetScratchBytes() != 0)
+  if (bricks->GetScratchBytes() == 0 || regions->GetScratchBytes() != 0)
   {
-    std::cerr << "Box by box, the maps and the control grid should be mapped files, and none with the maps resident: "
-              << boxes->GetScratchBytes() << " bytes against " << regions->GetScratchBytes() << "." << std::endl;
+    std::cerr << "By bricks, the maps and the control grid should be mapped files, and none with the maps resident: "
+              << bricks->GetScratchBytes() << " bytes against " << regions->GetScratchBytes() << "." << std::endl;
     return EXIT_FAILURE;
   }
   if (!std::filesystem::is_empty(scratch))
@@ -199,28 +198,12 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "The run left files in its scratch directory." << std::endl;
     return EXIT_FAILURE;
   }
-  if (boxes->GetBytesRead() != regions->GetBytesRead())
+  if (bricks->GetBytesRead() != regions->GetBytesRead())
   {
-    std::cerr << "Box by box, the images should be read once, as with the maps resident: " << boxes->GetBytesRead()
+    std::cerr << "By bricks, the images should be read once, as with the maps resident: " << bricks->GetBytesRead()
               << " bytes against " << regions->GetBytesRead() << "." << std::endl;
     return EXIT_FAILURE;
   }
-  const double boxDifference = MaxDifference(denseField, boxes->GetOutput(), fixed->GetLargestPossibleRegion());
-  std::cout << "dense vs box by box (every box): max |difference| = " << boxDifference << " mm" << std::endl;
-  if (boxDifference > 1e-5)
-  {
-    std::cerr << "The box-by-box field differs from the dense one by " << boxDifference << " mm." << std::endl;
-    return EXIT_FAILURE;
-  }
-  auto bricks = FineType::New();
-  bricks->SetFixedImage(fixed);
-  bricks->SetMovingImage(moving);
-  bricks->SetInitialDisplacementField(start);
-  Configure(bricks, 6);
-  bricks->SetRegionSize(16);
-  bricks->SetRegionsPerIteration(0);
-  bricks->SetResidentFeatureBudget(1);
-  ITK_TRY_EXPECT_NO_EXCEPTION(bricks->Update());
   const double brickDifference = MaxDifference(denseField, bricks->GetOutput(), fixed->GetLargestPossibleRegion());
   std::cout << "dense vs every cell by bricks: max |difference| = " << brickDifference << " mm" << std::endl;
   if (brickDifference > 1e-5)
@@ -263,7 +246,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
   const double difference = MaxDifference(denseField, regionField, fixed->GetLargestPossibleRegion());
-  std::cout << "dense vs regions (every box): max |difference| = " << difference << " mm" << std::endl;
+  std::cout << "dense vs regions: max |difference| = " << difference << " mm" << std::endl;
   if (difference > 1e-5)
   {
     std::cerr << "The region-sampled field differs from the dense one by " << difference << " mm." << std::endl;
@@ -329,7 +312,6 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   streamed->SetInitialDisplacementField(start);
   Configure(streamed, 6);
   streamed->SetRegionSize(16);
-  streamed->SetRegionsPerIteration(1000);
   streamed->UpdateOutputInformation();
   FieldType::RegionType slab = streamed->GetOutput()->GetLargestPossibleRegion();
   slab.SetIndex(2, 10);
@@ -366,50 +348,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     return EXIT_FAILURE;
   }
 
-  // 4. Box by box, a share of the boxes at every iteration, every box visited 10 times: converges towards the shift,
-  // moving(x + u) = fixed(x) with moving(y) = f(y + s) asking for u = -s.
-  auto partial = FineType::New();
-  partial->SetFixedImage(fixed);
-  partial->SetMovingImage(moving);
-  Configure(partial, 10, 1e-8); // Adam as configured by default: full steps
-  partial->SetRegionSize(16);
-  partial->SetRegionsPerIteration(3);
-  partial->SetResidentFeatureBudget(1);
-  ITK_TRY_EXPECT_NO_EXCEPTION(partial->Update());
-  {
-    FieldType::RegionType centre = fixed->GetLargestPossibleRegion();
-    for (unsigned int a = 0; a < 3; ++a)
-    {
-      centre.SetIndex(a, 8);
-      centre.SetSize(a, centre.GetSize()[a] - 16);
-    }
-    itk::Vector<double, 3> mean;
-    mean.Fill(0.0);
-    itk::ImageRegionConstIteratorWithIndex<FieldType> it(partial->GetOutput(), centre);
-    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-    {
-      mean += it.Get();
-    }
-    mean /= static_cast<double>(centre.GetNumberOfPixels());
-    std::cout << "partial schedule: mean displacement " << mean << " mm for a shift of (-1.5, 1, -0.5)" << std::endl;
-    const double expected[3] = { -1.5, 1.0, -0.5 };
-    for (unsigned int c = 0; c < 3; ++c)
-    {
-      if (std::abs(mean[c] - expected[c]) > 0.6)
-      {
-        std::cerr << "The partial schedule did not recover the shift." << std::endl;
-        return EXIT_FAILURE;
-      }
-    }
-    const auto & values = partial->GetMetricValuesPerIteration();
-    if (!(values.back() < values.front()))
-    {
-      std::cerr << "The loss did not decrease: " << values.front() << " -> " << values.back() << std::endl;
-      return EXIT_FAILURE;
-    }
-  }
-
-  // 5. The moving transform compensates the shift outside the field: the starting loss is near zero with it.
+  // 4. The moving transform compensates the shift outside the field: the starting loss is near zero with it.
   {
     ImageType::Pointer shifted = Texture(size, 3.0, 0.0, 0.0);
     using TranslationType = itk::TranslationTransform<double, 3>;
@@ -425,14 +364,12 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     with->SetMovingTransform(translation);
     Configure(with, 1);
     with->SetRegionSize(16);
-    with->SetRegionsPerIteration(1000);
     ITK_TRY_EXPECT_NO_EXCEPTION(with->Update());
     auto without = FineType::New();
     without->SetFixedImage(fixed);
     without->SetMovingImage(shifted);
     Configure(without, 1);
     without->SetRegionSize(16);
-    without->SetRegionsPerIteration(1000);
     ITK_TRY_EXPECT_NO_EXCEPTION(without->Update());
     const double compensated = with->GetMetricValuesPerIteration().front();
     const double raw = without->GetMetricValuesPerIteration().front();
@@ -444,7 +381,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 6. An initial field on a coarser grid starts the control grid as its dense field starts the whole-image run.
+  // 5. An initial field on a coarser grid starts the control grid as its dense field starts the whole-image run.
   {
     auto                  coarse = FieldType::New();
     FieldType::RegionType coarseRegion;
@@ -509,7 +446,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 7. A pair of odd sizes, whose tail the control cells leave out: by regions as whole, on the intensities and on a
+  // 6. A pair of odd sizes, whose tail the control cells leave out: by regions as whole, on the intensities and on a
   // model whose layers are half the image's resolution (an average pooling and a strided convolution), whose whole
   // layers the cells pool by uneven windows.
   for (const bool withModel : { false, true })
