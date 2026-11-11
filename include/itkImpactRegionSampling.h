@@ -147,6 +147,23 @@ ReadRegion(const TImage * image, const typename TImage::RegionType & region)
   return torch::from_blob(buffer.data(), shape, torch::kFloat32).clone().unsqueeze(0).unsqueeze(0);
 }
 
+/** ReadRegion on `device`, `bytes` counting what is asked of the image. `streamed` tells whether `source`, the image
+ * the read goes back to, served the region without buffering itself whole. */
+template <typename TImage, typename TSource>
+torch::Tensor
+ReadRegionCounted(const TImage *                      image,
+                  const typename TImage::RegionType & region,
+                  const torch::Device &               device,
+                  SizeValueType &                     bytes,
+                  const TSource *                     source,
+                  bool &                              streamed)
+{
+  bytes += region.GetNumberOfPixels() * sizeof(typename TImage::PixelType);
+  const torch::Tensor tensor = ReadRegion(image, region);
+  streamed = source->GetBufferedRegion().GetNumberOfPixels() < source->GetLargestPossibleRegion().GetNumberOfPixels();
+  return tensor.to(device);
+}
+
 /** The windows of `cells` cells of `voxelsPerCell` voxels each from the first voxel: the coarse stage's cells, the
  * tail voxels past the last one dropped. */
 inline PoolWindows

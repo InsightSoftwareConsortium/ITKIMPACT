@@ -1817,28 +1817,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
   }
 
-  // ---- Reads: each through the image's own pipeline, counted; whether the first one was served without the whole
-  // image tells if the input streams. ----
-  bool fixedProbed = false, movingProbed = false;
+  // ---- Reads: each through the image's own pipeline, counted, telling whether the input streams. ----
   auto readFixed = [&](const RegionType & region) {
-    m_BytesRead += region.GetNumberOfPixels() * sizeof(typename FixedImageType::PixelType);
-    torch::Tensor tensor = Impact::ReadRegion(m_FixedImage.GetPointer(), region);
-    if (!fixedProbed)
-    {
-      m_FixedImageStreamed = m_FixedImage->GetBufferedRegion().GetNumberOfPixels() < fixedRegion.GetNumberOfPixels();
-      fixedProbed = true;
-    }
-    return tensor.to(device);
+    return Impact::ReadRegionCounted(
+      m_FixedImage.GetPointer(), region, device, m_BytesRead, m_FixedImage.GetPointer(), m_FixedImageStreamed);
   };
   auto readMoving = [&](const typename MovingImageType::RegionType & region) {
-    m_BytesRead += region.GetNumberOfPixels() * sizeof(typename MovingImageType::PixelType);
-    torch::Tensor tensor = Impact::ReadRegion(m_MovingImage.GetPointer(), region);
-    if (!movingProbed)
-    {
-      m_MovingImageStreamed = m_MovingImage->GetBufferedRegion().GetNumberOfPixels() < movingRegion.GetNumberOfPixels();
-      movingProbed = true;
-    }
-    return tensor.to(device);
+    return Impact::ReadRegionCounted(
+      m_MovingImage.GetPointer(), region, device, m_BytesRead, m_MovingImage.GetPointer(), m_MovingImageStreamed);
   };
   auto readMask = [&](const MaskImageType * mask, const typename MaskImageType::RegionType & region) {
     m_BytesRead += region.GetNumberOfPixels();

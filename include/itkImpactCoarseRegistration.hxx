@@ -1044,30 +1044,14 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const typename MaskImageType::ConstPointer fixedMask = maskOnFixed(m_FixedMask.GetPointer(), nullptr);
     const typename MaskImageType::ConstPointer movingMask = maskOnFixed(m_MovingMask.GetPointer(), movingTransform);
 
-    // ---- Reads: each through the image's own pipeline, counted; whether the first was served without the whole
-    // image tells if the input streams. ----
-    bool fixedProbed = false, movingProbed = false;
+    // ---- Reads: each through the image's own pipeline, counted, telling whether the input streams. ----
     auto readFixed = [&](const RegionType & region) {
-      m_BytesRead += region.GetNumberOfPixels() * sizeof(typename FixedImageType::PixelType);
-      torch::Tensor tensor = Impact::ReadRegion(m_FixedImage.GetPointer(), region);
-      if (!fixedProbed)
-      {
-        m_FixedImageStreamed =
-          m_FixedImage->GetBufferedRegion().GetNumberOfPixels() < fixedRegion.GetNumberOfPixels();
-        fixedProbed = true;
-      }
-      return tensor.to(device);
+      return Impact::ReadRegionCounted(
+        m_FixedImage.GetPointer(), region, device, m_BytesRead, m_FixedImage.GetPointer(), m_FixedImageStreamed);
     };
     auto readMoving = [&](const RegionType & region) {
-      m_BytesRead += region.GetNumberOfPixels() * sizeof(typename MovingImageType::PixelType);
-      torch::Tensor tensor = Impact::ReadRegion(movingOnFixed.GetPointer(), region);
-      if (!movingProbed)
-      {
-        m_MovingImageStreamed = m_MovingImage->GetBufferedRegion().GetNumberOfPixels() <
-                                m_MovingImage->GetLargestPossibleRegion().GetNumberOfPixels();
-        movingProbed = true;
-      }
-      return tensor.to(device);
+      return Impact::ReadRegionCounted(
+        movingOnFixed.GetPointer(), region, device, m_BytesRead, m_MovingImage.GetPointer(), m_MovingImageStreamed);
     };
     auto readMask = [&](const MaskImageType * mask, const RegionType & region) {
       m_BytesRead += region.GetNumberOfPixels();
