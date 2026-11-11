@@ -503,24 +503,31 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 7. A model whose layers are half the image's resolution (an average pooling and a strided convolution), on a pair
-  // of odd sizes, whose whole layers the cells pool by uneven windows: by regions as whole.
-  if (argc > 2)
+  // 7. A pair of odd sizes, whose tail the control cells leave out: by regions as whole, on the intensities and on a
+  // model whose layers are half the image's resolution (an average pooling and a strided convolution), whose whole
+  // layers the cells pool by uneven windows.
+  for (const bool withModel : { false, true })
   {
-    const ImageType::SizeType           odd = { { 49, 41, 33 } };
-    ImageType::Pointer                  oddFixed = Texture(odd, 0.0, 0.0, 0.0);
-    ImageType::Pointer                  oddMoving = Texture(odd, 1.5, -1.0, 0.5);
-    const FieldType::Pointer            oddStart = StartingField(oddFixed);
-    const itk::ImpactModelConfiguration model(
-      argv[2], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false);
-    auto run = [&](bool byRegions) {
+    if (withModel && argc < 3)
+    {
+      continue;
+    }
+    const ImageType::SizeType odd = { { 49, 41, 33 } };
+    ImageType::Pointer        oddFixed = Texture(odd, 0.0, 0.0, 0.0);
+    ImageType::Pointer        oddMoving = Texture(odd, 1.5, -1.0, 0.5);
+    const FieldType::Pointer  oddStart = StartingField(oddFixed);
+    auto                      run = [&](bool byRegions) {
       auto fine = FineType::New();
       fine->SetFixedImage(oddFixed);
       fine->SetMovingImage(oddMoving);
       fine->SetInitialDisplacementField(oddStart);
-      fine->AddModelConfiguration(model);
-      fine->SetDistance({ "L2", "L2" });
-      fine->SetLayersWeight({ 1.f, 1.f });
+      if (withModel)
+      {
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[2], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+      }
       Configure(fine, 6);
       if (byRegions)
       {
@@ -532,14 +539,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     };
     const auto   whole = run(false);
     const auto   byRegions = run(true);
+    const char * label = withModel ? "half-resolution layers" : "intensities";
     const double moved = MaxDifference(whole->GetOutput(), oddStart, oddFixed->GetLargestPossibleRegion());
     const double difference =
       MaxDifference(whole->GetOutput(), byRegions->GetOutput(), oddFixed->GetLargestPossibleRegion());
-    std::cout << "half-resolution layers, by regions against whole: max |difference| = " << difference
+    std::cout << "odd sizes, " << label << ", by regions against whole: max |difference| = " << difference
               << " mm, for a field moved by " << moved << " mm" << std::endl;
     if (!(difference < 1e-5) || !(moved > 1e-3))
     {
-      std::cerr << "Half-resolution layers by regions differ from the whole-image run." << std::endl;
+      std::cerr << "On odd sizes, " << label << " by regions differ from the whole-image run." << std::endl;
       return EXIT_FAILURE;
     }
   }

@@ -979,20 +979,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   torch::Tensor movingCoarse, fixedCoarse, gridBaseCoarse, fixedCoarseMask, movingCoarseShare;
   if (!featureMode)
   {
-    auto poolToCoarse = [&](const torch::Tensor & t) -> torch::Tensor {
-      const std::vector<int64_t> ts(t.sizes().begin() + 2, t.sizes().end());
-      if (ts == coarseSpatial)
-      {
-        return t;
-      }
-      if constexpr (ImageDimension == 3)
-        return F::adaptive_avg_pool3d(
-          t, F::AdaptiveAvgPool3dFuncOptions({ coarseSpatial[0], coarseSpatial[1], coarseSpatial[2] }));
-      else
-        return F::adaptive_avg_pool2d(t, F::AdaptiveAvgPool2dFuncOptions({ coarseSpatial[0], coarseSpatial[1] }));
-    };
-    movingCoarse = poolToCoarse(movingT);
-    fixedCoarse = poolToCoarse(fixedT);
+    // Whole cells, the tail a size the shrink does not divide leaves dropped, as the masks and the feature layers.
+    movingCoarse = poolLayerToLoss(movingT);
+    fixedCoarse = poolLayerToLoss(fixedT);
     fixedCoarseMask = fixedMaskOn(coarseSpatial);
     movingCoarseShare = movingShareOn(coarseSpatial);
     std::vector<int64_t> gs{ 1, 1 };
