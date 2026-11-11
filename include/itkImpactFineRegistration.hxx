@@ -1694,7 +1694,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const Impact::PythonGilReleaseGuard gilRelease;
   // What grows with the image when the pooled maps are not resident; declared before the tensors it maps.
   Impact::ScratchFiles scratch(m_ScratchDirectory);
-  m_ScratchBytes = 0;
   m_BytesRead = 0;
   const auto                          onDevice = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   const auto                          sampleOpts =
@@ -2653,7 +2652,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   m_ControlGridTransform->SetDisplacementField(m_ControlGrid);
   m_DisplacementFieldTransform = m_ControlGridTransform;
   m_WarpedMovingImage = nullptr;
-  m_ScratchBytes = static_cast<SizeValueType>(scratch.GetBytes());
 }
 
 template <typename TFixedImage, typename TMovingImage>

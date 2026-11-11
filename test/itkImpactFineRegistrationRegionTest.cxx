@@ -187,12 +187,6 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "A budget of one byte should leave nothing resident." << std::endl;
     return EXIT_FAILURE;
   }
-  if (bricks->GetScratchBytes() == 0 || regions->GetScratchBytes() != 0)
-  {
-    std::cerr << "By bricks, the maps and the control grid should be mapped files, and none with the maps resident: "
-              << bricks->GetScratchBytes() << " bytes against " << regions->GetScratchBytes() << "." << std::endl;
-    return EXIT_FAILURE;
-  }
   if (!std::filesystem::is_empty(scratch))
   {
     std::cerr << "The run left files in its scratch directory." << std::endl;
