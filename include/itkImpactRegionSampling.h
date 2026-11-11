@@ -52,6 +52,11 @@
 #if !defined(_WIN32)
 #  include <unistd.h>
 #endif
+#if defined(__linux__)
+#  include <cerrno>
+#  include <cstring>
+#  include <fcntl.h>
+#endif
 
 namespace itk
 {
@@ -768,7 +773,7 @@ public:
       itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
                                << " cannot be used: " << error.message() << ".");
     }
-    // A mapped file is sparse: a file system that fills up under it kills the process at a write.
+    // Against the space free when the run started: all that guards a system that cannot reserve a file's blocks.
     if (m_Bytes + bytes > m_Available)
     {
       itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory << " has "
@@ -783,6 +788,22 @@ public:
       itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch file " << path << " exists.");
     }
     m_Paths.push_back(path);
+#if defined(__linux__)
+    // A mapped file is sparse, and a file system that fills up under it kills the process at a write: its blocks
+    // are reserved first, so that a full one is refused here.
+    const int descriptor = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    const int failure = descriptor < 0 ? errno : ::posix_fallocate(descriptor, 0, static_cast<off_t>(bytes));
+    if (descriptor >= 0)
+    {
+      ::close(descriptor);
+    }
+    if (failure != 0 && failure != EOPNOTSUPP && failure != EINVAL) // those two: a file system without the call
+    {
+      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
+                               << " cannot hold a file of " << bytes << " bytes (" << std::strerror(failure)
+                               << "); set ScratchDirectory to a directory of a larger disk.");
+    }
+#endif
     // A new file is zeros.
     torch::Tensor tensor = torch::from_file(path.string(), true, count, torch::TensorOptions().dtype(dtype));
 #if !defined(_WIN32)

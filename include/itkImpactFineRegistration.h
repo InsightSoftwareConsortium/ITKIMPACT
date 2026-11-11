@@ -312,8 +312,10 @@ public:
   /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks' cells,
    * the control grid and the optimizer's state, in files mapped to memory that the system pages in and out, removed
    * when the run ends. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs)
-   * keeps them there: give one on a disk for an image larger than the memory. GetScratchBytes() is what the last
-   * run mapped, 0 with the maps resident. */
+   * keeps them there: give one on a disk for an image larger than the memory. On Linux a file's blocks are reserved
+   * when it is mapped, so a directory too small raises an exception then; elsewhere the run checks the space free
+   * when it starts, and a disk that fills up afterwards kills the process at a write. GetScratchBytes() is what the
+   * last run mapped, 0 with the maps resident. */
   itkSetStringMacro(ScratchDirectory);
   itkGetStringMacro(ScratchDirectory);
   itkGetConstMacro(ScratchBytes, SizeValueType);
