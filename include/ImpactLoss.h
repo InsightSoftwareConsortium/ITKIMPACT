@@ -844,12 +844,12 @@ public:
 
   /** Each channel's correlation from its moments -- the means of f, m, f^2, m^2 and f*m over a window (the coarse
    * stage's cells) --, with the same floors as the global statistic below. */
-  static torch::Tensor
-  Correlation(const torch::Tensor & meanFixed,
-              const torch::Tensor & meanMoving,
-              const torch::Tensor & meanFixedSquare,
-              const torch::Tensor & meanMovingSquare,
-              const torch::Tensor & meanProduct)
+  torch::Tensor
+  SimilarityFromMoments(const torch::Tensor & meanFixed,
+                        const torch::Tensor & meanMoving,
+                        const torch::Tensor & meanFixedSquare,
+                        const torch::Tensor & meanMovingSquare,
+                        const torch::Tensor & meanProduct) const override
   {
     const torch::Tensor varianceFixed = (meanFixedSquare - meanFixed * meanFixed).clamp_min(0.0);
     const torch::Tensor varianceMoving = (meanMovingSquare - meanMoving * meanMoving).clamp_min(0.0);
@@ -862,16 +862,6 @@ public:
   IsPerPointMean() const override
   {
     return false;
-  }
-
-  torch::Tensor
-  SimilarityFromMoments(const torch::Tensor & meanFixed,
-                        const torch::Tensor & meanMoving,
-                        const torch::Tensor & meanFixedSquare,
-                        const torch::Tensor & meanMovingSquare,
-                        const torch::Tensor & meanProduct) const override
-  {
-    return Correlation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
   }
 
   void
@@ -1074,12 +1064,12 @@ public:
 
   /** Each channel's squared correlation from its moments over a window -- the means of f, m, f^2, m^2 and f*m --,
    * both variances floored as ANTs does. */
-  static torch::Tensor
-  SquaredCorrelation(const torch::Tensor & meanFixed,
-                     const torch::Tensor & meanMoving,
-                     const torch::Tensor & meanFixedSquare,
-                     const torch::Tensor & meanMovingSquare,
-                     const torch::Tensor & meanProduct)
+  torch::Tensor
+  SimilarityFromMoments(const torch::Tensor & meanFixed,
+                        const torch::Tensor & meanMoving,
+                        const torch::Tensor & meanFixedSquare,
+                        const torch::Tensor & meanMovingSquare,
+                        const torch::Tensor & meanProduct) const override
   {
     const torch::Tensor covariance = meanProduct - meanFixed * meanMoving;
     const torch::Tensor varianceFixed = (meanFixedSquare - meanFixed * meanFixed).clamp_min(s_epsilon);
@@ -1098,16 +1088,6 @@ public:
   IsPerPointMean() const override
   {
     return false;
-  }
-
-  torch::Tensor
-  SimilarityFromMoments(const torch::Tensor & meanFixed,
-                        const torch::Tensor & meanMoving,
-                        const torch::Tensor & meanFixedSquare,
-                        const torch::Tensor & meanMovingSquare,
-                        const torch::Tensor & meanProduct) const override
-  {
-    return SquaredCorrelation(meanFixed, meanMoving, meanFixedSquare, meanMovingSquare, meanProduct);
   }
 
   void
@@ -1154,11 +1134,11 @@ public:
                              .padding(torch::ExpandingArray<2>(at::IntArrayRef(padding)))
                              .count_include_pad(false));
     };
-    const torch::Tensor correlation = SquaredCorrelation(mean(fixedMap),
-                                                         mean(movingMap),
-                                                         mean(fixedMap * fixedMap),
-                                                         mean(movingMap * movingMap),
-                                                         mean(fixedMap * movingMap));
+    const torch::Tensor correlation = this->SimilarityFromMoments(mean(fixedMap),
+                                                                  mean(movingMap),
+                                                                  mean(fixedMap * fixedMap),
+                                                                  mean(movingMap * movingMap),
+                                                                  mean(fixedMap * movingMap));
     if (!mask.defined())
     {
       return 1.0 - correlation.mean();
