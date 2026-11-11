@@ -1984,6 +1984,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     return Impact::RelativeWindows(windows, c0, c1);
   };
   const auto writeCells = Impact::WriteCells;
+  const auto cellsOf = Impact::CellsOf;
 
   // ---- Occupancy: each box's cells in the fixed mask (share of their voxels >= 0.5), all of them without one. ----
   const std::vector<int64_t> noHalo(Dim, 0);
@@ -2368,9 +2369,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
   const std::vector<int64_t> wholeStart(Dim, 0);
 
-  // ---- The route: the pooled feature maps of both images resident on the device, computed once by one pass over
-  // the boxes and then compared whole at every iteration (the dense run on them); or, when they do not fit the
-  // budget, read box by box at every iteration. ----
+  // ---- The route: the pooled feature maps of both images, computed once by one pass over the boxes, are compared
+  // whole at every iteration when they fit the device (the dense run on them), box by box when they do not. ----
   std::vector<int64_t> channels(losses.size(), 1);
   if (featureMode)
   {
@@ -2393,52 +2393,50 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     budget = Impact::ResidentBudget(device);
   }
   m_ResidentFeatures = residentBytes <= budget;
-  std::vector<size_t> schedule; // the boxes of the box-by-box route, in epochs
-  {
-    const auto since = clock();
-    (void)since;
-  }
 
+  // ---- One pass over the boxes, the only time the images are read: the pooled maps, on the device when they fit
+  // its budget and in host memory otherwise. ----
+  // ponytail: host memory holds the maps past the device's budget; a mapped file if they outgrow it too.
+  const torch::TensorOptions atHome = onDevice.device(m_ResidentFeatures ? device : torch::Device(torch::kCPU));
+  std::vector<torch::Tensor> fixedMaps(losses.size()), movingMaps(losses.size());
+  torch::Tensor              movingShare;
+  for (size_t l = 0; l < losses.size(); ++l)
+  {
+    std::vector<int64_t> shape{ 1, channels[l] };
+    shape.insert(shape.end(), cells.begin(), cells.end());
+    fixedMaps[l] = torch::zeros(shape, atHome);
+    movingMaps[l] = torch::zeros(shape, atHome);
+  }
+  if (m_MovingMask.IsNotNull())
+  {
+    movingShare = torch::zeros(maskShape, atHome);
+  }
+  auto passStart = clock();
+  for (size_t b = 0; b < boxes.size(); ++b)
+  {
+    const Impact::CellBox & box = boxes[b];
+    if (countByBox[b] > 0)
+    {
+      const std::vector<torch::Tensor> layers = pooledFixed(box.cell0, box.cell1);
+      for (size_t l = 0; l < layers.size(); ++l)
+      {
+        writeCells(fixedMaps[l], box.cell0, layers[l]);
+      }
+    }
+    // The moving map everywhere: the displacement reads it past the fixed mask.
+    PooledMoving pooled = pooledMoving(box.cell0, box.cell1);
+    for (size_t l = 0; l < pooled.layers.size(); ++l)
+    {
+      writeCells(movingMaps[l], box.cell0, pooled.layers[l]);
+    }
+    if (pooled.share.defined())
+    {
+      writeCells(movingShare, box.cell0, pooled.share);
+    }
+  }
+  lap("pass over the boxes", passStart);
   if (m_ResidentFeatures)
   {
-    // ---- One pass over the boxes: the pooled maps. ----
-    std::vector<torch::Tensor> fixedMaps(losses.size()), movingMaps(losses.size());
-    torch::Tensor              movingShare;
-    for (size_t l = 0; l < losses.size(); ++l)
-    {
-      std::vector<int64_t> shape{ 1, channels[l] };
-      shape.insert(shape.end(), cells.begin(), cells.end());
-      fixedMaps[l] = torch::zeros(shape, onDevice);
-      movingMaps[l] = torch::zeros(shape, onDevice);
-    }
-    if (m_MovingMask.IsNotNull())
-    {
-      movingShare = torch::zeros(maskShape, onDevice);
-    }
-    auto since = clock();
-    for (size_t b = 0; b < boxes.size(); ++b)
-    {
-      const Impact::CellBox & box = boxes[b];
-      if (countByBox[b] > 0)
-      {
-        const std::vector<torch::Tensor> layers = pooledFixed(box.cell0, box.cell1);
-        for (size_t l = 0; l < layers.size(); ++l)
-        {
-          writeCells(fixedMaps[l], box.cell0, layers[l]);
-        }
-      }
-      // The moving map everywhere: the displacement reads it past the fixed mask.
-      PooledMoving pooled = pooledMoving(box.cell0, box.cell1);
-      for (size_t l = 0; l < pooled.layers.size(); ++l)
-      {
-        writeCells(movingMaps[l], box.cell0, pooled.layers[l]);
-      }
-      if (pooled.share.defined())
-      {
-        writeCells(movingShare, box.cell0, pooled.share);
-      }
-    }
-    lap("resident pass", since);
     // ---- The dense iterations on the pooled maps. ----
     const torch::Tensor base = cellPositions(wholeStart, cells);
     torch::Tensor       touched = torch::ones(maskShape, torch::TensorOptions().dtype(torch::kBool).device(device));
@@ -2446,7 +2444,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
-      since = clock();
+      auto since = clock();
       drawSubsets(channels);
       const torch::Tensor smoothed = smoothControl(theta);
       const torch::Tensor q = base + smoothed * unitToVoxels * voxelsToCells;
@@ -2515,12 +2513,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       // Where each cell reads the moving map, in cells: q = c + u (s_min units -> voxels -> cells), and the cells of
       // the moving map the box reads: what q reaches, one around for the interpolation and one spare, within the
       // lattice, at least two wide.
-      torch::Tensor displacement = smoothed;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        displacement = displacement.narrow(2 + static_cast<int64_t>(d), box.cell0[d], n[d]);
-      }
-      const torch::Tensor  q = cellPositions(box.cell0, box.cell1) + displacement * unitToVoxels * voxelsToCells;
+      const torch::Tensor  q = cellPositions(box.cell0, box.cell1) +
+                              cellsOf(smoothed, box.cell0, box.cell1) * unitToVoxels * voxelsToCells;
       std::vector<int64_t> m0(Dim), m1(Dim);
       {
         torch::NoGradGuard  noGrad;
@@ -2543,24 +2537,24 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         }
       }
       lap("box bounds", since);
-      const std::vector<torch::Tensor> fixedLayers = pooledFixed(box.cell0, box.cell1);
-      lap("box fixed", since);
-      const PooledMoving moving = pooledMoving(m0, m1);
-      lap("box moving", since);
+      std::vector<torch::Tensor> fixedLayers(losses.size()), movingLayers(losses.size());
+      for (size_t l = 0; l < losses.size(); ++l)
+      {
+        fixedLayers[l] = cellsOf(fixedMaps[l], box.cell0, box.cell1).to(device);
+        movingLayers[l] = cellsOf(movingMaps[l], m0, m1).to(device);
+      }
+      lap("box maps", since);
       const torch::Tensor grid = gridIn(q, m0, m1);
       torch::Tensor       counted;
       if (fixedOn.defined())
       {
-        counted = fixedOn;
-        for (unsigned int d = 0; d < Dim; ++d)
-        {
-          counted = counted.narrow(2 + static_cast<int64_t>(d), box.cell0[d], n[d]);
-        }
+        counted = cellsOf(fixedOn, box.cell0, box.cell1);
       }
-      if (moving.share.defined())
+      if (movingShare.defined())
       {
         torch::NoGradGuard  noGrad;
-        const torch::Tensor holds = F::grid_sample(moving.share, grid.detach(), sampleOpts) >= 0.5;
+        const torch::Tensor holds =
+          F::grid_sample(cellsOf(movingShare, m0, m1).to(device), grid.detach(), sampleOpts) >= 0.5;
         counted = counted.defined() ? counted.logical_and(holds) : holds;
       }
       const torch::Tensor rows = drawRows(counted, cellCount);
@@ -2570,7 +2564,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         for (size_t l = 0; l < losses.size(); ++l)
         {
-          const torch::Tensor sampled = F::grid_sample(pick(l, moving.layers[l]), grid, sampleOpts);
+          const torch::Tensor sampled = F::grid_sample(pick(l, movingLayers[l]), grid, sampleOpts);
           const torch::Tensor value = rowsLoss(l, pick(l, fixedLayers[l]), sampled, rows);
           if (raw != nullptr)
           {

@@ -251,12 +251,14 @@ public:
   /** @} */
 
   /** \name Region sampling: an out-of-core run.
-   * With RegionSize > 0 the images are never read whole: every iteration reads RegionsPerIteration boxes of the fixed
-   * grid, each RegionSize voxels of the finest axis a side (rounded to whole cells of the control grid), with their
-   * features, and the region of the moving image they read, through the images' own pipelines (SetRequestedRegion
-   * then Update: an itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them
-   * from its buffer). The boxes are visited in epochs, in an order drawn from Seed; one the fixed mask does not reach
-   * costs its share of the regularizer alone, nothing read. A box's loss is the dense loss restricted to its cells,
+   * With RegionSize > 0 the images are never read whole: one pass reads them by boxes of the fixed grid, each
+   * RegionSize voxels of the finest axis a side (rounded to whole cells of the control grid), with the region of the
+   * moving image each reads, through the images' own pipelines (SetRequestedRegion then Update: an
+   * itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them from its
+   * buffer), and keeps their features pooled to the control grid. The iterations read no image. Where the pooled maps
+   * do not fit the device they stay in host memory and an iteration steps RegionsPerIteration boxes, visited in
+   * epochs in an order drawn from Seed; one the fixed mask does not reach costs its share of the regularizer alone.
+   * A box's loss is the dense loss restricted to its cells,
    * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
    * mean, which the resident route keeps exact), with
    * the regularizer's differences whose first cell lies in it; Adam steps the cells the iteration touched and leaves
@@ -270,7 +272,7 @@ public:
   /** Side of a box, in voxels of the finest axis; 0 (the default) reads the images whole. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
-  /** Boxes read at every iteration when the pooled maps are not resident (default 1); NumberOfIterations then counts
+  /** Boxes stepped at every iteration when the pooled maps are not resident (default 1); NumberOfIterations then counts
    * the visits of every box, so that a cell is stepped as many times as in the dense run. */
   itkSetMacro(RegionsPerIteration, unsigned int);
   itkGetConstMacro(RegionsPerIteration, unsigned int);
@@ -288,9 +290,9 @@ public:
   using TransformType = Transform<double, ImageDimension, ImageDimension>;
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
-  /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it, one pass
-   * over the boxes pools them once and every iteration compares them whole (the dense run on the pooled maps,
-   * reading no image); past it, every iteration reads its RegionsPerIteration boxes. 0 (the default): half the
+  /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it every
+   * iteration compares them whole (the dense run on the pooled maps); past it they stay in host memory and every
+   * iteration brings the cells of its RegionsPerIteration boxes to the device. 0 (the default): half the
    * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
    * which route a run took. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);

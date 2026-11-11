@@ -247,6 +247,18 @@ NarrowTo(torch::Tensor t, const std::vector<int64_t> & lo, const std::vector<int
   return t;
 }
 
+/** The cells [c0, c1) of `whole` ({1, C, cells...}), as a view. */
+inline torch::Tensor
+CellsOf(const torch::Tensor & whole, const std::vector<int64_t> & c0, const std::vector<int64_t> & c1)
+{
+  torch::Tensor view = whole;
+  for (size_t d = 0; d < c0.size(); ++d)
+  {
+    view = view.narrow(2 + static_cast<int64_t>(d), c0[d], c1[d] - c0[d]);
+  }
+  return view;
+}
+
 /** `t` ({1, C, n...}) written over the cells [c0, c1) of `whole` ({1, C, cells...}). */
 inline void
 WriteCells(torch::Tensor & whole, const std::vector<int64_t> & c0, const torch::Tensor & t)

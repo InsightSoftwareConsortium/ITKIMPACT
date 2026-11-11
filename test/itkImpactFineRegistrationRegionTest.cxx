@@ -147,6 +147,12 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "A budget of one byte should leave nothing resident." << std::endl;
     return EXIT_FAILURE;
   }
+  if (boxes->GetBytesRead() != regions->GetBytesRead())
+  {
+    std::cerr << "Box by box, the images should be read once, as with the maps resident: " << boxes->GetBytesRead()
+              << " bytes against " << regions->GetBytesRead() << "." << std::endl;
+    return EXIT_FAILURE;
+  }
   const double boxDifference = MaxDifference(denseField, boxes->GetOutput(), fixed->GetLargestPossibleRegion());
   std::cout << "dense vs box by box (every box): max |difference| = " << boxDifference << " mm" << std::endl;
   if (boxDifference > 1e-3)
