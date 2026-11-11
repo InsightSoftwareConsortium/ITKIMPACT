@@ -1767,11 +1767,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   };
 
   // ---- Masks, read by regions on their own image's grid. ----
-  auto sameGrid = [](const auto * a, const auto * b) { return Impact::SameGrid(a, b); };
   if (m_FixedMask.IsNotNull())
   {
     const_cast<MaskImageType *>(m_FixedMask.GetPointer())->UpdateOutputInformation();
-    if (!sameGrid(m_FixedMask.GetPointer(), m_FixedImage.GetPointer()))
+    if (!Impact::SameGrid(m_FixedMask.GetPointer(), m_FixedImage.GetPointer()))
     {
       itkExceptionMacro("ImpactFineRegistration: with RegionSize the fixed mask is read by regions on the fixed "
                         "image's grid; resample it there first.");
@@ -1780,7 +1779,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   if (m_MovingMask.IsNotNull())
   {
     const_cast<MaskImageType *>(m_MovingMask.GetPointer())->UpdateOutputInformation();
-    if (!sameGrid(m_MovingMask.GetPointer(), m_MovingImage.GetPointer()))
+    if (!Impact::SameGrid(m_MovingMask.GetPointer(), m_MovingImage.GetPointer()))
     {
       itkExceptionMacro("ImpactFineRegistration: with RegionSize the moving mask is read by regions on the moving "
                         "image's grid; resample it there first.");
@@ -1803,7 +1802,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
 
   // ---- The moving transform, and where a fixed voxel reads the moving image. ----
   const bool identityMap =
-    m_MovingTransform.IsNull() && sameGrid(m_MovingImage.GetPointer(), m_FixedImage.GetPointer());
+    m_MovingTransform.IsNull() && Impact::SameGrid(m_MovingImage.GetPointer(), m_FixedImage.GetPointer());
   const bool linearMap = m_MovingTransform.IsNull() ||
                          m_MovingTransform->GetTransformCategory() == TransformType::TransformCategoryEnum::Linear;
   // The moving continuous index (tensor order) at every voxel of `window`, a region of the fixed grid: {1, Dim,
@@ -1890,8 +1889,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                      const std::vector<int64_t> & c1) {
     return Impact::PoolLayerToCells<Dim>(layer, lattice, lowPad, c0, c1, windows, spatial, "ImpactFineRegistration");
   };
-  const auto writeCells = Impact::WriteCells;
-  const auto cellsOf = Impact::CellsOf;
 
   // ---- The feature models and distances. ----
   std::vector<std::unique_ptr<Impact::Loss>> losses;
@@ -2191,7 +2188,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                        lowPad,
                                        box.cell0,
                                        box.cell1) >= 0.5;
-      writeCells(fixedOn, box.cell0, on);
+      Impact::WriteCells(fixedOn, box.cell0, on);
       count = on.sum().template item<int64_t>();
     }
     countByBox[b] = count;
@@ -2374,18 +2371,18 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const std::vector<torch::Tensor> layers = pooledFixed(box.cell0, box.cell1);
       for (size_t l = 0; l < layers.size(); ++l)
       {
-        writeCells(fixedMaps[l], box.cell0, layers[l]);
+        Impact::WriteCells(fixedMaps[l], box.cell0, layers[l]);
       }
     }
     // The moving map everywhere: the displacement reads it past the fixed mask.
     PooledMoving pooled = pooledMoving(box.cell0, box.cell1);
     for (size_t l = 0; l < pooled.layers.size(); ++l)
     {
-      writeCells(movingMaps[l], box.cell0, pooled.layers[l]);
+      Impact::WriteCells(movingMaps[l], box.cell0, pooled.layers[l]);
     }
     if (pooled.share.defined())
     {
-      writeCells(movingShare, box.cell0, pooled.share);
+      Impact::WriteCells(movingShare, box.cell0, pooled.share);
     }
   }
   if (m_ResidentFeatures)
@@ -2484,7 +2481,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     for (const Impact::CellBox & brick : bricks)
     {
       countByBrick.push_back(fixedOn.defined()
-                               ? cellsOf(fixedOn, brick.cell0, brick.cell1).sum().template item<int64_t>()
+                               ? Impact::NarrowTo(fixedOn, brick.cell0, brick.cell1).sum().template item<int64_t>()
                                : cellCountOf(brick));
     }
     // The cells a brick touches: its own, the regularizer's next one, and the smoothing's reach. Smoothed alone,
@@ -2544,20 +2541,20 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       std::vector<torch::Tensor> fixedLayers(losses.size()), movingLayers(losses.size());
       for (size_t l = 0; l < losses.size(); ++l)
       {
-        fixedLayers[l] = cellsOf(fixedMaps[l], box.cell0, box.cell1).to(device);
-        movingLayers[l] = cellsOf(movingMaps[l], m0, m1).to(device);
+        fixedLayers[l] = Impact::NarrowTo(fixedMaps[l], box.cell0, box.cell1).to(device);
+        movingLayers[l] = Impact::NarrowTo(movingMaps[l], m0, m1).to(device);
       }
       const torch::Tensor grid = gridIn(q, m0, m1);
       torch::Tensor       counted;
       if (fixedOn.defined())
       {
-        counted = cellsOf(fixedOn, box.cell0, box.cell1).to(device);
+        counted = Impact::NarrowTo(fixedOn, box.cell0, box.cell1).to(device);
       }
       if (movingShare.defined())
       {
         torch::NoGradGuard  noGrad;
         const torch::Tensor holds =
-          F::grid_sample(cellsOf(movingShare, m0, m1).to(device), grid.detach(), sampleOpts) >= 0.5;
+          F::grid_sample(Impact::NarrowTo(movingShare, m0, m1).to(device), grid.detach(), sampleOpts) >= 0.5;
         counted = counted.defined() ? counted.logical_and(holds) : holds;
       }
       const torch::Tensor rows = drawRows(counted, cellCountOf(box));
@@ -2592,7 +2589,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         for (size_t b = 0; b < bricks.size(); ++b)
         {
           const Impact::CellBox window = touchedBy(bricks[b]);
-          brickLoss(b, smoothControl(cellsOf(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
+          brickLoss(b, smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
         }
         for (size_t l = 0; l < losses.size(); ++l)
         {
@@ -2605,7 +2602,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       for (size_t b = 0; b < bricks.size(); ++b)
       {
         const Impact::CellBox window = touchedBy(bricks[b]);
-        const torch::Tensor   control = cellsOf(theta, window.cell0, window.cell1)
+        const torch::Tensor   control = Impact::NarrowTo(theta, window.cell0, window.cell1)
                                         .to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true)
                                         .requires_grad_(true);
         const torch::Tensor loss = brickLoss(b, smoothControl(control), window.cell0, nullptr);
@@ -2616,14 +2613,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         lossValue += loss.template item<double>();
         if (control.grad().defined())
         {
-          cellsOf(gradient, window.cell0, window.cell1).add_(control.grad().to(torch::kCPU));
+          Impact::NarrowTo(gradient, window.cell0, window.cell1).add_(control.grad().to(torch::kCPU));
         }
       }
       adam.Advance();
       for (const Impact::CellBox & brick : bricks)
       {
         adam.StepCells(theta, gradient, brick.cell0, brick.cell1, device);
-        cellsOf(gradient, brick.cell0, brick.cell1).zero_();
+        Impact::NarrowTo(gradient, brick.cell0, brick.cell1).zero_();
       }
       m_MetricValuesPerIteration.push_back(lossValue);
     }
@@ -2645,7 +2642,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         hi[d] = box.cell1[d] - w0[d];
       }
       Impact::WriteCellsToCellGrid<Dim>(
-        Impact::NarrowTo(smoothControl(cellsOf(theta, w0, w1).to(device)), lo, hi, 2),
+        Impact::NarrowTo(smoothControl(Impact::NarrowTo(theta, w0, w1).to(device)), lo, hi, 2),
         box.cell0,
         cells,
         m_FixedImage.GetPointer(),

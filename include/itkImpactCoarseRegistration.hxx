@@ -969,7 +969,6 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // (the identity without one) by a resampler that asks its input for that region alone; a fixed mask on another
     // grid likewise through the identity. An image already on the grid, with nothing to read it through, is read as
     // it is. ----
-    auto sameGrid = [](const auto * a, const auto * b) { return Impact::SameGrid(a, b); };
     const typename TransformType::ConstPointer identity = IdentityTransform<double, Dim>::New().GetPointer();
     std::vector<ProcessObject::Pointer>       resamplers; // alive for as long as their outputs are read
     auto onFixedGrid = [&](auto image, auto interpolator, const TransformType * transform) {
@@ -987,7 +986,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     const TransformType * movingTransform = m_MovingTransform.IsNotNull() ? m_MovingTransform.GetPointer() : nullptr;
     typename MovingImageType::ConstPointer movingOnFixed = m_MovingImage;
-    if (movingTransform != nullptr || !sameGrid(m_MovingImage.GetPointer(), m_FixedImage.GetPointer()))
+    if (movingTransform != nullptr || !Impact::SameGrid(m_MovingImage.GetPointer(), m_FixedImage.GetPointer()))
     {
       movingOnFixed = onFixedGrid(m_MovingImage.GetPointer(),
                                   LinearInterpolateImageFunction<MovingImageType, double>::New(),
@@ -1000,7 +999,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           return nullptr;
         }
         const_cast<MaskImageType *>(mask)->UpdateOutputInformation();
-        if (transform == nullptr && sameGrid(mask, m_FixedImage.GetPointer()))
+        if (transform == nullptr && Impact::SameGrid(mask, m_FixedImage.GetPointer()))
         {
           return mask;
         }
@@ -1039,8 +1038,6 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                       int64_t                      align = 1) {
       return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, align);
     };
-    const auto narrowTo = Impact::NarrowTo;
-    const auto writeCells = Impact::WriteCells;
 
     // ---- The feature models, run on each region whole at the image's resolution. ----
     size_t layerCount = 1;
@@ -1153,12 +1150,12 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       if (fixedMask.IsNotNull())
       {
         fixedMaskBox = readMask(fixedMask, span);
-        writeCells(fixedShare, box.cell0, toCells(fixedMaskBox, voxels));
+        Impact::WriteCells(fixedShare, box.cell0, toCells(fixedMaskBox, voxels));
       }
       if (movingMask.IsNotNull())
       {
         movingMaskBox = readMask(movingMask, span);
-        writeCells(movingShare, box.cell0, toCells(movingMaskBox, voxels));
+        Impact::WriteCells(movingShare, box.cell0, toCells(movingMaskBox, voxels));
       }
       const std::vector<torch::Tensor> fixedLayers = layersOf(fixedSpan, false);
       const std::vector<torch::Tensor> movingLayers = layersOf(movingSpan, true);
@@ -1187,8 +1184,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           fixedLayer = fixedLayer.index_select(1, subset[l]);
           movingLayer = movingLayer.index_select(1, subset[l]);
         }
-        writeCells(fixedMaps[l], box.cell0, pooledCells(fixedLayer, lattices.fixed[l], fixedMaskBox));
-        writeCells(movingMaps[l], box.cell0, pooledCells(movingLayer, lattices.moving[l], movingMaskBox));
+        Impact::WriteCells(fixedMaps[l], box.cell0, pooledCells(fixedLayer, lattices.fixed[l], fixedMaskBox));
+        Impact::WriteCells(movingMaps[l], box.cell0, pooledCells(movingLayer, lattices.moving[l], movingMaskBox));
       }
     }
 
@@ -1306,9 +1303,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         padding.push_back(halfWidths[a] - (hiM[a] - hi[a]));
       }
       auto shiftWindow = [&](const torch::Tensor & t) {
-        return F::pad(narrowTo(t, loM, hiM, 2), F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
+        return F::pad(Impact::NarrowTo(t, loM, hiM, 2), F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
       };
-      const torch::Tensor  refShare = referenceShare.defined() ? narrowTo(referenceShare, lo, hi, 2) : referenceShare;
+      const torch::Tensor  refShare = referenceShare.defined() ? Impact::NarrowTo(referenceShare, lo, hi, 2) : referenceShare;
       const torch::Tensor  paddedShare = shiftShare.defined() ? shiftWindow(shiftShare) : shiftShare;
       std::vector<int64_t> shape{ L };
       for (unsigned int d = 0; d < Dim; ++d)
@@ -1324,7 +1321,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         }
         Impact::AccumulateCoarseCostPadded<Dim>(cost,
                                                 *distances[l],
-                                                narrowTo(reference[l], lo, hi, 2),
+                                                Impact::NarrowTo(reference[l], lo, hi, 2),
                                                 shiftWindow(toShift[l]),
                                                 halfWidths,
                                                 only >= 0 ? 1.0 : weights[l],
@@ -1334,7 +1331,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       if (masked)
       {
         support = Impact::CoarseMaskSupportPadded<Dim>(
-          refShare, paddedShare, halfWidths, narrowTo(reference[0], lo, hi, 2).sizes(), L);
+          refShare, paddedShare, halfWidths, Impact::NarrowTo(reference[0], lo, hi, 2).sizes(), L);
         cost = Impact::FillCoarseCostWithoutData(cost, support);
       }
       for (unsigned int d = 0; d < Dim; ++d)
@@ -1400,7 +1397,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         {
           torch::Tensor       support;
           const torch::Tensor cost = costOf(reference, toShift, referenceShare, shiftShare, box, -1, support);
-          torch::Tensor       view = narrowTo(argmin, box.cell0, box.cell1, 0);
+          torch::Tensor       view = Impact::NarrowTo(argmin, box.cell0, box.cell1, 0);
           if (disp == nullptr)
           {
             torch::Tensor best = torch::argmin(cost, 0);
@@ -1412,7 +1409,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             continue;
           }
           // Tiled over the box's first axis so the (L x box) penalty transient stays bounded, as the dense run.
-          const torch::Tensor dispBox = narrowTo(disp->squeeze(0), box.cell0, box.cell1, 1);
+          const torch::Tensor dispBox = Impact::NarrowTo(disp->squeeze(0), box.cell0, box.cell1, 1);
           for (int64_t i = 0; i < dispBox.size(1); ++i)
           {
             const torch::Tensor dvi = dispBox.narrow(1, i, 1);

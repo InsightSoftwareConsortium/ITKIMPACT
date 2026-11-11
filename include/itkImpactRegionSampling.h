@@ -219,27 +219,16 @@ CellSpan(const std::vector<int64_t> &     c0,
   return TRegion(start, size);
 }
 
-/** `t` narrowed to [lo, hi) on each spatial axis, the first of them at `firstAxis`. */
+/** `t` narrowed to [lo, hi) on each spatial axis, the first of them at `firstAxis`: the cells [lo, hi) of a map
+ * ({1, C, cells...}), as a view. */
 inline torch::Tensor
-NarrowTo(torch::Tensor t, const std::vector<int64_t> & lo, const std::vector<int64_t> & hi, int64_t firstAxis)
+NarrowTo(torch::Tensor t, const std::vector<int64_t> & lo, const std::vector<int64_t> & hi, int64_t firstAxis = 2)
 {
   for (size_t d = 0; d < lo.size(); ++d)
   {
     t = t.narrow(firstAxis + static_cast<int64_t>(d), lo[d], hi[d] - lo[d]);
   }
   return t;
-}
-
-/** The cells [c0, c1) of `whole` ({1, C, cells...}), as a view. */
-inline torch::Tensor
-CellsOf(const torch::Tensor & whole, const std::vector<int64_t> & c0, const std::vector<int64_t> & c1)
-{
-  torch::Tensor view = whole;
-  for (size_t d = 0; d < c0.size(); ++d)
-  {
-    view = view.narrow(2 + static_cast<int64_t>(d), c0[d], c1[d] - c0[d]);
-  }
-  return view;
 }
 
 /** `t` ({1, C, n...}) written over the cells [c0, c1) of `whole` ({1, C, cells...}). */
@@ -697,7 +686,7 @@ struct CellAdam
   {
     torch::NoGradGuard noGrad;
     auto               onDevice = [&](const torch::Tensor & whole) { // a copy, never the mapped cells themselves
-      return CellsOf(whole, c0, c1).to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true);
+      return NarrowTo(whole, c0, c1).to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true);
     };
     const torch::Tensor g = onDevice(gradient);
     const torch::Tensor average = onDevice(exponentialAverage).mul_(beta1).add_(g, 1.0 - beta1);
