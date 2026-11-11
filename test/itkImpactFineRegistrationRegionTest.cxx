@@ -27,6 +27,7 @@
 #include "itkImageRegionIteratorWithIndex.h"
 #include "itkTestingMacros.h"
 #include "itkTranslationTransform.h"
+#include "itkVectorLinearInterpolateImageFunction.h"
 
 #include <cmath>
 #include <string>
@@ -370,6 +371,71 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     if (!(compensated < 0.05 * raw))
     {
       std::cerr << "The moving transform did not bring the moving image onto the fixed one." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  // 6. An initial field on a coarser grid starts the control grid as its dense field starts the whole-image run.
+  {
+    auto                  coarse = FieldType::New();
+    FieldType::RegionType coarseRegion;
+    coarseRegion.SetSize({ { 8, 7, 6 } });
+    coarse->SetRegions(coarseRegion);
+    FieldType::SpacingType coarseSpacing;
+    coarseSpacing.Fill(6.0);
+    coarse->SetSpacing(coarseSpacing);
+    FieldType::PointType coarseOrigin;
+    coarseOrigin.Fill(2.5);
+    coarse->SetOrigin(coarseOrigin);
+    coarse->Allocate();
+    itk::ImageRegionIteratorWithIndex<FieldType> cell(coarse, coarseRegion);
+    for (cell.GoToBegin(); !cell.IsAtEnd(); ++cell)
+    {
+      const auto            index = cell.GetIndex();
+      FieldType::PixelType  value;
+      value[0] = static_cast<float>(2.0 * std::sin(index[0] / 1.3));
+      value[1] = static_cast<float>(2.0 * std::cos(index[1] / 1.7));
+      value[2] = static_cast<float>(std::sin((index[0] + index[2]) / 1.1));
+      cell.Set(value);
+    }
+    auto interpolator = itk::VectorLinearInterpolateImageFunction<FieldType, double>::New();
+    interpolator->SetInputImage(coarse);
+    auto resized = FieldType::New();
+    resized->SetRegions(fixed->GetLargestPossibleRegion());
+    resized->Allocate();
+    itk::ImageRegionIteratorWithIndex<FieldType> voxel(resized, resized->GetLargestPossibleRegion());
+    for (voxel.GoToBegin(); !voxel.IsAtEnd(); ++voxel)
+    {
+      FieldType::PointType point;
+      resized->TransformIndexToPhysicalPoint(voxel.GetIndex(), point);
+      const auto           value = interpolator->Evaluate(point);
+      FieldType::PixelType pixel;
+      for (unsigned int c = 0; c < 3; ++c)
+      {
+        pixel[c] = static_cast<float>(value[c]);
+      }
+      voxel.Set(pixel);
+    }
+    auto whole = FineType::New();
+    whole->SetFixedImage(fixed);
+    whole->SetMovingImage(moving);
+    whole->SetInitialDisplacementField(resized);
+    Configure(whole, 0);
+    ITK_TRY_EXPECT_NO_EXCEPTION(whole->Update());
+    auto byRegions = FineType::New();
+    byRegions->SetFixedImage(fixed);
+    byRegions->SetMovingImage(moving);
+    byRegions->SetInitialDisplacementField(coarse);
+    Configure(byRegions, 0);
+    byRegions->SetRegionSize(16);
+    ITK_TRY_EXPECT_NO_EXCEPTION(byRegions->Update());
+    const double difference =
+      MaxDifference(byRegions->GetOutput(), whole->GetOutput(), fixed->GetLargestPossibleRegion());
+    std::cout << "initial field on a coarser grid, by regions against its dense field whole: max " << difference
+              << std::endl;
+    if (!(difference < 1e-4))
+    {
+      std::cerr << "An initial field on a coarser grid is not read as its dense field." << std::endl;
       return EXIT_FAILURE;
     }
   }

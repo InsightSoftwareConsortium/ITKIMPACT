@@ -268,7 +268,8 @@ public:
    * the others as they are. Visiting every box at every iteration reproduces the whole-image run, so the schedule is
    * the only approximation. Static mode, point-wise distances, feature layers at the image's resolution (MIND); the
    * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
-   * displacement field may lie on any grid: it is read at the control points. The output is produced by region:
+   * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
+   * as the whole-image run resizes its dense field. The output is produced by region:
    * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
    * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. */
   /** @{ */

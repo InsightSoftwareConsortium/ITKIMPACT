@@ -2262,27 +2262,54 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const auto &       direction = m_FixedImage->GetDirection();
     for (int64_t flat = 0; flat < cellCountTotal; ++flat)
     {
-      int64_t                      rest = flat;
-      ContinuousIndex<double, Dim> fixedIndex;
+      // Resizing the dense field to the control grid blends, along each axis, the two voxels around the cell's
+      // centre. The field is read at those voxels: one given on a coarser grid is then its dense field, resized.
+      int64_t                     rest = flat;
+      std::array<int64_t, Dim>    below{};
+      std::array<double, Dim>     share{};
       for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
       {
         const int64_t c = rest % cells[d];
         rest /= cells[d];
-        // The cell's centre among the voxels, where resizing the field to the control grid reads it.
-        fixedIndex[Dim - 1 - d] = std::clamp((static_cast<double>(c) + 0.5) * static_cast<double>(spatial[d]) /
-                                                 static_cast<double>(cells[d]) -
-                                               0.5,
-                                             0.0,
-                                             static_cast<double>(spatial[d] - 1));
-        fixedIndex[Dim - 1 - d] += static_cast<double>(fixedRegion.GetIndex()[Dim - 1 - d]);
+        const double centre = std::max(
+          (static_cast<double>(c) + 0.5) * static_cast<double>(spatial[d]) / static_cast<double>(cells[d]) - 0.5, 0.0);
+        below[Dim - 1 - d] = std::min(static_cast<int64_t>(centre), spatial[d] - 1);
+        share[Dim - 1 - d] = centre - static_cast<double>(below[Dim - 1 - d]);
       }
-      typename FixedImageType::PointType point;
-      m_FixedImage->TransformContinuousIndexToPhysicalPoint(fixedIndex, point);
-      if (!interpolator->IsInsideBuffer(point))
+      Vector<double, Dim> u; // millimetres, ITK order
+      u.Fill(0.0);
+      bool inside = true;
+      for (unsigned int corner = 0; inside && corner < (1u << Dim); ++corner)
+      {
+        double                          weight = 1.0;
+        typename FixedImageType::IndexType voxel;
+        for (unsigned int a = 0; a < Dim; ++a)
+        {
+          const bool above = (corner >> a) & 1u;
+          weight *= above ? share[a] : 1.0 - share[a];
+          voxel[a] = fixedRegion.GetIndex()[a] +
+                     std::min(below[a] + (above ? 1 : 0), static_cast<int64_t>(fixedRegion.GetSize()[a]) - 1);
+        }
+        if (weight == 0.0)
+        {
+          continue;
+        }
+        typename FixedImageType::PointType point;
+        m_FixedImage->TransformIndexToPhysicalPoint(voxel, point);
+        inside = interpolator->IsInsideBuffer(point);
+        if (inside)
+        {
+          const auto value = interpolator->Evaluate(point);
+          for (unsigned int r = 0; r < Dim; ++r)
+          {
+            u[r] += weight * static_cast<double>(value[r]);
+          }
+        }
+      }
+      if (!inside)
       {
         continue;
       }
-      const auto u = interpolator->Evaluate(point); // millimetres, ITK order
       for (unsigned int d = 0; d < Dim; ++d)
       {
         const unsigned int a = Dim - 1 - d;
