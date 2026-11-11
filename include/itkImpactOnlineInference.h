@@ -406,11 +406,18 @@ OnlineBackpropagate(const OnlineSettings &                                      
     for (size_t k = 0; k < layers.size(); ++k)
     {
       torch::Tensor       features = layers[k].detach().to(torch::kCPU);
-      const torch::Tensor seed = modulator(jacobians.size(), features).to(settings.device).to(layers[k].dtype());
+      const torch::Tensor modulated = modulator(jacobians.size(), features);
+      // A global loss's d(loss)/d(feature) shrinks with the number of points, and a half-precision model would
+      // round it to zero. The backward pass is linear in its seed: it is given the seed scaled to a largest
+      // magnitude near one, by a power of two, which the result is divided by.
+      const double        peak = modulated.numel() > 0 ? modulated.abs().max().item<double>() : 0.0;
+      const double        scale = peak > 0.0 && std::isfinite(peak) ? std::exp2(-std::ceil(std::log2(peak))) : 1.0;
+      const torch::Tensor seed = (modulated * scale).to(settings.device).to(layers[k].dtype());
       const torch::Tensor gradient =
         torch::autograd::grad({ layers[k] }, { patches }, { seed }, k + 1 < layers.size(), false)[0];
       // d(.)/d(moving coordinate), [B, 1, MovingDim], and then d(.)/d(parameter), [B, 1, P].
-      const torch::Tensor coordinate = torch::bmm(gradient.flatten(1).unsqueeze(1).to(torch::kFloat32), patchGradients);
+      const torch::Tensor coordinate =
+        torch::bmm(gradient.flatten(1).unsqueeze(1).to(torch::kFloat32), patchGradients) / scale;
       jacobians.push_back(torch::bmm(coordinate.to(torch::kCPU), batch.transformJacobian));
     }
   }
