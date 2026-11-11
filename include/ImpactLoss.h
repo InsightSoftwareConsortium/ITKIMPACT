@@ -587,10 +587,11 @@ public:
     this->m_sff += fixedSquare;
     this->m_smm += movingSquare;
     const torch::Tensor denominator = fixedSquare + movingSquare;
-    // d(2 p / D)/dm = 2 (f D - 2 p m) / D^2, for each point and channel; the loss is 1 minus its mean over channels.
+    // d(2 p / D)/dm = 2 (f - dice m) / D, for each point and channel; the loss is 1 minus its mean over channels.
+    // D is never squared: in float32 its square reaches zero while D has not.
     const torch::Tensor empty = denominator == 0;
     const torch::Tensor safe = torch::where(empty, 1.0, denominator);
-    const torch::Tensor grad = -2.0 * (fixedOutput * safe - 2.0 * product * movingOutput) / (safe * safe) /
+    const torch::Tensor grad = -2.0 * (fixedOutput - DiceOf(product, denominator) * movingOutput) / safe /
                                static_cast<double>(fixedOutput.size(1));
     return torch::where(empty, 0.0, grad);
   }
@@ -620,12 +621,13 @@ public:
     {
       return this->m_derivative.to(torch::kCPU);
     }
-    // d(2 p / D)/dp = 2 (sfdm D - p 2 smdm) / D^2 per channel; the loss is 1 minus its mean over channels.
+    // d(2 p / D)/dp = 2 (sfdm - dice smdm) / D per channel; the loss is 1 minus its mean over channels.
+    // D is never squared: in float32 its square reaches zero while D has not.
     const torch::Tensor denominator = this->m_sff + this->m_smm;
     const torch::Tensor empty = (denominator == 0).unsqueeze(-1);
     const torch::Tensor safe = torch::where(denominator == 0, 1.0, denominator).unsqueeze(-1);
     const torch::Tensor dice =
-      2.0 * (this->m_sfdm * safe - 2.0 * this->m_sfm.unsqueeze(-1) * this->m_smdm) / (safe * safe);
+      2.0 * (this->m_sfdm - DiceOf(this->m_sfm, denominator).unsqueeze(-1) * this->m_smdm) / safe;
     return (-torch::where(empty, 0.0, dice).mean(0)).to(torch::kCPU);
   }
 
