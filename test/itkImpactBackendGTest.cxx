@@ -2963,6 +2963,14 @@ TEST(ImpactTorchAdam, ZeroIterationIdentity)
 
 // Recover a known translation from raw-intensity MSE, including the direction-rotated
 // physical displacement under an oblique/anisotropic geometry.
+// The fine stage keeps ConvexAdam's displacement scale, (n - 1) / 2 for n control points per axis, on a grid
+// sampled between voxel centres: a translation of t comes back as t (n - 1) / n.
+static itk::Vector<double, 3>
+AdamStageField(itk::Vector<double, 3> displacement, unsigned int controlPoints)
+{
+  return displacement * (static_cast<double>(controlPoints - 1) / controlPoints);
+}
+
 TEST(ImpactTorchAdam, TranslationRecoveryIntensity)
 {
   const double             tx = 1.5, ty = -2.0, tz = 1.0;
@@ -3009,7 +3017,7 @@ TEST(ImpactTorchAdam, TranslationRecoveryIntensity)
         v += direction[r][c] * spacing[c] * ((c == 0) ? tx : (c == 1) ? ty : tz);
       expected[r] = v;
     }
-    const auto   err = InteriorMeanError(filter->GetDisplacementField(), expected, 6);
+    const auto   err = InteriorMeanError(filter->GetDisplacementField(), AdamStageField(expected, 20), 6);
     const auto & hist = filter->GetMetricValuesPerIteration();
 
     EXPECT_LT(hist.back(), 0.1 * hist.front()) << "loss should drop (variant " << variant << ")";
@@ -3741,7 +3749,7 @@ TEST(ImpactTorchAdam, LowResControlGrid)
   expected[0] = tx;
   expected[1] = ty;
   expected[2] = tz;
-  const auto   err = InteriorMeanError(filter->GetDisplacementField(), expected, 6);
+  const auto   err = InteriorMeanError(filter->GetDisplacementField(), AdamStageField(expected, 12), 6);
   const auto & hist = filter->GetMetricValuesPerIteration();
 
   EXPECT_LT(hist.back(), 0.1 * hist.front()) << "loss should drop on the low-res control grid";
@@ -3827,7 +3835,7 @@ TEST(ImpactConvexAdam, CoarseInitThenAdamRefines)
   fine->SetLearningRate(0.1); // warm-started -> small lr converges tight instead of wandering
   fine->SetRegularizationWeight(0.02);
   fine->Update();
-  const auto adamErr = InteriorMeanError(fine->GetDisplacementField(), expected, 8);
+  const auto adamErr = InteriorMeanError(fine->GetDisplacementField(), AdamStageField(expected, 32), 8);
 
   double meanZero = 0, meanCoarse = 0, meanAdam = 0;
   for (unsigned int d = 0; d < 3; ++d)
@@ -3967,8 +3975,8 @@ TEST(ImpactConvexAdam, NormalizedCoarseCostIgnoresTheFeatureRange)
 }
 
 // The coarse cost volume compares each layer with its distance, over the cell window around every coarse voxel --
-// the two 3^3 box passes ConvexAdam smooths its cost with --, for every candidate displacement of the edge-replicated
-// moving features, in a box of its own half-width per axis. Checked for every distance against loops in double
+// the two 3^3 box passes ConvexAdam smooths its cost with --, for every candidate displacement of the moving
+// features, zeros past the image, in a box of its own half-width per axis. Checked for every distance against loops in double
 // precision: a point-wise distance's terms averaged over the window, NCC and LNCC correlated over it from the
 // window's weighted moments.
 TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
@@ -4004,7 +4012,7 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
     return out;
   };
   auto window = [&](const Volume & q) { return box(box(q)); };
-  auto clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
+  auto inside = [](int64_t i, int64_t n) { return i >= 0 && i < n; };
 
   for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
   {
@@ -4017,7 +4025,9 @@ TEST(ImpactConvexAdam, CoarseCostVolumeMatchesABruteForceForEveryDistance)
       // The candidate's offsets, x fastest.
       const int64_t dx = l % sx - halfWidths[2], dy = (l / sx) % sy - halfWidths[1], dz = l / (sx * sy) - halfWidths[0];
       auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
-        return static_cast<double>(M[0][c][clampTo(z + dz, Z)][clampTo(y + dy, Y)][clampTo(x + dx, X)]);
+        return inside(z + dz, Z) && inside(y + dy, Y) && inside(x + dx, X)
+                 ? static_cast<double>(M[0][c][z + dz][y + dy][x + dx])
+                 : 0.0; // past the image the moving features are zeros, as ConvexAdam pads them
       };
       auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
       Volume expected(Z * Y * X, 0.0);
@@ -4125,39 +4135,14 @@ TEST(ImpactConvexAdam, CoarseRecoversATranslationWithEveryDistance)
   }
 }
 
-// ConvexAdam's knobs are counted in voxels of the fixed image's finest axis, s_min, and derived per axis so that they
-// are (nearly) isotropic in millimetres: on an isotropic image every axis keeps the numbers as they are, whatever the
-// spacing; on a 1 x 1 x 3 mm or a 1 x 1 x 2.5 mm image the thick axis takes fewer voxels. All in tensor order (z, y,
-// x).
-TEST(ImpactConvexAdam, KnobsAreCountedInUnitsOfTheFinestVoxelSide)
+// An LNCC window counts the image's voxels: on a map pooled along some axes it shrinks along those alone. Tensor
+// order (z, y, x).
+TEST(ImpactConvexAdam, AnLNCCWindowCountsTheImagesVoxels)
 {
   using Counts = std::vector<int64_t>;
-  for (const double side : { 1.0, 2.0, 0.7 })
-  {
-    const std::vector<double> sides{ side, side, side };
-    EXPECT_EQ(itk::Impact::IsotropicVoxelCounts(sides, 6), (Counts{ 6, 6, 6 })) << side << " mm";
-    EXPECT_EQ(itk::Impact::CaptureHalfWidths(sides, { 6, 6, 6 }, 6, 4), (Counts{ 4, 4, 4 })) << side << " mm";
-    EXPECT_EQ(itk::Impact::IsotropicWindow(sides, { 24, 24, 24 }, { 1, 2, 12, 12, 12 }, 5), (Counts{ 5, 5, 5 }));
-  }
-  ImageType::SpacingType thick;
-  thick[0] = 1.0;
-  thick[1] = 1.0;
-  thick[2] = 3.0;
-  const std::vector<double> sides = itk::Impact::TensorVoxelSides<3>(thick);
-  EXPECT_EQ(sides, (std::vector<double>{ 3.0, 1.0, 1.0 }));
-  const Counts cells = itk::Impact::IsotropicVoxelCounts(sides, 6); // coarse cells of 6 mm
-  EXPECT_EQ(cells, (Counts{ 2, 6, 6 }));
-  EXPECT_EQ(itk::Impact::CaptureHalfWidths(sides, cells, 6, 4), (Counts{ 4, 4, 4 }))
-    << "24 mm each way: 9^3 candidates";
-  EXPECT_EQ(itk::Impact::IsotropicVoxelCounts(sides, 2), (Counts{ 1, 2, 2 })) << "the fine control grid's shrink";
-  const std::vector<double> sides25{ 2.5, 1.0, 1.0 };
-  const Counts              cells25 = itk::Impact::IsotropicVoxelCounts(sides25, 6); // round(2.4) = 2: 5 mm along z
-  EXPECT_EQ(cells25, (Counts{ 2, 6, 6 }));
-  EXPECT_EQ(itk::Impact::CaptureHalfWidths(sides25, cells25, 6, 4), (Counts{ 5, 4, 4 }))
-    << "24 mm: 5 cells of 5 mm along z, 4 of 6 mm in-plane, 11 x 9 x 9 candidates";
-  // The LNCC window, on a map at the image's resolution and on one pooled to the fine grid of shrink (1, 2, 2).
-  EXPECT_EQ(itk::Impact::IsotropicWindow(sides, { 24, 24, 24 }, { 1, 2, 24, 24, 24 }, 5), (Counts{ 1, 5, 5 }));
-  EXPECT_EQ(itk::Impact::IsotropicWindow(sides, { 24, 24, 24 }, { 1, 2, 24, 12, 12 }, 5), (Counts{ 3, 5, 5 }));
+  EXPECT_EQ(itk::Impact::IsotropicWindow({ 24, 24, 24 }, { 1, 2, 24, 24, 24 }, 5), (Counts{ 5, 5, 5 }));
+  EXPECT_EQ(itk::Impact::IsotropicWindow({ 24, 24, 24 }, { 1, 2, 12, 12, 12 }, 5), (Counts{ 5, 5, 5 }));
+  EXPECT_EQ(itk::Impact::IsotropicWindow({ 24, 24, 24 }, { 1, 2, 24, 12, 12 }, 5), (Counts{ 5, 3, 3 }));
 }
 
 // On an isotropic image, the coarse and the fine stage work in voxels whatever the spacing: the same images at 2 mm
@@ -4252,7 +4237,7 @@ TEST(ImpactConvexAdam, AnisotropicSpacingRecoversADisplacementAlongEveryAxis)
   fine->SetLearningRate(0.2);
   fine->SetRegularizationWeight(0.1);
   fine->Update();
-  const auto fineError = InteriorMeanError(fine->GetDisplacementField(), expected, 6);
+  const auto fineError = InteriorMeanError(fine->GetDisplacementField(), AdamStageField(expected, 12), 6);
   for (unsigned int d = 0; d < 3; ++d)
   {
     EXPECT_LT(coarseError[d], 1.5) << "coarse, axis " << d << " (mm)";
@@ -4378,7 +4363,7 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
     return out;
   };
   auto                window = [&](const Volume & q) { return box(box(q)); };
-  auto                clampTo = [](int64_t i, int64_t n) { return std::min<int64_t>(std::max<int64_t>(i, 0), n - 1); };
+  auto                inside = [](int64_t i, int64_t n) { return i >= 0 && i < n; };
   const torch::Tensor support =
     itk::Impact::CoarseMaskSupport<3>(fixedShare, movingShare, halfWidths, fixed.sizes(), L);
   for (const std::string name : { "L1", "L2", "Cosine", "L1Cosine", "Dice", "OrganDice", "NCC", "LNCC" })
@@ -4392,7 +4377,9 @@ TEST(ImpactConvexAdam, MaskedCoarseCostVolumeMatchesABruteForceForEveryDistance)
     {
       const int64_t dx = l % sx - halfWidths[2], dy = (l / sx) % sy - halfWidths[1], dz = l / (sx * sy) - halfWidths[0];
       auto          m = [&](int64_t c, int64_t z, int64_t y, int64_t x) {
-        return static_cast<double>(M[0][c][clampTo(z + dz, Z)][clampTo(y + dy, Y)][clampTo(x + dx, X)]);
+        return inside(z + dz, Z) && inside(y + dy, Y) && inside(x + dx, X)
+                 ? static_cast<double>(M[0][c][z + dz][y + dy][x + dx])
+                 : 0.0; // past the image the moving features are zeros, as ConvexAdam pads them
       };
       auto   f = [&](int64_t c, int64_t z, int64_t y, int64_t x) { return static_cast<double>(F[0][c][z][y][x]); };
       Volume weight(Z * Y * X, 0.0);

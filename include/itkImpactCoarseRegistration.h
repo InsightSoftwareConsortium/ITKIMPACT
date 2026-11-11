@@ -50,7 +50,9 @@ namespace itk
  * global regularization (an increasing-coupling argmin/smoothing schedule) to obtain a smooth
  * coarse field, finally upsampled to full resolution. All heavy computation uses LibTorch. The
  * cost is on raw intensities by default, or on deep features of any configured IMPACT
- * TorchScript model (not tied to MIND specifically).
+ * TorchScript model (not tied to MIND specifically). With the authors' settings (one MIND layer, L2,
+ * GridSpacing 6, DisplacementHalfWidth 4, inverse consistency) on an isotropic pair without masks, the field is
+ * theirs: test/itkImpactConvexAdamParityTest.py compares the two.
  *
  * The output is a geometry-correct itk displacement field on the fixed grid (physical
  * millimetres, ITK x,y,z, fixed->moving), sharing the ImpactFineRegistration convention
@@ -186,21 +188,15 @@ public:
   itkGetConstMacro(Seed, unsigned int);
 
   /** \name Coarse search parameters.
-   * Counted in voxels of the fixed image's finest axis, s_min = min_a s_a, and derived per axis, so that
-   * the cells and the capture range are (nearly) isotropic in millimetres; on an isotropic image every
-   * axis takes the numbers as they are. */
+   * Counted in voxels of the fixed image, the same number along every axis whatever its spacing, as ConvexAdam
+   * counts them. */
   /** @{ */
-  /** Cell size of the coarse grid the cost volume runs on, in voxels of the finest axis: along axis a a
-   * cell spans gs_a = max(1, round(GridSpacing * s_min / s_a)) voxels (avg-pool kernel and stride), a
-   * cell of about GridSpacing * s_min mm. The cost smoothing, the NCC/LNCC window and the displacement
-   * smoothing are counted in cells. Default 4. */
+  /** Cell size of the coarse grid the cost volume runs on, in voxels (avg-pool kernel and stride). The cost
+   * smoothing, the NCC/LNCC window and the displacement smoothing are counted in cells. Default 4. */
   itkSetMacro(GridSpacing, unsigned int);
   itkGetConstMacro(GridSpacing, unsigned int);
-  /** Displacement search half-width, in cells of the finest axis: the capture range is R =
-   * DisplacementHalfWidth * GridSpacing * s_min mm each way, which axis a covers with hw_a = ceil(R /
-   * (gs_a * s_a)) cells, so the candidates are the box prod_a (2 hw_a + 1). The coupling penalty
-   * weighs a move of one cell along axis a by (gs_a * s_a / (GridSpacing * s_min))^2, so that a
-   * distance in millimetres costs the same along every axis. Default 3. */
+  /** Displacement search half-width, in cells: DisplacementHalfWidth * GridSpacing voxels each way along every
+   * axis, (2 DisplacementHalfWidth + 1)^Dim candidates. Default 3. */
   itkSetMacro(DisplacementHalfWidth, unsigned int);
   itkGetConstMacro(DisplacementHalfWidth, unsigned int);
   /** Also solve the backward (moving->fixed) coarse problem and symmetrize the two fields
@@ -214,7 +210,7 @@ public:
 
   /** \name Region sampling: an out-of-core run.
    * With RegionSize > 0 the images are never read whole. One pass over boxes of the fixed grid, each RegionSize
-   * voxels of the finest axis a side (whole cells of the coarse grid), reads each box of the fixed image and of the
+   * voxels a side (whole cells of the coarse grid), reads each box of the fixed image and of the
    * moving image (brought onto the fixed grid through the identity, region by region) with its halo, extracts their
    * features and pools them to the coarse grid, which stays on the device; the cost volume is then built by boxes of
    * that grid, each within CostBoxBytes, never whole, and the coupled-convex iterations and the inverse consistency
@@ -225,7 +221,7 @@ public:
    * GetCoarseGridTransform(). PCA fits its basis on the whole feature map, a model resampling the image to its own
    * voxel size and a layer at another resolution than the image do not line up with the boxes: refused. */
   /** @{ */
-  /** Side of a box, in voxels of the finest axis; 0 (the default) reads the images whole. */
+  /** Side of a box, in voxels; 0 (the default) reads the images whole. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
   /** Voxels read around a box, on every axis, so that its features equal those of the whole image: the receptive

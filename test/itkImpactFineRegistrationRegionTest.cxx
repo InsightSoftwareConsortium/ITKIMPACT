@@ -218,10 +218,11 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   }
   // The control grid is the same map: at a voxel, its transform's displacement is the field's.
   FineType::DisplacementFieldTransformType * control = regions->GetControlGridTransform();
-  if (control->GetDisplacementField()->GetLargestPossibleRegion().GetSize()[0] != 24)
+  if (control->GetDisplacementField()->GetLargestPossibleRegion().GetSize()[0] != 28)
   {
     std::cerr << "The control grid has " << control->GetDisplacementField()->GetLargestPossibleRegion().GetSize()
-              << " cells where 24 x 20 x 16 were expected." << std::endl;
+              << " samples where 28 x 24 x 20 were expected: 24 x 20 x 16 cells, two of border each side."
+              << std::endl;
     return EXIT_FAILURE;
   }
   {

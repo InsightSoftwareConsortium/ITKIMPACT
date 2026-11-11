@@ -53,28 +53,12 @@ namespace itk
 namespace Impact
 {
 
-/** The windows PyTorch's adaptive average pooling takes an axis of `length` voxels into `cells` cells by: cell i
- * covers the voxels [floor(i * length / cells), ceil((i + 1) * length / cells)). Pooling a region of whole cells
- * with these windows gives the same cells as pooling the whole axis. */
+/** The voxels each cell of an axis pools: cell i covers [starts[i], ends[i]). */
 struct PoolWindows
 {
   std::vector<int64_t> starts;
   std::vector<int64_t> ends;
 };
-
-inline PoolWindows
-AdaptivePoolWindows(int64_t length, int64_t cells)
-{
-  PoolWindows windows;
-  windows.starts.resize(static_cast<size_t>(cells));
-  windows.ends.resize(static_cast<size_t>(cells));
-  for (int64_t i = 0; i < cells; ++i)
-  {
-    windows.starts[i] = (i * length) / cells;
-    windows.ends[i] = ((i + 1) * length + cells - 1) / cells;
-  }
-  return windows;
-}
 
 /** `map` ({1, C, spatial...}) averaged over the windows `starts`/`ends` of each tensor axis, given in the map's own
  * voxel indices: {1, C, cells...}. Windows that are one stride wide and contiguous take an average pool, the others

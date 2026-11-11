@@ -140,11 +140,11 @@ CoarseCandidateShift(const torch::Tensor &        padded,
   return shifted;
 }
 
-/** `volume` padded by `halfWidths` on each side of each axis: edge-replicated (features), or with zeros (a mask's
- * share: outside the image no voxel is in the mask). */
+/** `volume` padded with zeros by `halfWidths` on each side of each axis: the moving features as ConvexAdam pads them,
+ * a mask's share because no voxel outside the image is in the mask. */
 template <unsigned int Dim>
 torch::Tensor
-CoarsePad(const torch::Tensor & volume, const std::vector<int64_t> & halfWidths, bool replicate)
+CoarsePad(const torch::Tensor & volume, const std::vector<int64_t> & halfWidths)
 {
   namespace F = torch::nn::functional;
   std::vector<int64_t> padding; // F::pad takes its pairs from the last axis backwards
@@ -153,8 +153,7 @@ CoarsePad(const torch::Tensor & volume, const std::vector<int64_t> & halfWidths,
     padding.push_back(halfWidths[a]);
     padding.push_back(halfWidths[a]);
   }
-  return replicate ? F::pad(volume, F::PadFuncOptions(padding).mode(torch::kReplicate))
-                   : F::pad(volume, F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
+  return F::pad(volume, F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
 }
 
 /** The weight of each coarse cell for one candidate: the fixed cell's share of the fixed mask times the share of the
@@ -173,7 +172,7 @@ CoarseMaskWeight(const torch::Tensor & fixedShare, const torch::Tensor & shifted
 /** Add `weight` times one feature layer's coarse cost volume to `cost` ({L, coarse...}): for each of the L =
  * prod_a (2 halfWidths[a] + 1) candidate displacements -- `halfWidths` per tensor axis, in coarse voxels, the last
  * tensor axis (ITK x) running fastest, the order of the solver's displacement table --, the CoarseLayerCost of `moving`
- * shifted by it (edge-replicated) against `fixed`, both {1, C, coarse...}. With masks, `fixedShare` and `movingShare`
+ * shifted by it (zeros past the image) against `fixed`, both {1, C, coarse...}. With masks, `fixedShare` and `movingShare`
  * ({1, 1, coarse...}, either undefined when its mask is absent) weigh the cells, the moving one shifted with the
  * features (zero outside the image). */
 /** AccumulateCoarseCost with the moving features and share already padded by the half-widths (`padded`,
@@ -220,11 +219,11 @@ AccumulateCoarseCost(torch::Tensor &              cost,
   AccumulateCoarseCostPadded<Dim>(cost,
                                   distance,
                                   fixed,
-                                  CoarsePad<Dim>(moving, halfWidths, true),
+                                  CoarsePad<Dim>(moving, halfWidths),
                                   halfWidths,
                                   weight,
                                   fixedShare,
-                                  movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths, false) : movingShare);
+                                  movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths) : movingShare);
 }
 
 /** Where each candidate leaves the cell window around each coarse voxel some mask weight, {L, coarse...} bool: the
@@ -262,7 +261,7 @@ CoarseMaskSupport(const torch::Tensor &        fixedShare,
 {
   return CoarseMaskSupportPadded<Dim>(
     fixedShare,
-    movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths, false) : movingShare,
+    movingShare.defined() ? CoarsePad<Dim>(movingShare, halfWidths) : movingShare,
     halfWidths,
     coarse,
     candidates);
@@ -277,53 +276,6 @@ FillCoarseCostWithoutData(const torch::Tensor & cost, const torch::Tensor & supp
   const torch::Tensor worst =
     torch::where(support, cost, -std::numeric_limits<float>::infinity()).amax(0, /*keepdim=*/true);
   return torch::where(support, cost, torch::where(support.any(0, /*keepdim=*/true), worst, 0.0));
-}
-
-/** The coarse field ({1, Dim, coarse...}, in voxels of the fixed grid, one sample per cell at the cell's centre) as a
- * displacement image on its own grid, padded by two cells of replicated border each side: linear interpolation on
- * it gives at every fixed voxel what the dense run's trilinear upsampling (align_corners=false, the tail voxels
- * replicated) gives. */
-template <unsigned int Dim, typename TFixedImage>
-typename Image<Vector<float, Dim>, Dim>::Pointer
-BuildCoarseGrid(const torch::Tensor & voxelField, const TFixedImage * fixed, const std::vector<int64_t> & cellVoxels)
-{
-  namespace F = torch::nn::functional;
-  using FieldType = Image<Vector<float, Dim>, Dim>;
-  constexpr int64_t    pad = 2;
-  std::vector<int64_t> padding(2 * Dim, pad);
-  const torch::Tensor  padded = F::pad(voxelField, F::PadFuncOptions(padding).mode(torch::kReplicate));
-  auto                            grid = FieldType::New();
-  typename FieldType::SizeType    size;
-  typename FieldType::SpacingType spacing;
-  typename FieldType::PointType   origin;
-  std::vector<double>             shift(Dim); // the first sample's position, in voxels of each ITK axis
-  for (unsigned int a = 0; a < Dim; ++a)
-  {
-    const int64_t cells = cellVoxels[Dim - 1 - a];
-    size[a] = static_cast<SizeValueType>(padded.size(2 + static_cast<int64_t>(Dim - 1 - a)));
-    spacing[a] = fixed->GetSpacing()[a] * static_cast<double>(cells);
-    shift[a] = (static_cast<double>(cells) - 1.0) / 2.0 - static_cast<double>(pad * cells);
-  }
-  typename FieldType::PointType first; // the first voxel of the region, whatever its index
-  fixed->TransformIndexToPhysicalPoint(fixed->GetLargestPossibleRegion().GetIndex(), first);
-  for (unsigned int r = 0; r < Dim; ++r)
-  {
-    double offset = 0.0;
-    for (unsigned int c = 0; c < Dim; ++c)
-    {
-      offset += fixed->GetDirection()[r][c] * fixed->GetSpacing()[c] * shift[c];
-    }
-    origin[r] = first[r] + offset;
-  }
-  typename FieldType::RegionType region;
-  region.SetSize(size);
-  grid->SetRegions(region);
-  grid->SetSpacing(spacing);
-  grid->SetOrigin(origin);
-  grid->SetDirection(fixed->GetDirection());
-  grid->Allocate();
-  WriteVoxelFieldToDisplacement<Dim>(padded, fixed->GetSpacing(), fixed->GetDirection(), grid);
-  return grid;
 }
 
 } // namespace Impact
@@ -535,23 +487,16 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       }
     }
 
-    // ---- The search, in units of the fixed image's finest voxel side s_min, derived per axis so that it is (nearly)
-    // isotropic in millimetres: a cell of gs_a = max(1, round(GridSpacing * s_min / s_a)) voxels along axis a, and
-    // along it hw_a = ceil(R / (gs_a * s_a)) cells each way, R = DisplacementHalfWidth * GridSpacing * s_min mm being
-    // the capture range. An isotropic image keeps GridSpacing and DisplacementHalfWidth on every axis. ----
+    // ---- The search, in voxels on every axis whatever its spacing, as ConvexAdam's: cells of GridSpacing voxels,
+    // DisplacementHalfWidth cells each way. ----
     const int64_t              gs = static_cast<int64_t>(m_GridSpacing);
     const int64_t              hw = static_cast<int64_t>(m_DisplacementHalfWidth);
-    const std::vector<double>  voxelSide = Impact::TensorVoxelSides<ImageDimension>(m_FixedImage->GetSpacing());
-    const double               finest = *std::min_element(voxelSide.begin(), voxelSide.end());
-    const std::vector<int64_t> cellVoxels = Impact::IsotropicVoxelCounts(voxelSide, static_cast<double>(gs)); // gs_a
-    const std::vector<int64_t> halfWidths = Impact::CaptureHalfWidths(voxelSide, cellVoxels, gs, hw);         // hw_a
-    std::vector<double> cellWeight(ImageDimension); // (cell_a / cell_ref)^2, what a cell of axis a costs to cross
-    int64_t             L = 1;
+    const std::vector<int64_t> cellVoxels(ImageDimension, gs);
+    const std::vector<int64_t> halfWidths(ImageDimension, hw);
+    int64_t                    L = 1;
     for (unsigned int a = 0; a < ImageDimension; ++a)
     {
-      const double ratio = (static_cast<double>(cellVoxels[a]) * voxelSide[a]) / (static_cast<double>(gs) * finest);
-      cellWeight[a] = ratio * ratio;
-      L *= 2 * halfWidths[a] + 1;
+      L *= 2 * hw + 1;
     }
 
     // Dimension-generic avg-pool / replicate-pad / interpolate helpers (2D or 3D).
@@ -719,12 +664,6 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       dmShape.push_back(1);
     }
-    // The coupling penalty weighs each axis's difference in cells by the cell's side in millimetres against cell_ref =
-    // GridSpacing * s_min, so that the same distance costs the same along every axis: {Dim, 1, ..., 1}.
-    std::vector<int64_t> weightShape(ImageDimension + 1, 1);
-    weightShape[0] = static_cast<int64_t>(ImageDimension);
-    const torch::Tensor penaltyWeight =
-      torch::tensor(cellWeight, torch::kFloat64).to(torch::kFloat32).view(weightShape).to(device);
 
     // Solve the coarse problem for one (reference, to-shift) pair of cost sources: discrete cost volume over the dense
     // window (each layer's distance, weighed) + coupled-convex regularization -> {1, Dim, coarse...}.
@@ -811,7 +750,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
         for (int64_t i = 0; i < coarse[0]; ++i)
         {
           torch::Tensor dvi = dispC.narrow(1, i, 1);
-          torch::Tensor penalty = ((dm - dvi).pow(2) * penaltyWeight).sum(0);
+          torch::Tensor penalty = (dm - dvi).pow(2).sum(0);
           torch::Tensor coupled = ssd.select(1, i) + coeff * penalty;
           argmin.select(0, i).copy_(torch::argmin(coupled, 0));
         }
@@ -859,7 +798,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       {
         gridSize.push_back(c);
       }
-      torch::Tensor        idGrid = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true);
+      torch::Tensor        idGrid = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/false);
       std::vector<int64_t> toChannelFirst;
       toChannelFirst.push_back(0);
       toChannelFirst.push_back(idGrid.dim() - 1);
@@ -877,7 +816,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       }
       toChannelLast.push_back(1);
       const auto icSampleOpts =
-        F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kBorder).align_corners(true);
+        F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(false);
 
       // Symmetric fixed point: f1 <- 0.5 (f1 - f2 pulled back through id+f1), and vice versa.
       for (int it = 0; it < 15; ++it)
@@ -891,45 +830,20 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::GenerateData()
       disp = f1.flip(1) * scaleT;
     }
 
-    // ---- Upsample to full resolution; coarse-voxel -> full-resolution voxel units. ----
-    // Interpolate with an EXACT gs_a stretch (target coarse*gs_a) so the displacement-magnitude scale (gs_a)
-    // matches the positional stretch. Otherwise, when a dimension is not divisible by gs_a, interpolate
-    // would stretch by full/coarse != gs_a and shear the field toward the high-index border. Tail voxels
-    // the coarse avg-pool dropped are then edge-padded.
-    std::vector<int64_t> exactSize(ImageDimension);
-    bool                 needPad = false;
-    for (unsigned int d = 0; d < ImageDimension; ++d)
-    {
-      exactSize[d] = coarse[d] * cellVoxels[d];
-      if (exactSize[d] != spatial[d])
-      {
-        needPad = true;
-      }
-    }
+    // ---- Upsample to full resolution, as ConvexAdam does: cells to voxels, then straight to the image's size, which
+    // stretches the cells over the tail a size that is no multiple of the spacing leaves. ----
     std::vector<int64_t> componentShape(ImageDimension + 2, 1); // {1, Dim, 1, ...}: one factor per component
     componentShape[1] = static_cast<int64_t>(ImageDimension);
     const torch::Tensor cellsToVoxels = torch::tensor(cellVoxels, torch::kLong).to(disp.options()).view(componentShape);
-    m_CoarseGrid =
-      Impact::BuildCoarseGrid<ImageDimension>(disp * cellsToVoxels, m_FixedImage.GetPointer(), cellVoxels);
+    m_CoarseGrid = Impact::BuildCellGrid<ImageDimension>(disp * cellsToVoxels, m_FixedImage.GetPointer());
     m_CoarseGridTransform = nullptr;
-    torch::Tensor       dispFull;
+    torch::Tensor dispFull; // {1, Dim, spatial...}, full-res voxel units, z,y,x
     if constexpr (ImageDimension == 3)
       dispFull = F::interpolate(
-        disp * cellsToVoxels, F::InterpolateFuncOptions().size(exactSize).mode(torch::kTrilinear).align_corners(false));
+        disp * cellsToVoxels, F::InterpolateFuncOptions().size(spatial).mode(torch::kTrilinear).align_corners(false));
     else
       dispFull = F::interpolate(
-        disp * cellsToVoxels, F::InterpolateFuncOptions().size(exactSize).mode(torch::kBilinear).align_corners(false));
-    if (needPad)
-    {
-      // F::pad pads from the last (x) axis inward; high side only (coarse*gs <= full), replicate.
-      std::vector<int64_t> pad;
-      for (int a = static_cast<int>(ImageDimension) - 1; a >= 0; --a)
-      {
-        pad.push_back(0);
-        pad.push_back(spatial[a] - exactSize[a]);
-      }
-      dispFull = F::pad(dispFull, F::PadFuncOptions(pad).mode(torch::kReplicate));
-    } // dispFull: {1, Dim, spatial...}, full-res voxel units, z,y,x
+        disp * cellsToVoxels, F::InterpolateFuncOptions().size(spatial).mode(torch::kBilinear).align_corners(false));
 
     // ---- Geometry-correct writeback (shared convention). ----
     DisplacementFieldType * output = this->GetOutput();
@@ -1057,17 +971,12 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     const int64_t              gs = static_cast<int64_t>(m_GridSpacing);
     const int64_t              hw = static_cast<int64_t>(m_DisplacementHalfWidth);
-    const std::vector<double>  voxelSide = Impact::TensorVoxelSides<Dim>(m_FixedImage->GetSpacing());
-    const double               finest = *std::min_element(voxelSide.begin(), voxelSide.end());
-    const std::vector<int64_t> cellVoxels = Impact::IsotropicVoxelCounts(voxelSide, static_cast<double>(gs));
-    const std::vector<int64_t> halfWidths = Impact::CaptureHalfWidths(voxelSide, cellVoxels, gs, hw);
-    std::vector<double>        cellWeight(Dim); // (cell_a / cell_ref)^2, what a cell of axis a costs to cross
+    const std::vector<int64_t> cellVoxels(Dim, gs);
+    const std::vector<int64_t> halfWidths(Dim, hw);
     int64_t                    L = 1;
     for (unsigned int a = 0; a < Dim; ++a)
     {
-      const double ratio = (static_cast<double>(cellVoxels[a]) * voxelSide[a]) / (static_cast<double>(gs) * finest);
-      cellWeight[a] = ratio * ratio;
-      L *= 2 * halfWidths[a] + 1;
+      L *= 2 * hw + 1;
     }
     std::vector<int64_t> coarse(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
@@ -1078,9 +987,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         itkExceptionMacro("ImpactCoarseRegistration: GridSpacing too large for the image size.");
       }
     }
-    // The boxes of cells read at a time: RegionSize voxels of the finest axis a side, whole cells.
-    const std::vector<int64_t> regionVoxels =
-      Impact::IsotropicVoxelCounts(voxelSide, static_cast<double>(m_RegionSize));
+    // The boxes of cells read at a time: RegionSize voxels a side, whole cells.
+    const std::vector<int64_t> regionVoxels(Dim, static_cast<int64_t>(m_RegionSize));
     std::vector<int64_t> perBox(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
@@ -1404,10 +1312,6 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       dmShape.push_back(1);
     }
-    std::vector<int64_t> weightShape(Dim + 1, 1);
-    weightShape[0] = static_cast<int64_t>(Dim);
-    const torch::Tensor penaltyWeight =
-      torch::tensor(cellWeight, torch::kFloat64).to(torch::kFloat32).view(weightShape).to(device);
     int64_t zeroCandidate = 0; // the candidate of zero displacement, in the table's order (x fastest)
     for (unsigned int a = 0; a < Dim; ++a)
     {
@@ -1448,13 +1352,11 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         padding.push_back(halfWidths[a] - (lo[a] - loM[a]));
         padding.push_back(halfWidths[a] - (hiM[a] - hi[a]));
       }
-      auto shiftWindow = [&](const torch::Tensor & t, bool replicate) {
-        const torch::Tensor w = narrowTo(t, loM, hiM, 2);
-        return replicate ? F::pad(w, F::PadFuncOptions(padding).mode(torch::kReplicate))
-                         : F::pad(w, F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
+      auto shiftWindow = [&](const torch::Tensor & t) {
+        return F::pad(narrowTo(t, loM, hiM, 2), F::PadFuncOptions(padding).mode(torch::kConstant).value(0.0));
       };
       const torch::Tensor  refShare = referenceShare.defined() ? narrowTo(referenceShare, lo, hi, 2) : referenceShare;
-      const torch::Tensor  paddedShare = shiftShare.defined() ? shiftWindow(shiftShare, false) : shiftShare;
+      const torch::Tensor  paddedShare = shiftShare.defined() ? shiftWindow(shiftShare) : shiftShare;
       std::vector<int64_t> shape{ L };
       for (unsigned int d = 0; d < Dim; ++d)
       {
@@ -1470,7 +1372,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         Impact::AccumulateCoarseCostPadded<Dim>(cost,
                                                 *distances[l],
                                                 narrowTo(reference[l], lo, hi, 2),
-                                                shiftWindow(toShift[l], true),
+                                                shiftWindow(toShift[l]),
                                                 halfWidths,
                                                 only >= 0 ? 1.0 : weights[l],
                                                 refShare,
@@ -1561,7 +1463,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           for (int64_t i = 0; i < dispBox.size(1); ++i)
           {
             const torch::Tensor dvi = dispBox.narrow(1, i, 1);
-            const torch::Tensor penalty = ((dm - dvi).pow(2) * penaltyWeight).sum(0);
+            const torch::Tensor penalty = (dm - dvi).pow(2).sum(0);
             const torch::Tensor coupled = cost.select(1, i) + coeff * penalty;
             view.select(0, i).copy_(torch::argmin(coupled, 0));
           }
@@ -1603,7 +1505,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                    .unsqueeze(0);
       std::vector<int64_t> gridSize{ 1, 1 };
       gridSize.insert(gridSize.end(), coarse.begin(), coarse.end());
-      torch::Tensor        idGrid = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/true);
+      torch::Tensor        idGrid = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/false);
       std::vector<int64_t> toChannelFirst{ 0, idGrid.dim() - 1 };
       for (int64_t dd = 1; dd < idGrid.dim() - 1; ++dd)
       {
@@ -1617,7 +1519,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       toChannelLast.push_back(1);
       const auto icSampleOpts =
-        F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kBorder).align_corners(true);
+        F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(false);
       for (int it = 0; it < 15; ++it)
       {
         torch::Tensor f1i = f1.clone();
@@ -1634,7 +1536,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     componentShape[1] = static_cast<int64_t>(Dim);
     const torch::Tensor cellsToVoxels =
       torch::tensor(cellVoxels, torch::kLong).to(disp.options()).view(componentShape);
-    m_CoarseGrid = Impact::BuildCoarseGrid<Dim>(disp * cellsToVoxels, m_FixedImage.GetPointer(), cellVoxels);
+    m_CoarseGrid = Impact::BuildCellGrid<Dim>(disp * cellsToVoxels, m_FixedImage.GetPointer());
     m_CoarseGridTransform = nullptr;
   }
 }
