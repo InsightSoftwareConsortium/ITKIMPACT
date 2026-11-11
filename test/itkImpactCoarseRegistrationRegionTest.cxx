@@ -144,7 +144,8 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
 {
   if (argc < 2)
   {
-    std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv) << " <temporary directory>" << std::endl;
+    std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
+              << " <temporary directory> [<model with half-resolution layers>]" << std::endl;
     return EXIT_FAILURE;
   }
   const std::string         temporary = argv[1];
@@ -361,6 +362,45 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
   {
     std::cerr << "No bytes were counted." << std::endl;
     return EXIT_FAILURE;
+  }
+
+  // A model whose layers are half the image's resolution, on a pair of odd sizes, whose whole layers the cells pool
+  // by uneven windows: by regions as whole, without a mask and with one.
+  if (argc > 2)
+  {
+    const ImageType::SizeType           odd = { { 49, 41, 33 } };
+    ImageType::Pointer                  oddFixed = Texture(odd, 0.0, 0.0, 0.0);
+    ImageType::Pointer                  oddMoving = Texture(odd, 1.5, -1.0, 0.5);
+    const itk::ImpactModelConfiguration model(
+      argv[2], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false);
+    for (const bool masked : { false, true })
+    {
+      auto run = [&](bool byRegions) {
+        auto coarse = CoarseType::New();
+        coarse->SetFixedImage(oddFixed);
+        coarse->SetMovingImage(oddMoving);
+        coarse->AddModelConfiguration(model);
+        coarse->SetDistance({ "L2", "L2" });
+        coarse->SetLayersWeight({ 1.f, 1.f });
+        if (masked)
+        {
+          coarse->SetFixedMask(HalfMask(oddFixed, 0, 30));
+        }
+        Configure(coarse);
+        if (byRegions)
+        {
+          coarse->SetRegionSize(16);
+          coarse->SetRegionHalo(2);
+          coarse->SetCostBoxBytes(CostBoxBytes);
+        }
+        return coarse;
+      };
+      if (CompareRuns(run(false), run(true), masked ? "half-resolution layers, masked" : "half-resolution layers", 1e-3) !=
+          EXIT_SUCCESS)
+      {
+        return EXIT_FAILURE;
+      }
+    }
   }
   return EXIT_SUCCESS;
 }

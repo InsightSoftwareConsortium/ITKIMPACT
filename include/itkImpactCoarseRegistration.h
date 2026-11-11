@@ -218,8 +218,9 @@ public:
    * own pipelines (SetRequestedRegion then Update: an itk::ImageFileReader with UseStreamingOn reads those regions
    * alone; an image in memory serves them from its buffer); the caller keeps its readers alive. Request a region of
    * GetOutput() (or stream it to a writer) rather than the whole field, and take the field on the coarse grid from
-   * GetCoarseGridTransform(). PCA fits its basis on the whole feature map, a model resampling the image to its own
-   * voxel size and a layer at another resolution than the image do not line up with the boxes: refused. */
+   * GetCoarseGridTransform(). A feature layer a power of two coarser than the image, no coarser than the coarse
+   * cells, is computed by regions too, each region starting on its lattice. PCA fits its basis on the whole feature
+   * map and a model resampling the image to its own voxel size does not line up with the boxes: refused. */
   /** @{ */
   /** Side of a box, in voxels; 0 (the default) reads the images whole. */
   itkSetMacro(RegionSize, unsigned int);

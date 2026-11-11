@@ -61,6 +61,28 @@ Texture(const ImageType::SizeType & size, double sx, double sy, double sz)
   return image;
 }
 
+// A smooth field of a fraction of a voxel on `image`'s grid, for the runs to start from. From a zero field every
+// cell reads the moving features exactly at a sample, where linear interpolation has two slopes and float round-off
+// picks one: two runs then differ by whole steps there, whatever their agreement elsewhere.
+FieldType::Pointer
+StartingField(const ImageType * image)
+{
+  auto field = FieldType::New();
+  field->SetRegions(image->GetLargestPossibleRegion());
+  field->Allocate();
+  itk::ImageRegionIteratorWithIndex<FieldType> it(field, field->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    const auto           index = it.GetIndex();
+    FieldType::PixelType value;
+    value[0] = static_cast<float>(0.31 + 0.2 * std::sin(index[1] / 7.0));
+    value[1] = static_cast<float>(-0.27 + 0.2 * std::cos(index[2] / 5.0));
+    value[2] = static_cast<float>(0.23 + 0.2 * std::sin(index[0] / 9.0));
+    it.Set(value);
+  }
+  return field;
+}
+
 void
 Configure(FineType * fine, unsigned int iterations, double epsilon = 1.0)
 {
@@ -100,19 +122,22 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
 {
   if (argc < 2)
   {
-    std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv) << " <temporary directory>" << std::endl;
+    std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
+              << " <temporary directory> [<model with half-resolution layers>]" << std::endl;
     return EXIT_FAILURE;
   }
   const std::string         temporary = argv[1];
   const ImageType::SizeType size = { { 48, 40, 32 } }; // whole cells of 2 voxels, whole boxes of 16
   ImageType::Pointer        fixed = Texture(size, 0.0, 0.0, 0.0);
   ImageType::Pointer        moving = Texture(size, 1.5, -1.0, 0.5);
+  const FieldType::Pointer  start = StartingField(fixed);
 
   // 1. The whole-image run.
   auto dense = FineType::New();
   ITK_EXERCISE_BASIC_OBJECT_METHODS(dense, ImpactFineRegistration, ImageSource);
   dense->SetFixedImage(fixed);
   dense->SetMovingImage(moving);
+  dense->SetInitialDisplacementField(start);
   Configure(dense, 6);
   ITK_TRY_EXPECT_NO_EXCEPTION(dense->Update());
   const FieldType * denseField = dense->GetOutput();
@@ -122,6 +147,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   auto regions = FineType::New();
   regions->SetFixedImage(fixed);
   regions->SetMovingImage(moving);
+  regions->SetInitialDisplacementField(start);
   Configure(regions, 6);
   regions->SetRegionSize(16);
   regions->SetRegionsPerIteration(1000);
@@ -137,6 +163,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   auto              boxes = FineType::New();
   boxes->SetFixedImage(fixed);
   boxes->SetMovingImage(moving);
+  boxes->SetInitialDisplacementField(start);
   Configure(boxes, 6);
   boxes->SetRegionSize(16);
   boxes->SetRegionsPerIteration(1000);
@@ -156,7 +183,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   }
   const double boxDifference = MaxDifference(denseField, boxes->GetOutput(), fixed->GetLargestPossibleRegion());
   std::cout << "dense vs box by box (every box): max |difference| = " << boxDifference << " mm" << std::endl;
-  if (boxDifference > 1e-3)
+  if (boxDifference > 1e-5)
   {
     std::cerr << "The box-by-box field differs from the dense one by " << boxDifference << " mm." << std::endl;
     return EXIT_FAILURE;
@@ -196,7 +223,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   }
   const double difference = MaxDifference(denseField, regionField, fixed->GetLargestPossibleRegion());
   std::cout << "dense vs regions (every box): max |difference| = " << difference << " mm" << std::endl;
-  if (difference > 1e-3)
+  if (difference > 1e-5)
   {
     std::cerr << "The region-sampled field differs from the dense one by " << difference << " mm." << std::endl;
     return EXIT_FAILURE;
@@ -258,6 +285,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   auto streamed = FineType::New();
   streamed->SetFixedImage(fixedReader->GetOutput());
   streamed->SetMovingImage(movingReader->GetOutput());
+  streamed->SetInitialDisplacementField(start);
   Configure(streamed, 6);
   streamed->SetRegionSize(16);
   streamed->SetRegionsPerIteration(1000);
@@ -436,6 +464,47 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     if (!(difference < 1e-4))
     {
       std::cerr << "An initial field on a coarser grid is not read as its dense field." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  // 7. A model whose layers are half the image's resolution (an average pooling and a strided convolution), on a pair
+  // of odd sizes, whose whole layers the cells pool by uneven windows: by regions as whole.
+  if (argc > 2)
+  {
+    const ImageType::SizeType           odd = { { 49, 41, 33 } };
+    ImageType::Pointer                  oddFixed = Texture(odd, 0.0, 0.0, 0.0);
+    ImageType::Pointer                  oddMoving = Texture(odd, 1.5, -1.0, 0.5);
+    const FieldType::Pointer            oddStart = StartingField(oddFixed);
+    const itk::ImpactModelConfiguration model(
+      argv[2], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false);
+    auto run = [&](bool byRegions) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(oddFixed);
+      fine->SetMovingImage(oddMoving);
+      fine->SetInitialDisplacementField(oddStart);
+      fine->AddModelConfiguration(model);
+      fine->SetDistance({ "L2", "L2" });
+      fine->SetLayersWeight({ 1.f, 1.f });
+      Configure(fine, 6);
+      if (byRegions)
+      {
+        fine->SetRegionSize(16);
+        fine->SetRegionHalo(2);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto   whole = run(false);
+    const auto   byRegions = run(true);
+    const double moved = MaxDifference(whole->GetOutput(), oddStart, oddFixed->GetLargestPossibleRegion());
+    const double difference =
+      MaxDifference(whole->GetOutput(), byRegions->GetOutput(), oddFixed->GetLargestPossibleRegion());
+    std::cout << "half-resolution layers, by regions against whole: max |difference| = " << difference
+              << " mm, for a field moved by " << moved << " mm" << std::endl;
+    if (!(difference < 1e-5) || !(moved > 1e-3))
+    {
+      std::cerr << "Half-resolution layers by regions differ from the whole-image run." << std::endl;
       return EXIT_FAILURE;
     }
   }

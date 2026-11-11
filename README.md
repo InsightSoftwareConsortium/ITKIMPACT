@@ -176,7 +176,8 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   transform (an affine, a coarser pass's field) to the moving side outside the optimization;
   `GetControlGridTransform()` is the result on the control grid, `GetOutput()` the dense field,
   produced for the region requested of it (stream it to a writer). Static mode, point-wise distances
-  and feature layers at the image's resolution (MIND); the caller keeps its readers alive.
+  and feature layers at the image's resolution (MIND) or a power of two coarser, no coarser than the
+  control cells; the caller keeps its readers alive.
 - **The coarse stage by regions.** `SetRegionSize(n)` on `ImpactCoarseRegistration` reads the pair the same
   way: one pass over the boxes (each with its halo, the moving image brought onto the fixed grid region by
   region) extracts the features and pools them to the coarse grid, which stays on the device; the cost volume

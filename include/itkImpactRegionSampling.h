@@ -179,8 +179,8 @@ SameGrid(const TA * a, const TB * b)
 }
 
 /** The region of a grid (`spatial` in tensor order, `index` its first index) that the cells [c0, c1) of `windows`
- * span, `extra` voxels around on each tensor axis, clipped to the grid: `lowPad` what the clipping left of the margin
- * on the low side, `core` the cells' own extent. */
+ * span, `extra` voxels around on each tensor axis, clipped to the grid and starting on a multiple of `align` voxels
+ * from the grid's first: `lowPad` what that left of the margin on the low side, `core` the cells' own extent. */
 template <typename TRegion>
 TRegion
 CellSpan(const std::vector<int64_t> &     c0,
@@ -190,7 +190,8 @@ CellSpan(const std::vector<int64_t> &     c0,
          const std::vector<int64_t> &     spatial,
          const typename TRegion::IndexType & index,
          std::vector<int64_t> &           lowPad,
-         std::vector<int64_t> &           core)
+         std::vector<int64_t> &           core,
+         int64_t                          align = 1)
 {
   constexpr unsigned int Dim = TRegion::ImageDimension;
   typename TRegion::IndexType start;
@@ -199,7 +200,8 @@ CellSpan(const std::vector<int64_t> &     c0,
   {
     const int64_t first = windows[d].starts[c0[d]];
     const int64_t end = windows[d].ends[c1[d] - 1];
-    const int64_t low = std::max<int64_t>(0, first - extra[d]);
+    const int64_t margin = std::max<int64_t>(0, first - extra[d]);
+    const int64_t low = margin - margin % align;
     const int64_t high = std::min<int64_t>(spatial[d], end + extra[d]);
     start[Dim - 1 - d] = static_cast<IndexValueType>(low) + index[Dim - 1 - d];
     size[Dim - 1 - d] = static_cast<SizeValueType>(high - low);
@@ -253,6 +255,150 @@ WriteCells(torch::Tensor & whole, const std::vector<int64_t> & c0, const torch::
     view = view.narrow(2 + static_cast<int64_t>(d), c0[d], t.size(2 + static_cast<int64_t>(d)));
   }
   view.copy_(t);
+}
+
+/** Where a layer's samples lie among the image's voxels, along each tensor axis: every `stride` voxels from the
+ * first, n voxels giving ceil(n / stride) samples when the last may cover fewer voxels (`partial`, a strided
+ * convolution) and floor(n / stride) otherwise (a pooling). A layer at the image's resolution has stride 1. */
+struct LayerLattice
+{
+  std::vector<int64_t> stride;
+  std::vector<bool>    partial;
+
+  int64_t
+  Samples(size_t d, int64_t voxels) const
+  {
+    return (voxels + (partial[d] ? stride[d] - 1 : 0)) / stride[d];
+  }
+};
+
+/** The lattice of the image itself, of a mask on its grid. */
+inline LayerLattice
+ImageLattice(size_t dim)
+{
+  return { std::vector<int64_t>(dim, 1), std::vector<bool>(dim, false) };
+}
+
+/** The lattices of the `layers` a model gave for a probe of `LatticeProbe` voxels along every axis, one more than a
+ * power of two: a layer of 64 / s samples keeps whole samples every s voxels, one of 64 / s + 1 a partial last one. */
+constexpr int64_t LatticeProbe = 65;
+
+template <unsigned int Dim>
+std::vector<LayerLattice>
+LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
+{
+  auto powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
+  std::vector<LayerLattice> lattices;
+  for (const torch::Tensor & layer : layers)
+  {
+    LayerLattice lattice = ImageLattice(Dim);
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      const int64_t samples = layer.size(2 + static_cast<int64_t>(d));
+      if (samples == LatticeProbe)
+      {
+        continue;
+      }
+      const int64_t whole = LatticeProbe - 1;
+      if (samples > 0 && whole % samples == 0 && powerOfTwo(whole / samples))
+      {
+        lattice.stride[d] = whole / samples;
+      }
+      else if (samples > 1 && whole % (samples - 1) == 0 && powerOfTwo(whole / (samples - 1)))
+      {
+        lattice.stride[d] = whole / (samples - 1);
+        lattice.partial[d] = true;
+      }
+      else
+      {
+        itkGenericExceptionMacro(<< who << ": a feature layer of " << layer.sizes() << " for an image of "
+                                 << LatticeProbe << " voxels a side lies on no lattice of the image's (a power of "
+                                    "two of its voxels), which RegionSize needs to compute it by regions.");
+      }
+    }
+    lattices.push_back(lattice);
+  }
+  return lattices;
+}
+
+/** A layer ({1, C, samples...}) of a span of the image, pooled over the cells [c0, c1) as the whole-image run pools
+ * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. A coarser one: the whole
+ * layer is adaptive-average pooled to the cells, so each cell takes the samples that pooling gives it. `lowPad` is
+ * where the cells start in the span, `spatial` the image; the span starts on the layer's lattice and holds those
+ * samples (CellSpan's `align` and `extra`). */
+template <unsigned int Dim>
+torch::Tensor
+PoolLayerToCells(torch::Tensor                    layer,
+                 const LayerLattice &             lattice,
+                 const std::vector<int64_t> &     lowPad,
+                 const std::vector<int64_t> &     c0,
+                 const std::vector<int64_t> &     c1,
+                 const std::vector<PoolWindows> & windows,
+                 const std::vector<int64_t> &     spatial,
+                 const char *                     who)
+{
+  std::vector<PoolWindows> relative(Dim);
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t axis = 2 + static_cast<int64_t>(d);
+    const int64_t stride = lattice.stride[d];
+    const int64_t low = windows[d].starts[c0[d]] - lowPad[d]; // the span's first voxel in the image
+    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
+    const int64_t length = lattice.Samples(d, spatial[d]); // the whole layer's samples
+    if (low % stride != 0 || (stride > 1 && length < cells))
+    {
+      itkGenericExceptionMacro(<< who << ": a feature layer " << stride << " times coarser than the image, of "
+                               << length << " samples for " << cells
+                               << " cells, cannot be pooled to the cells by regions: it must be no coarser than they.");
+    }
+    // Cell i's samples on the whole layer: [start(i), end(i)).
+    auto start = [&](int64_t i) { return stride == 1 ? windows[d].starts[i] : i * length / cells; };
+    auto end = [&](int64_t i) { return stride == 1 ? windows[d].ends[i] : ((i + 1) * length + cells - 1) / cells; };
+    const int64_t first = start(c0[d]) - low / stride;
+    const int64_t last = end(c1[d] - 1) - low / stride;
+    if (first < 0 || last > layer.size(axis))
+    {
+      itkGenericExceptionMacro(<< who << ": the region read around the cells does not hold the samples of a layer of "
+                               << layer.sizes() << " they pool; give RegionHalo more voxels.");
+    }
+    layer = layer.narrow(axis, first, last - first);
+    for (int64_t i = c0[d]; i < c1[d]; ++i)
+    {
+      relative[d].starts.push_back(start(i) - start(c0[d]));
+      relative[d].ends.push_back(end(i) - start(c0[d]));
+    }
+  }
+  return PoolByWindows<Dim>(layer, relative);
+}
+
+/** The share of a mask ({1, 1, span...}, floats) in each sample a layer of `lattice` has over that span, as the
+ * whole-image run brings the whole mask to the whole layer (adaptive average pooling over the image's `spatial`
+ * voxels); the mask itself for a layer at the image's resolution. `low` is the span's first voxel in the image. */
+template <unsigned int Dim>
+torch::Tensor
+SpanMaskShare(const torch::Tensor &        mask,
+              const LayerLattice &         lattice,
+              const std::vector<int64_t> & low,
+              const std::vector<int64_t> & spatial)
+{
+  std::vector<PoolWindows> windows(Dim);
+  bool                     same = true;
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t span = mask.size(2 + static_cast<int64_t>(d));
+    const int64_t stride = lattice.stride[d];
+    const int64_t length = lattice.Samples(d, spatial[d]);
+    same = same && stride == 1;
+    for (int64_t j = low[d] / stride; j < low[d] / stride + lattice.Samples(d, span); ++j)
+    {
+      // Sample j's voxels on the whole image, kept inside the span at its edges.
+      const int64_t first = stride == 1 ? j : j * spatial[d] / length;
+      const int64_t last = stride == 1 ? j + 1 : ((j + 1) * spatial[d] + length - 1) / length;
+      windows[d].starts.push_back(std::clamp<int64_t>(first - low[d], 0, span - 1));
+      windows[d].ends.push_back(std::clamp<int64_t>(last - low[d], windows[d].starts.back() + 1, span));
+    }
+  }
+  return same ? mask : PoolByWindows<Dim>(mask, windows);
 }
 
 /** What the feature models of a region-sampled run must be: run at the image's resolution (no voxel size of
@@ -333,9 +479,9 @@ MetadataByBlocks(const TDirection & direction, unsigned int dim, TReadBlocks && 
   return metadata;
 }
 
-/** The kept feature layers of an image region ({1, 1, span...}) at its resolution, each model run on the region
- * whole in one forward, `metadata` (when given) set on the configurations first; the region itself with no model.
- * `layerCount` is what the caller keeps, checked. */
+/** The kept feature layers of an image region ({1, 1, span...}), each at its own resolution, each model run on the
+ * region whole in one forward, `metadata` (when given) set on the configurations first; the region itself with no
+ * model. `layerCount` is what the caller keeps, checked. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
 RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
@@ -375,13 +521,6 @@ RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
       }
       const torch::Tensor layer =
         NormalizeFeatureChannels(outputs[i].toTensor().to(torch::kFloat32), config.GetFeatureNormalization(), 1);
-      if (!std::equal(layer.sizes().begin() + 2, layer.sizes().end(), image.sizes().begin() + 2))
-      {
-        itkGenericExceptionMacro(<< who << ": a feature layer of another resolution than the image (" << layer.sizes()
-                                 << " for " << image.sizes()
-                                 << ") cannot be computed by regions, its lattice not lining up with the image's; "
-                                    "RegionSize takes layers at the image's resolution (MIND).");
-      }
       layers.push_back(layer.contiguous());
     }
   }

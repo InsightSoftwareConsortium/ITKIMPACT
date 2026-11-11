@@ -1960,8 +1960,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                     const std::vector<int64_t> & c1,
                     const std::vector<int64_t> & extra,
                     std::vector<int64_t> &       lowPad,
-                    std::vector<int64_t> &       core) {
-    return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core);
+                    std::vector<int64_t> &       core,
+                    int64_t                      align = 1) {
+    return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core, align);
   };
   const auto cropCore = Impact::CropCore;
   auto       windowsOf = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
@@ -2100,16 +2101,40 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                      takesMetadata ? &(moving ? movingMetadata : fixedMetadata) : nullptr,
                                      "ImpactFineRegistration");
   };
+  // A layer coarser than the image lies on the image's lattice every `align` voxels: the regions read for the
+  // features start on it, and reach what pooling the whole layer to the cells reads past a cell's own voxels.
+  int64_t                           align = 1;
+  std::vector<int64_t>              reach = halo;
+  std::vector<Impact::LayerLattice> lattices(losses.size(), Impact::ImageLattice(Dim));
+  if (featureMode)
+  {
+    std::vector<int64_t> probe(Dim + 2, Impact::LatticeProbe);
+    probe[0] = probe[1] = 1;
+    lattices = Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), false), "ImpactFineRegistration");
+    for (const Impact::LayerLattice & lattice : lattices)
+    {
+      align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+    }
+    for (unsigned int d = 0; d < Dim && align > 1; ++d)
+    {
+      reach[d] += windows[d].ends[0] - windows[d].starts[0] + 2 * align;
+    }
+  }
+  auto pooledToCells = [&](std::vector<torch::Tensor> &   layers,
+                           const std::vector<int64_t> & lowPad,
+                           const std::vector<int64_t> & c0,
+                           const std::vector<int64_t> & c1) {
+    for (size_t l = 0; l < layers.size(); ++l)
+    {
+      layers[l] = Impact::PoolLayerToCells<Dim>(
+        layers[l], lattices[l], lowPad, c0, c1, windows, spatial, "ImpactFineRegistration");
+    }
+  };
   // The fixed features pooled over the cells [c0, c1): {1, C, n...} per layer.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<int64_t>       lowPad(Dim), core(Dim);
-    const RegionType           span = spanOf(c0, c1, halo, lowPad, core);
-    std::vector<torch::Tensor> layers = layersOf(readFixed(span), false);
-    const auto                 relative = windowsOf(c0, c1);
-    for (torch::Tensor & layer : layers)
-    {
-      layer = Impact::PoolByWindows<Dim>(cropCore(layer, lowPad, core), relative);
-    }
+    std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, reach, lowPad, core, align)), false);
+    pooledToCells(layers, lowPad, c0, c1);
     return layers;
   };
   // The moving features pooled over the cells [c0, c1) of the fixed grid, the moving image brought there through
@@ -2122,7 +2147,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   };
   auto pooledMoving = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) -> PooledMoving {
     std::vector<int64_t> lowPad(Dim), core(Dim);
-    const RegionType     span = spanOf(c0, c1, halo, lowPad, core);
+    const RegionType     span = spanOf(c0, c1, reach, lowPad, core, align);
     const torch::Tensor  movingIndex = movingIndexField(span); // {1, Dim, span...} on the device
     std::vector<int64_t> spanSize(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
@@ -2177,14 +2202,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     PooledMoving pooled;
     pooled.layers = layersOf(window, true);
-    const auto relative = windowsOf(c0, c1);
-    for (torch::Tensor & layer : pooled.layers)
-    {
-      layer = Impact::PoolByWindows<Dim>(cropCore(layer, lowPad, core), relative);
-    }
+    pooledToCells(pooled.layers, lowPad, c0, c1);
     if (maskWindow.defined())
     {
-      pooled.share = Impact::PoolByWindows<Dim>(cropCore(maskWindow, lowPad, core), relative);
+      pooled.share = Impact::PoolByWindows<Dim>(cropCore(maskWindow, lowPad, core), windowsOf(c0, c1));
     }
     return pooled;
   };

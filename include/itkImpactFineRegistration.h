@@ -266,7 +266,8 @@ public:
    * mean, which the resident route keeps exact), with
    * the regularizer's differences whose first cell lies in it; Adam steps the cells the iteration touched and leaves
    * the others as they are. Visiting every box at every iteration reproduces the whole-image run, so the schedule is
-   * the only approximation. Static mode, point-wise distances, feature layers at the image's resolution (MIND); the
+   * the only approximation. Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
+   * a power of two coarser, no coarser than the control cells (a region then starts on the layer's lattice); the
    * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
    * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
    * as the whole-image run resizes its dense field. The output is produced by region:

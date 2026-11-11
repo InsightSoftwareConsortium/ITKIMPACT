@@ -997,7 +997,6 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const std::vector<Impact::CellBox> boxes = Impact::TileCells(coarse, perBox);
     // A model's receptive field is in its input's voxels, on every axis whatever their spacing.
     const std::vector<int64_t> halo(Dim, static_cast<int64_t>(m_RegionHalo));
-    const std::vector<int64_t> noHalo(Dim, 0);
 
     // ---- The moving image and its mask on the fixed grid, each region brought there through the moving transform
     // (the identity without one) by a resampler that asks its input for that region alone; a fixed mask on another
@@ -1086,22 +1085,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                       const std::vector<int64_t> & c1,
                       const std::vector<int64_t> & extra,
                       std::vector<int64_t> &       lowPad,
-                      std::vector<int64_t> &       core) {
-      return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core);
-    };
-    const auto cropCore = Impact::CropCore;
-    auto poolCells = [&](const torch::Tensor & t) -> torch::Tensor {
-      if constexpr (Dim == 3)
-      {
-        return F::avg_pool3d(t,
-                             F::AvgPool3dFuncOptions({ cellVoxels[0], cellVoxels[1], cellVoxels[2] })
-                               .stride({ cellVoxels[0], cellVoxels[1], cellVoxels[2] }));
-      }
-      else
-      {
-        return F::avg_pool2d(
-          t, F::AvgPool2dFuncOptions({ cellVoxels[0], cellVoxels[1] }).stride({ cellVoxels[0], cellVoxels[1] }));
-      }
+                      std::vector<int64_t> &       core,
+                      int64_t                      align = 1) {
+      return Impact::CellSpan<RegionType>(c0, c1, extra, windows, spatial, fixedRegion.GetIndex(), lowPad, core, align);
     };
     const auto narrowTo = Impact::NarrowTo;
     const auto writeCells = Impact::WriteCells;
@@ -1181,34 +1167,68 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       movingShare = torch::zeros(shareShape, onDevice);
     }
-    // A cell's features: the mean over its voxels, over its masked voxels with a mask (a cell without any: 0).
-    auto pooledCells = [&](const torch::Tensor & layer, const torch::Tensor & maskBox) -> torch::Tensor {
-      if (!maskBox.defined())
+    // A layer coarser than the image lies on the image's lattice every `align` voxels: the regions read for the
+    // features start on it, and reach what pooling the whole layer to the cells reads past a cell's own voxels.
+    int64_t                           align = 1;
+    std::vector<int64_t>              reach = halo;
+    std::vector<Impact::LayerLattice> lattices(layerCount, Impact::ImageLattice(Dim));
+    if (featureMode)
+    {
+      std::vector<int64_t> probe(Dim + 2, Impact::LatticeProbe);
+      probe[0] = probe[1] = 1;
+      lattices = Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), false), "ImpactCoarseRegistration");
+      for (const Impact::LayerLattice & lattice : lattices)
       {
-        return poolCells(layer);
+        align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
       }
-      const torch::Tensor count = poolCells(maskBox);
-      return torch::where(count > 0.0, poolCells(layer * maskBox) / torch::where(count > 0.0, count, 1.0), 0.0);
-    };
+      for (unsigned int d = 0; d < Dim && align > 1; ++d)
+      {
+        reach[d] += cellVoxels[d] + 2 * align;
+      }
+    }
     for (size_t b = 0; b < boxes.size(); ++b)
     {
-      const Impact::CellBox & box = boxes[b];
-      std::vector<int64_t>    lowPad(Dim), core(Dim), cellsPad(Dim), cellsCore(Dim);
-      const RegionType        span = spanOf(box.cell0, box.cell1, halo, lowPad, core);
-      const RegionType        cellsSpan = spanOf(box.cell0, box.cell1, noHalo, cellsPad, cellsCore);
-      torch::Tensor           fixedMaskBox, movingMaskBox;
+      const Impact::CellBox &    box = boxes[b];
+      std::vector<int64_t>       lowPad(Dim), core(Dim), low(Dim);
+      const RegionType           span = spanOf(box.cell0, box.cell1, reach, lowPad, core, align);
+      const torch::Tensor        fixedSpan = readFixed(span);
+      const torch::Tensor        movingSpan = readMoving(span);
+      for (unsigned int d = 0; d < Dim; ++d)
+      {
+        low[d] = windows[d].starts[box.cell0[d]] - lowPad[d];
+      }
+      auto toCells = [&](const torch::Tensor & t, const Impact::LayerLattice & lattice) {
+        return Impact::PoolLayerToCells<Dim>(
+          t, lattice, lowPad, box.cell0, box.cell1, windows, spatial, "ImpactCoarseRegistration");
+      };
+      // A cell's features: the mean of the layer's samples it pools, of its masked ones with a mask (brought to the
+      // layer's samples as its share; a cell without any: 0).
+      auto pooledCells = [&](const torch::Tensor &        layer,
+                             const Impact::LayerLattice & lattice,
+                             const torch::Tensor &        mask) -> torch::Tensor {
+        if (!mask.defined())
+        {
+          return toCells(layer, lattice);
+        }
+        const torch::Tensor share = Impact::SpanMaskShare<Dim>(mask, lattice, low, spatial);
+        const torch::Tensor count = toCells(share, lattice);
+        return torch::where(
+          count > 0.0, toCells(layer * share, lattice) / torch::where(count > 0.0, count, 1.0), 0.0);
+      };
+      const Impact::LayerLattice voxels = Impact::ImageLattice(Dim);
+      torch::Tensor fixedMaskBox, movingMaskBox;
       if (fixedMask.IsNotNull())
       {
-        fixedMaskBox = readMask(fixedMask, cellsSpan);
-        writeCells(fixedShare, box.cell0, poolCells(fixedMaskBox));
+        fixedMaskBox = readMask(fixedMask, span);
+        writeCells(fixedShare, box.cell0, toCells(fixedMaskBox, voxels));
       }
       if (movingMask.IsNotNull())
       {
-        movingMaskBox = readMask(movingMask, cellsSpan);
-        writeCells(movingShare, box.cell0, poolCells(movingMaskBox));
+        movingMaskBox = readMask(movingMask, span);
+        writeCells(movingShare, box.cell0, toCells(movingMaskBox, voxels));
       }
-      const std::vector<torch::Tensor> fixedLayers = layersOf(readFixed(span), false);
-      const std::vector<torch::Tensor> movingLayers = layersOf(readMoving(span), true);
+      const std::vector<torch::Tensor> fixedLayers = layersOf(fixedSpan, false);
+      const std::vector<torch::Tensor> movingLayers = layersOf(movingSpan, true);
       if (b == 0)
       {
         for (size_t l = 0; l < layerCount; ++l)
@@ -1227,15 +1247,15 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       for (size_t l = 0; l < layerCount; ++l)
       {
-        torch::Tensor fixedLayer = cropCore(fixedLayers[l], lowPad, core);
-        torch::Tensor movingLayer = cropCore(movingLayers[l], lowPad, core);
+        torch::Tensor fixedLayer = fixedLayers[l];
+        torch::Tensor movingLayer = movingLayers[l];
         if (subset[l].defined())
         {
           fixedLayer = fixedLayer.index_select(1, subset[l]);
           movingLayer = movingLayer.index_select(1, subset[l]);
         }
-        writeCells(fixedMaps[l], box.cell0, pooledCells(fixedLayer, fixedMaskBox));
-        writeCells(movingMaps[l], box.cell0, pooledCells(movingLayer, movingMaskBox));
+        writeCells(fixedMaps[l], box.cell0, pooledCells(fixedLayer, lattices[l], fixedMaskBox));
+        writeCells(movingMaps[l], box.cell0, pooledCells(movingLayer, lattices[l], movingMaskBox));
       }
     }
 
