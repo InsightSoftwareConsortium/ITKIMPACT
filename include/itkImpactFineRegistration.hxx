@@ -1906,7 +1906,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const Impact::RegionModels models = Impact::CheckRegionModels(
       m_FixedModelsConfiguration, m_FixedImage->GetSpacing(), Dim, m_PCA, "ImpactFineRegistration");
     const size_t layerCount = models.layerCount;
-    takesMetadata = models.takesMetadata;
+    // The moving models of their own are held to the same: the moving image reaches them on the fixed grid.
+    const Impact::RegionModels movingModels = Impact::CheckRegionModels(
+      m_MovingModelsConfiguration, m_FixedImage->GetSpacing(), Dim, m_PCA, "ImpactFineRegistration");
+    takesMetadata = models.takesMetadata || movingModels.takesMetadata;
     for (size_t l = 0; l < layerCount; ++l)
     {
       const std::string name = m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];

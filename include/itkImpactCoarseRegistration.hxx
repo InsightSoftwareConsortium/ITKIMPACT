@@ -1096,7 +1096,10 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const Impact::RegionModels models = Impact::CheckRegionModels(
         m_FixedModelsConfiguration, m_FixedImage->GetSpacing(), Dim, m_PCA, "ImpactCoarseRegistration");
       layerCount = models.layerCount;
-      takesMetadata = models.takesMetadata;
+      // The moving models of their own are held to the same: the moving image reaches them on the fixed grid.
+      const Impact::RegionModels movingModels = Impact::CheckRegionModels(
+        m_MovingModelsConfiguration, m_FixedImage->GetSpacing(), Dim, m_PCA, "ImpactCoarseRegistration");
+      takesMetadata = models.takesMetadata || movingModels.takesMetadata;
     }
     const std::vector<ImpactModelConfiguration> & movingConfigs =
       m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
