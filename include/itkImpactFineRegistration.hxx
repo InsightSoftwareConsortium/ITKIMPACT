@@ -2055,35 +2055,44 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   int64_t                           align = 1;
   std::vector<int64_t>              reach = halo;
   std::vector<Impact::LayerLattice> lattices(losses.size(), Impact::ImageLattice(Dim));
+  std::vector<Impact::LayerLattice> movingLattices = lattices; // the moving models' own, when they differ
   if (featureMode)
   {
     std::vector<int64_t> probe(Dim + 2, Impact::LatticeProbe);
     probe[0] = probe[1] = 1;
     lattices = Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), false), "ImpactFineRegistration");
-    for (const Impact::LayerLattice & lattice : lattices)
+    movingLattices =
+      m_MovingModelsConfiguration.empty()
+        ? lattices
+        : Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), true), "ImpactFineRegistration");
+    for (const auto * side : { &lattices, &movingLattices })
     {
-      align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+      for (const Impact::LayerLattice & lattice : *side)
+      {
+        align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+      }
     }
     for (unsigned int d = 0; d < Dim && align > 1; ++d)
     {
       reach[d] += windows[d].ends[0] - windows[d].starts[0] + 2 * align;
     }
   }
-  auto pooledToCells = [&](std::vector<torch::Tensor> &   layers,
-                           const std::vector<int64_t> & lowPad,
-                           const std::vector<int64_t> & c0,
-                           const std::vector<int64_t> & c1) {
+  auto pooledToCells = [&](std::vector<torch::Tensor> &              layers,
+                           const std::vector<Impact::LayerLattice> & on,
+                           const std::vector<int64_t> &              lowPad,
+                           const std::vector<int64_t> &              c0,
+                           const std::vector<int64_t> &              c1) {
     for (size_t l = 0; l < layers.size(); ++l)
     {
-      layers[l] = Impact::PoolLayerToCells<Dim>(
-        layers[l], lattices[l], lowPad, c0, c1, windows, spatial, "ImpactFineRegistration");
+      layers[l] =
+        Impact::PoolLayerToCells<Dim>(layers[l], on[l], lowPad, c0, c1, windows, spatial, "ImpactFineRegistration");
     }
   };
   // The fixed features pooled over the cells [c0, c1): {1, C, n...} per layer.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<int64_t>       lowPad(Dim), core(Dim);
     std::vector<torch::Tensor> layers = layersOf(readFixed(spanOf(c0, c1, reach, lowPad, core, align)), false);
-    pooledToCells(layers, lowPad, c0, c1);
+    pooledToCells(layers, lattices, lowPad, c0, c1);
     return layers;
   };
   // The moving features pooled over the cells [c0, c1) of the fixed grid, the moving image brought there through
@@ -2151,7 +2160,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     PooledMoving pooled;
     pooled.layers = layersOf(window, true);
-    pooledToCells(pooled.layers, lowPad, c0, c1);
+    pooledToCells(pooled.layers, movingLattices, lowPad, c0, c1);
     if (maskWindow.defined())
     {
       pooled.share = Impact::PoolByWindows<Dim>(cropCore(maskWindow, lowPad, core), windowsOf(c0, c1));

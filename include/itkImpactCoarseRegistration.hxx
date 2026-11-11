@@ -1172,14 +1172,22 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     int64_t                           align = 1;
     std::vector<int64_t>              reach = halo;
     std::vector<Impact::LayerLattice> lattices(layerCount, Impact::ImageLattice(Dim));
+    std::vector<Impact::LayerLattice> movingLattices = lattices; // the moving models' own, when they differ
     if (featureMode)
     {
       std::vector<int64_t> probe(Dim + 2, Impact::LatticeProbe);
       probe[0] = probe[1] = 1;
       lattices = Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), false), "ImpactCoarseRegistration");
-      for (const Impact::LayerLattice & lattice : lattices)
+      movingLattices =
+        m_MovingModelsConfiguration.empty()
+          ? lattices
+          : Impact::LayerLattices<Dim>(layersOf(torch::zeros(probe, onDevice), true), "ImpactCoarseRegistration");
+      for (const auto * side : { &lattices, &movingLattices })
       {
-        align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+        for (const Impact::LayerLattice & lattice : *side)
+        {
+          align = std::max(align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+        }
       }
       for (unsigned int d = 0; d < Dim && align > 1; ++d)
       {
@@ -1255,7 +1263,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           movingLayer = movingLayer.index_select(1, subset[l]);
         }
         writeCells(fixedMaps[l], box.cell0, pooledCells(fixedLayer, lattices[l], fixedMaskBox));
-        writeCells(movingMaps[l], box.cell0, pooledCells(movingLayer, lattices[l], movingMaskBox));
+        writeCells(movingMaps[l], box.cell0, pooledCells(movingLayer, movingLattices[l], movingMaskBox));
       }
     }
 
