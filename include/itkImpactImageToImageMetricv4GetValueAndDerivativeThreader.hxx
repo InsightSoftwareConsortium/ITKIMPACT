@@ -586,10 +586,10 @@ ImpactImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner, TIma
       });
       return ids;
     }
-    const Self &                        m_Threader;
-    const std::vector<typename Self::Sample> &         m_Samples;
-    typename TImpactMetric::Internals & m_Internals;
-    const bool                          m_Keep;
+    const Self &                               m_Threader;
+    const std::vector<typename Self::Sample> & m_Samples;
+    typename TImpactMetric::Internals &        m_Internals;
+    const bool                                 m_Keep;
   };
 
   const Impact::OnlineSettings settings{ this->m_ImpactAssociate->GetFixedModelsConfiguration(),
