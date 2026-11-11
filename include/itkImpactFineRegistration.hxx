@@ -1658,30 +1658,8 @@ void
 ImpactFineRegistration<TFixedImage, TMovingImage>::DynamicThreadedGenerateData(
   const typename Superclass::OutputImageRegionType & region)
 {
-  using InterpolatorType = VectorLinearInterpolateImageFunction<DisplacementFieldType, double>;
-  auto interpolator = InterpolatorType::New();
-  interpolator->SetInputImage(m_ControlGrid);
-  const auto &                                        controlSize = m_ControlGrid->GetLargestPossibleRegion().GetSize();
-  ImageRegionIteratorWithIndex<DisplacementFieldType> it(this->GetOutput(), region);
-  typename FixedImageType::PointType                  point;
-  typename InterpolatorType::ContinuousIndexType      index;
-  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-  {
-    m_FixedImage->TransformIndexToPhysicalPoint(it.GetIndex(), point);
-    m_ControlGrid->TransformPhysicalPointToContinuousIndex(point, index);
-    for (unsigned int a = 0; a < ImageDimension; ++a)
-    {
-      // Round-off can put the last voxel a hair past the last control point.
-      index[a] = std::clamp(index[a], 0.0, static_cast<double>(controlSize[a] - 1));
-    }
-    const auto u = interpolator->EvaluateAtContinuousIndex(index);
-    VectorType value;
-    for (unsigned int a = 0; a < ImageDimension; ++a)
-    {
-      value[a] = static_cast<float>(u[a]);
-    }
-    it.Set(value);
-  }
+  Impact::InterpolateCellGrid<ImageDimension>(
+    m_ControlGrid.GetPointer(), m_FixedImage.GetPointer(), this->GetOutput(), region);
 }
 
 template <typename TFixedImage, typename TMovingImage>

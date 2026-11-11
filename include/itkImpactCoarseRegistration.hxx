@@ -27,9 +27,7 @@
 #include <itkLinearInterpolateImageFunction.h>
 #include <itkIdentityTransform.h>
 #include "itkImpactRegionSampling.h"
-#include <itkImageRegionIteratorWithIndex.h>
 #include <itkNearestNeighborInterpolateImageFunction.h>
-#include <itkVectorLinearInterpolateImageFunction.h>
 
 #include <torch/torch.h>
 #include <ATen/CPUGeneratorImpl.h>
@@ -887,30 +885,8 @@ void
 ImpactCoarseRegistration<TFixedImage, TMovingImage>::DynamicThreadedGenerateData(
   const typename Superclass::OutputImageRegionType & region)
 {
-  using InterpolatorType = VectorLinearInterpolateImageFunction<DisplacementFieldType, double>;
-  auto interpolator = InterpolatorType::New();
-  interpolator->SetInputImage(m_CoarseGrid);
-  const auto &                                        gridSize = m_CoarseGrid->GetLargestPossibleRegion().GetSize();
-  ImageRegionIteratorWithIndex<DisplacementFieldType> it(this->GetOutput(), region);
-  typename FixedImageType::PointType                  point;
-  typename InterpolatorType::ContinuousIndexType      index;
-  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-  {
-    m_FixedImage->TransformIndexToPhysicalPoint(it.GetIndex(), point);
-    m_CoarseGrid->TransformPhysicalPointToContinuousIndex(point, index);
-    for (unsigned int a = 0; a < ImageDimension; ++a)
-    {
-      // Round-off can put a voxel a hair past the padded grid.
-      index[a] = std::clamp(index[a], 0.0, static_cast<double>(gridSize[a] - 1));
-    }
-    const auto u = interpolator->EvaluateAtContinuousIndex(index);
-    VectorType value;
-    for (unsigned int a = 0; a < ImageDimension; ++a)
-    {
-      value[a] = static_cast<float>(u[a]);
-    }
-    it.Set(value);
-  }
+  Impact::InterpolateCellGrid<ImageDimension>(
+    m_CoarseGrid.GetPointer(), m_FixedImage.GetPointer(), this->GetOutput(), region);
 }
 
 template <typename TFixedImage, typename TMovingImage>

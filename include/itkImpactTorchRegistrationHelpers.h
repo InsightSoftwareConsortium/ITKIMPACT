@@ -41,6 +41,7 @@
 #include <itkIdentityTransform.h>
 #include <itkNearestNeighborInterpolateImageFunction.h>
 #include <itkResampleImageFilter.h>
+#include <itkVectorLinearInterpolateImageFunction.h>
 
 #include <torch/torch.h>
 
@@ -640,6 +641,42 @@ BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
     AllocateCellGrid<Dim>(std::vector<int64_t>(voxelField.sizes().begin() + 2, voxelField.sizes().end()), fixed);
   WriteVoxelFieldToDisplacement<Dim>(padded, fixed->GetSpacing(), fixed->GetDirection(), grid);
   return grid;
+}
+
+/** The region `region` of `output`, a dense displacement field on `fixed`'s grid, interpolated linearly from the
+ * cell grid `grid` (BuildCellGrid's). */
+template <unsigned int Dim, typename TFixedImage>
+void
+InterpolateCellGrid(const Image<Vector<float, Dim>, Dim> *                       grid,
+                    const TFixedImage *                                          fixed,
+                    Image<Vector<float, Dim>, Dim> *                             output,
+                    const typename Image<Vector<float, Dim>, Dim>::RegionType & region)
+{
+  using FieldType = Image<Vector<float, Dim>, Dim>;
+  using InterpolatorType = VectorLinearInterpolateImageFunction<FieldType, double>;
+  auto interpolator = InterpolatorType::New();
+  interpolator->SetInputImage(grid);
+  const auto &                                   gridSize = grid->GetLargestPossibleRegion().GetSize();
+  ImageRegionIteratorWithIndex<FieldType>        it(output, region);
+  typename TFixedImage::PointType                point;
+  typename InterpolatorType::ContinuousIndexType index;
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    fixed->TransformIndexToPhysicalPoint(it.GetIndex(), point);
+    grid->TransformPhysicalPointToContinuousIndex(point, index);
+    for (unsigned int a = 0; a < Dim; ++a)
+    {
+      // Round-off can put a voxel a hair past the padded grid.
+      index[a] = std::clamp(index[a], 0.0, static_cast<double>(gridSize[a] - 1));
+    }
+    const auto         u = interpolator->EvaluateAtContinuousIndex(index);
+    Vector<float, Dim> value;
+    for (unsigned int a = 0; a < Dim; ++a)
+    {
+      value[a] = static_cast<float>(u[a]);
+    }
+    it.Set(value);
+  }
 }
 
 /** Inverse of WriteVoxelFieldToDisplacement: read an ITK displacement field (physical mm,
