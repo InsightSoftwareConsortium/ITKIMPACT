@@ -2525,7 +2525,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         }
       }
       const torch::Tensor loss = total + regularizer(smoothed, wholeStart, cells, wholeStart);
-      loss.backward();
+      if (loss.requires_grad()) // a constant when no cell counts on a grid without a difference
+      {
+        loss.backward();
+      }
       lap("resident forward+backward", since);
       adam.Step(theta, touched);
       lap("resident adam", since);
@@ -2743,7 +2746,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                         .requires_grad_(true);
         const torch::Tensor loss = boxLoss(b, smoothControl(control), window.cell0, nullptr);
         auto                since = clock();
-        loss.backward();
+        if (loss.requires_grad()) // a constant for a last cell out of the fixed mask: no similarity, no difference
+        {
+          loss.backward();
+        }
         lossValue += loss.template item<double>();
         if (control.grad().defined())
         {
