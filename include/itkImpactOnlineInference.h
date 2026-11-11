@@ -207,21 +207,6 @@ GetModelOutputsExample(std::vector<itk::ImpactModelConfiguration> & modelsConfig
         }
       }
     }
-    for (itk::ImpactModelConfiguration & config : modelsConfig)
-    {
-      std::vector<std::vector<torch::indexing::TensorIndex>> centersIndexLayers;
-      for (const torch::Tensor & tensor : outputsTensor)
-      {
-        std::vector<torch::indexing::TensorIndex> centersIndexLayer;
-        centersIndexLayer.push_back("...");
-        for (int j = 2; j < tensor.dim(); ++j)
-        {
-          centersIndexLayer.push_back(tensor.size(j) / 2);
-        }
-        centersIndexLayers.push_back(centersIndexLayer);
-      }
-      itk::SetCentersIndexLayers(config, centersIndexLayers);
-    }
   }
   // How many patches one online forward may hold on the device (itkImpactBatchBudget.h). Done
   // here, outside the no-grad scope, so every host of the online mode gets it from this call.

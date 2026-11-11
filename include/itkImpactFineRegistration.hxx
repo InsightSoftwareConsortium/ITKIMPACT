@@ -1130,7 +1130,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             return F::grid_sample(moving ? movingT : fixedT, at, sampleOpts).reshape(shape);
           };
           // Every kept layer's centre feature vector {b, C} of a model run on `patches`, normalized, the voxel the
-          // patch is centred on (GetCentersIndexLayers' size / 2).
+          // patch is centred on (size / 2 along every axis).
           auto centresOf = [&](const ImpactModelConfiguration & config,
                                const torch::Tensor &            patches,
                                const ImpactImageMetadata &      metadata) {
