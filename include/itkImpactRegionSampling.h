@@ -28,6 +28,7 @@
 
 #include <itkImageRegion.h>
 #include <itkImageRegionConstIterator.h>
+#include <itkImageRegionIterator.h>
 #include <itkMacro.h>
 
 #include <torch/torch.h>
@@ -259,6 +260,56 @@ WriteCells(torch::Tensor & whole, const std::vector<int64_t> & c0, const torch::
     view = view.narrow(2 + static_cast<int64_t>(d), c0[d], t.size(2 + static_cast<int64_t>(d)));
   }
   view.copy_(t);
+}
+
+/** The cells from `c0` on of a field ({1, Dim, n...}, in voxels of the fixed grid, tensor order) written into the
+ * image AllocateCellGrid made for `cells` cells, in millimetres, as BuildCellGrid writes the whole field: the cells on
+ * a side of the grid replicated over its border. */
+template <unsigned int Dim, typename TFixedImage>
+void
+WriteCellsToCellGrid(const torch::Tensor &            field,
+                     const std::vector<int64_t> &     c0,
+                     const std::vector<int64_t> &     cells,
+                     const TFixedImage *              fixed,
+                     Image<Vector<float, Dim>, Dim> * grid)
+{
+  namespace F = torch::nn::functional;
+  using FieldType = Image<Vector<float, Dim>, Dim>;
+  std::vector<int64_t>           padding; // F::pad takes its pairs from the last axis backwards
+  typename FieldType::RegionType region;
+  for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
+  {
+    const int64_t n = field.size(2 + d);
+    const int64_t low = c0[d] == 0 ? CellGridBorder : 0;
+    const int64_t high = c0[d] + n == cells[d] ? CellGridBorder : 0;
+    padding.push_back(low);
+    padding.push_back(high);
+    region.SetIndex(Dim - 1 - d, static_cast<IndexValueType>(c0[d] + CellGridBorder - low));
+    region.SetSize(Dim - 1 - d, static_cast<SizeValueType>(n + low + high));
+  }
+  const torch::Tensor values = F::pad(field, F::PadFuncOptions(padding).mode(torch::kReplicate))
+                                 .squeeze(0)
+                                 .permute(SqueezedChannelLastPermutation<Dim>())
+                                 .contiguous()
+                                 .to(torch::kCPU);
+  const float *                  v = values.data_ptr<float>(); // components in (z, y, x) order
+  const auto &                   spacing = fixed->GetSpacing();
+  const auto &                   direction = fixed->GetDirection();
+  ImageRegionIterator<FieldType> it(grid, region);
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it, v += Dim) // raster order, ITK x fastest: the tensor's
+  {
+    Vector<float, Dim> physical;
+    for (unsigned int r = 0; r < Dim; ++r)
+    {
+      double accumulator = 0.0;
+      for (unsigned int c = 0; c < Dim; ++c)
+      {
+        accumulator += direction[r][c] * spacing[c] * static_cast<double>(v[Dim - 1 - c]);
+      }
+      physical[r] = accumulator;
+    }
+    it.Set(physical);
+  }
 }
 
 /** Where a layer's samples lie among the image's voxels, along each tensor axis: every `stride` voxels from the

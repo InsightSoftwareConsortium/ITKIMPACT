@@ -273,7 +273,9 @@ public:
    * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
    * as the whole-image run resizes its dense field. The output is produced by region:
    * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
-   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. */
+   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. Of what grows with
+   * the image, the run leaves in host memory the control grid GetControlGridTransform() holds, 4 * ImageDimension
+   * bytes a control cell, written a box at a time, and the initial displacement field as the caller gave it. */
   /** @{ */
   /** Side of a box, in voxels; 0 (the default) reads the images whole. */
   itkSetMacro(RegionSize, unsigned int);

@@ -2774,10 +2774,29 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
   }
 
-  // ---- The control grid, smoothed, as the field on its own grid; the dense output is interpolated from it. ----
+  // ---- The control grid, smoothed, as the field on its own grid, written a box at a time from the cells its
+  // smoothing reads: the host holds that image alone. The dense output is interpolated from it. ----
   {
     torch::NoGradGuard noGrad;
-    m_ControlGrid = Impact::BuildCellGrid<Dim>(smoothControl(theta), m_FixedImage.GetPointer());
+    m_ControlGrid = Impact::AllocateCellGrid<Dim>(cells, m_FixedImage.GetPointer());
+    const auto smoothingReach = static_cast<int64_t>(m_ControlGridSmoothingIterations);
+    for (const Impact::CellBox & box : boxes)
+    {
+      std::vector<int64_t> w0(Dim), w1(Dim), lo(Dim), hi(Dim);
+      for (unsigned int d = 0; d < Dim; ++d)
+      {
+        w0[d] = std::max<int64_t>(0, box.cell0[d] - smoothingReach);
+        w1[d] = std::min<int64_t>(cells[d], box.cell1[d] + smoothingReach);
+        lo[d] = box.cell0[d] - w0[d];
+        hi[d] = box.cell1[d] - w0[d];
+      }
+      Impact::WriteCellsToCellGrid<Dim>(
+        Impact::NarrowTo(smoothControl(cellsOf(theta, w0, w1).to(device)), lo, hi, 2),
+        box.cell0,
+        cells,
+        m_FixedImage.GetPointer(),
+        m_ControlGrid.GetPointer());
+    }
   }
   m_ControlGridTransform = DisplacementFieldTransformType::New();
   m_ControlGridTransform->SetDisplacementField(m_ControlGrid);

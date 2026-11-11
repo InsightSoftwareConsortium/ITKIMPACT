@@ -581,19 +581,15 @@ WriteVoxelFieldToDisplacement(const torch::Tensor &                             
   }
 }
 
-/** A field on a grid of cells ({1, Dim, cells...}, in voxels of the fixed grid, tensor order), one sample at each
- * cell's centre, the cells sharing the fixed image's extent, as a displacement image in millimetres on its own grid,
- * padded by two cells of replicated border each side: its linear interpolation gives at every fixed voxel what the
- * trilinear upsampling of the field to the fixed size (align_corners=false) gives, ConvexAdam's. */
+/** The cells replicated past each side of a cell grid (BuildCellGrid's border). */
+constexpr int64_t CellGridBorder = 2;
+
+/** BuildCellGrid's image for a field of `cells` cells (tensor order), allocated, its values left to the caller. */
 template <unsigned int Dim, typename TFixedImage>
 typename Image<Vector<float, Dim>, Dim>::Pointer
-BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
+AllocateCellGrid(const std::vector<int64_t> & cells, const TFixedImage * fixed)
 {
-  namespace F = torch::nn::functional;
   using FieldType = Image<Vector<float, Dim>, Dim>;
-  constexpr int64_t               pad = 2;
-  const std::vector<int64_t>      padding(2 * Dim, pad);
-  const torch::Tensor             padded = F::pad(voxelField, F::PadFuncOptions(padding).mode(torch::kReplicate));
   auto                            grid = FieldType::New();
   typename FieldType::SizeType    size;
   typename FieldType::SpacingType spacing;
@@ -602,11 +598,11 @@ BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
   const auto &                    fixedSize = fixed->GetLargestPossibleRegion().GetSize();
   for (unsigned int a = 0; a < Dim; ++a)
   {
-    const int64_t tensorAxis = 2 + static_cast<int64_t>(Dim - 1 - a);
-    const double  stretch = static_cast<double>(fixedSize[a]) / static_cast<double>(voxelField.size(tensorAxis));
-    size[a] = static_cast<SizeValueType>(padded.size(tensorAxis));
+    const int64_t count = cells[Dim - 1 - a];
+    const double  stretch = static_cast<double>(fixedSize[a]) / static_cast<double>(count);
+    size[a] = static_cast<SizeValueType>(count + 2 * CellGridBorder);
     spacing[a] = fixed->GetSpacing()[a] * stretch;
-    shift[a] = (stretch - 1.0) / 2.0 - static_cast<double>(pad) * stretch;
+    shift[a] = (stretch - 1.0) / 2.0 - static_cast<double>(CellGridBorder) * stretch;
   }
   typename FieldType::PointType first; // the first voxel of the region, whatever its index
   fixed->TransformIndexToPhysicalPoint(fixed->GetLargestPossibleRegion().GetIndex(), first);
@@ -626,6 +622,22 @@ BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
   grid->SetOrigin(origin);
   grid->SetDirection(fixed->GetDirection());
   grid->Allocate();
+  return grid;
+}
+
+/** A field on a grid of cells ({1, Dim, cells...}, in voxels of the fixed grid, tensor order), one sample at each
+ * cell's centre, the cells sharing the fixed image's extent, as a displacement image in millimetres on its own grid,
+ * padded by two cells of replicated border each side: its linear interpolation gives at every fixed voxel what the
+ * trilinear upsampling of the field to the fixed size (align_corners=false) gives, ConvexAdam's. */
+template <unsigned int Dim, typename TFixedImage>
+typename Image<Vector<float, Dim>, Dim>::Pointer
+BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
+{
+  namespace F = torch::nn::functional;
+  const std::vector<int64_t> padding(2 * Dim, CellGridBorder);
+  const torch::Tensor        padded = F::pad(voxelField, F::PadFuncOptions(padding).mode(torch::kReplicate));
+  auto                       grid =
+    AllocateCellGrid<Dim>(std::vector<int64_t>(voxelField.sizes().begin() + 2, voxelField.sizes().end()), fixed);
   WriteVoxelFieldToDisplacement<Dim>(padded, fixed->GetSpacing(), fixed->GetDirection(), grid);
   return grid;
 }
