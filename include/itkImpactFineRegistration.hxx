@@ -150,6 +150,23 @@ PatchCorners(const ImpactModelConfiguration & config)
   return corners;
 }
 
+/** `passes` averages over 3^Dim cells (zero-padded) of a control field ({1, Dim, cells...}), ConvexAdam's
+ * smoothing; the field itself without a pass. */
+template <unsigned int Dim>
+torch::Tensor
+SmoothControlField(torch::Tensor control, unsigned int passes)
+{
+  namespace F = torch::nn::functional;
+  for (unsigned int k = 0; k < passes; ++k)
+  {
+    if constexpr (Dim == 3)
+      control = F::avg_pool3d(control, F::AvgPool3dFuncOptions(3).stride(1).padding(1));
+    else
+      control = F::avg_pool2d(control, F::AvgPool2dFuncOptions(3).stride(1).padding(1));
+  }
+  return control;
+}
+
 } // namespace Impact
 
 template <typename TFixedImage, typename TMovingImage>
@@ -394,17 +411,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   const auto controlOpts =
     F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kBorder).align_corners(false);
 
-  // Optional 3x3x3 average-pool smoothing passes on the control field (identity if disabled).
-  auto smoothControl = [&](const torch::Tensor & control) -> torch::Tensor {
-    torch::Tensor s = control;
-    for (unsigned int k = 0; k < m_ControlGridSmoothingIterations; ++k)
-    {
-      if constexpr (ImageDimension == 3)
-        s = F::avg_pool3d(s, F::AvgPool3dFuncOptions(3).stride(1).padding(1));
-      else
-        s = F::avg_pool2d(s, F::AvgPool2dFuncOptions(3).stride(1).padding(1));
-    }
-    return s;
+  auto smoothControl = [&](const torch::Tensor & control) {
+    return Impact::SmoothControlField<ImageDimension>(control, m_ControlGridSmoothingIterations);
   };
 
   // Resize a displacement field {1, N, ...} to a target spatial size (identity if already equal).
@@ -2288,16 +2296,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   }
   // Epsilon weighs against the gradient per control cell, as in the dense run.
   const double     adamEpsilon = m_Epsilon / static_cast<double>(std::max(1u, m_GridShrinkFactor));
-  auto             smoothControl = [&](const torch::Tensor & control) -> torch::Tensor {
-    torch::Tensor s = control;
-    for (unsigned int k = 0; k < m_ControlGridSmoothingIterations; ++k)
-    {
-      if constexpr (Dim == 3)
-        s = F::avg_pool3d(s, F::AvgPool3dFuncOptions(3).stride(1).padding(1));
-      else
-        s = F::avg_pool2d(s, F::AvgPool2dFuncOptions(3).stride(1).padding(1));
-    }
-    return s;
+  auto             smoothControl = [&](const torch::Tensor & control) {
+    return Impact::SmoothControlField<Dim>(control, m_ControlGridSmoothingIterations);
   };
   // The diffusion regularizer over the differences along `ax` between `first` and `second` ({1, Dim, ...}, the
   // smoothed field at consecutive cells), over the count the dense mean divides by. `smoothed` holds the cells from
