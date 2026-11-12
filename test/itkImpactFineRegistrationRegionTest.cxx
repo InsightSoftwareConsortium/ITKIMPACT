@@ -19,7 +19,8 @@
 // The region-sampled run of ImpactFineRegistration against its whole-image run, on the intensity similarity: it
 // reproduces the dense field, with the pooled maps resident and by bricks from mapped files that the run removes; a
 // streaming reader gives the same field as the image in memory and is read by regions; a transform set on the moving
-// side is applied outside the field.
+// side is applied outside the field; stepping the boxes drawn at each iteration is that run when every box is
+// drawn, and tends to it with a few as the iterations grow.
 
 #include "itkImpactFineRegistration.h"
 
@@ -512,6 +513,77 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     if (!(residentDifference < 1e-5) || !(mappedDifference < 1e-5))
     {
       std::cerr << "By boxes whose last is one cell, the field differs from the whole-image run's." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  // 8. RegionsPerIteration: an iteration steps the cells of the boxes it draws, with the whole grid's gradient.
+  {
+    auto drawing = [&](unsigned int regionsPerIteration, unsigned int iterations, double epsilon, bool mapped) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fixed);
+      fine->SetMovingImage(moving);
+      fine->SetInitialDisplacementField(start);
+      Configure(fine, iterations, epsilon);
+      fine->SetRegionSize(16);
+      fine->SetRegionsPerIteration(regionsPerIteration);
+      if (mapped)
+      {
+        fine->SetResidentFeatureBudget(1);
+        fine->SetScratchDirectory(scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    auto differenceOf = [&](const FineType * a, const FieldType * b) {
+      return MaxDifference(a->GetOutput(), b, fixed->GetLargestPossibleRegion());
+    };
+    // All 18 boxes at every iteration: the run that steps every cell, with the maps resident and in mapped files.
+    const auto everyResident = drawing(18, 6, 1.0, false);
+    ITK_TEST_SET_GET_VALUE(18u, everyResident->GetRegionsPerIteration());
+    const auto   everyMapped = drawing(1000, 6, 1.0, true);
+    const double residentDifference = differenceOf(everyResident, denseField);
+    const double mappedDifference = differenceOf(everyMapped, denseField);
+    std::cout << "every box drawn at every iteration, against the dense run: max |difference| = " << residentDifference
+              << " mm with the maps resident, " << mappedDifference << " mm from mapped files" << std::endl;
+    if (everyResident->GetMetricValuesPerIteration().size() != 6 || !everyResident->GetResidentFeatures() ||
+        everyMapped->GetResidentFeatures() || !(residentDifference < 1e-5) || !(mappedDifference < 1e-5))
+    {
+      std::cerr << "Drawing every box at every iteration is not the run that steps every cell." << std::endl;
+      return EXIT_FAILURE;
+    }
+    // Three boxes an iteration: one field for one seed, from mapped files as with the maps resident.
+    const auto   fewMapped = drawing(3, 36, 1.0, true);
+    const double againDifference = differenceOf(drawing(3, 36, 1.0, true), fewMapped->GetOutput());
+    const double routeDifference = differenceOf(drawing(3, 36, 1.0, false), fewMapped->GetOutput());
+    std::cout << "three boxes an iteration: max |difference| = " << againDifference << " mm between two runs, "
+              << routeDifference << " mm between mapped files and resident maps" << std::endl;
+    if (fewMapped->GetMetricValuesPerIteration().size() != 36 || againDifference != 0.0 || !(routeDifference < 1e-5))
+    {
+      std::cerr << "Three boxes an iteration do not give one field for one seed." << std::endl;
+      return EXIT_FAILURE;
+    }
+    // And the field tends to that of every cell at every iteration: at as many steps a cell on average (six
+    // iterations of 3 boxes for one of all 18), the two fields close in as the steps grow. Under an epsilon of the
+    // gradients' order, with which Adam's steps die out near the minimum both runs go to. Measured: 0.40, 0.17 and
+    // 0.044 mm at 15, 45 and 135 steps a cell, for fields that moved by 2.2 mm.
+    double previous = std::numeric_limits<double>::infinity();
+    for (const unsigned int steps : { 15u, 45u, 135u })
+    {
+      const double distance =
+        differenceOf(drawing(3, 6 * steps, 1e-4, false), drawing(0, steps, 1e-4, false)->GetOutput());
+      std::cout << "three boxes an iteration against every cell, " << steps
+                << " steps a cell: max |difference| = " << distance << " mm" << std::endl;
+      if (!(distance < previous / 1.5))
+      {
+        std::cerr << "The field of three boxes an iteration does not close in on that of every cell." << std::endl;
+        return EXIT_FAILURE;
+      }
+      previous = distance;
+    }
+    if (!std::filesystem::is_empty(scratch))
+    {
+      std::cerr << "The runs that draw their boxes left files in the scratch directory." << std::endl;
       return EXIT_FAILURE;
     }
   }
