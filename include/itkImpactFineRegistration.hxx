@@ -2690,7 +2690,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // smoothing reads: the host holds that image alone. The dense output is interpolated from it. ----
   {
     torch::NoGradGuard noGrad;
-    m_ControlGrid = Impact::AllocateCellGrid<Dim>(cells, m_FixedImage.GetPointer());
+    m_ControlGrid = Impact::AllocateCellGrid<Dim>(
+      cells,
+      m_FixedImage.GetPointer(),
+      m_ResidentFeatures ? nullptr : Impact::MapCellGridPixels<Dim>(cells, scratch).GetPointer());
     const auto smoothingReach = static_cast<int64_t>(m_ControlGridSmoothingIterations);
     for (const Impact::CellBox & box : boxes)
     {

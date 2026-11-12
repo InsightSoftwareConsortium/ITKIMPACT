@@ -585,10 +585,13 @@ WriteVoxelFieldToDisplacement(const torch::Tensor &                             
 /** The cells replicated past each side of a cell grid (BuildCellGrid's border). */
 constexpr int64_t CellGridBorder = 2;
 
-/** BuildCellGrid's image for a field of `cells` cells (tensor order), allocated, its values left to the caller. */
+/** BuildCellGrid's image for a field of `cells` cells (tensor order), its values left to the caller: allocated, or
+ * on `pixels` when given, a container of as many pixels as the grid with its border has samples. */
 template <unsigned int Dim, typename TFixedImage>
 typename Image<Vector<float, Dim>, Dim>::Pointer
-AllocateCellGrid(const std::vector<int64_t> & cells, const TFixedImage * fixed)
+AllocateCellGrid(const std::vector<int64_t> &                              cells,
+                 const TFixedImage *                                       fixed,
+                 typename Image<Vector<float, Dim>, Dim>::PixelContainer * pixels = nullptr)
 {
   using FieldType = Image<Vector<float, Dim>, Dim>;
   auto                            grid = FieldType::New();
@@ -622,7 +625,14 @@ AllocateCellGrid(const std::vector<int64_t> & cells, const TFixedImage * fixed)
   grid->SetSpacing(spacing);
   grid->SetOrigin(origin);
   grid->SetDirection(fixed->GetDirection());
-  grid->Allocate();
+  if (pixels != nullptr)
+  {
+    grid->SetPixelContainer(pixels);
+  }
+  else
+  {
+    grid->Allocate();
+  }
   return grid;
 }
 

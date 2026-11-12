@@ -274,11 +274,13 @@ public:
    * streaming reader, or the output of ImpactCoarseRegistration run by regions, is asked for the region around
    * each box alone). The output is produced by region:
    * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
-   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. Of what grows with
-   * the image, the run leaves in host memory the control grid GetControlGridTransform() holds, 4 * ImageDimension
-   * bytes a control cell, written a box at a time. */
+   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. With the pooled
+   * maps in mapped files, nothing the run holds in host memory or on the device grows with the image, save about
+   * a hundred bytes a box (the lists of the boxes and their counts of cells): the control grid of
+   * GetControlGridTransform() is a mapped file too. */
   /** @{ */
-  /** Side of a box, in voxels; 0 (the default) reads the images whole. */
+  /** Side of a box, in voxels; 0 (the default) reads the images whole. A model runs on a box with RegionHalo voxels
+   * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
   /** Most bytes of the mapped files a brick may bring to the device when the pooled maps are not resident: a brick
@@ -340,7 +342,11 @@ public:
   /** The (smoothed) control grid as a displacement field on its own grid, wrapped in a transform: one sample per
    * cell at the cell's centre, padded by two cells of replicated border, so that its linear interpolation is the map
    * the dense output holds at every voxel. Solves the registration if it has not run yet, without allocating the
-   * dense field. */
+   * dense field. After a run by regions whose pooled maps were not resident, the pixels of that field are a file of
+   * ScratchDirectory mapped to memory: the field's pixel container holds the mapping, so they stay valid for as
+   * long as the field, or the transform, is referenced, past the filter and its next run, and the file is removed
+   * when the last reference goes. Reading them pages them in; copying the field (to an array) brings it to memory
+   * whole. */
   DisplacementFieldTransformType *
   GetControlGridTransform();
 

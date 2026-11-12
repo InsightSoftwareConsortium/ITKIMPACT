@@ -30,6 +30,7 @@
 #include <itkImageRegion.h>
 #include <itkImageRegionConstIterator.h>
 #include <itkImageRegionIterator.h>
+#include <itkImportImageContainer.h>
 #include <itkMacro.h>
 
 #include <torch/torch.h>
@@ -701,7 +702,7 @@ struct CellAdam
  * \brief Tensors of zeros in files of a directory, mapped shared.
  *
  * The kernel pages them in and out, so what grows with the image need not fit the memory. The files go with the
- * object, which the tensors must not outlive. */
+ * object, which the tensors must not outlive, save one kept by its caller. */
 class ScratchFiles
 {
 public:
@@ -721,8 +722,12 @@ public:
     }
   }
 
+  /** With `kept`, the file is the caller's from then on: it outlives this object, and the caller removes `*kept`
+   * once the tensor is gone. */
   torch::Tensor
-  Zeros(const std::vector<int64_t> & shape, torch::ScalarType dtype = torch::kFloat32)
+  Zeros(const std::vector<int64_t> & shape,
+        torch::ScalarType            dtype = torch::kFloat32,
+        std::filesystem::path *      kept = nullptr)
   {
     int64_t count = 1;
     for (const int64_t n : shape)
@@ -780,6 +785,11 @@ public:
 #if !defined(_WIN32)
     std::filesystem::remove(path, error); // the mapping keeps it: a killed process leaves nothing behind
 #endif
+    if (kept != nullptr)
+    {
+      *kept = path;
+      m_Paths.pop_back();
+    }
     m_Bytes += bytes;
     return tensor.view(shape);
   }
@@ -797,6 +807,64 @@ private:
   std::uintmax_t                     m_Available{ 0 };
   std::uintmax_t                     m_Bytes{ 0 };
 };
+
+/** \class MappedPixels
+ * \ingroup Impact
+ * \brief The pixels of an image in a file mapped to memory.
+ *
+ * The container holds the mapping, which lives as long as the image whose pixels it is and whatever holds that
+ * image; the file goes with it. */
+template <typename TPixel>
+class MappedPixels : public ImportImageContainer<SizeValueType, TPixel>
+{
+public:
+  ITK_DISALLOW_COPY_AND_MOVE(MappedPixels);
+
+  using Self = MappedPixels;
+  using Superclass = ImportImageContainer<SizeValueType, TPixel>;
+  using Pointer = SmartPointer<Self>;
+  using ConstPointer = SmartPointer<const Self>;
+
+  itkNewMacro(Self);
+  itkOverrideGetNameOfClassMacro(MappedPixels);
+
+  /** `count` pixels of zeros in a file of `scratch`. */
+  void
+  Map(ScratchFiles & scratch, SizeValueType count)
+  {
+    m_Mapping = scratch.Zeros({ static_cast<int64_t>(count * sizeof(TPixel)) }, torch::kUInt8, &m_Path);
+    this->SetImportPointer(static_cast<TPixel *>(m_Mapping.data_ptr()), count, /*LetContainerManageMemory=*/false);
+  }
+
+protected:
+  MappedPixels() = default;
+  ~MappedPixels() override
+  {
+    m_Mapping = torch::Tensor(); // unmapped before the file goes
+    std::error_code ignored;
+    std::filesystem::remove(m_Path, ignored);
+  }
+
+private:
+  torch::Tensor         m_Mapping;
+  std::filesystem::path m_Path;
+};
+
+/** The pixels of AllocateCellGrid's image for `cells` cells, in a file of `scratch`: of the grid the host memory
+ * then holds the pages the system keeps of it. */
+template <unsigned int Dim>
+typename MappedPixels<Vector<float, Dim>>::Pointer
+MapCellGridPixels(const std::vector<int64_t> & cells, ScratchFiles & scratch)
+{
+  SizeValueType count = 1;
+  for (const int64_t n : cells)
+  {
+    count *= static_cast<SizeValueType>(n + 2 * CellGridBorder);
+  }
+  auto pixels = MappedPixels<Vector<float, Dim>>::New();
+  pixels->Map(scratch, count);
+  return pixels;
+}
 
 /** What the pooled feature maps of a region-sampled run may take to stay resident on `device`, when the caller sets
  * no budget: half the device memory free now, or a quarter of the machine's memory on the CPU. */
