@@ -280,7 +280,7 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
 
   // 4. A transform on the moving side, outside the field: the translation undoing the shift leaves little to find.
   {
-    ImageType::Pointer     far = Texture(size, 5.5, -1.0, 0.5);
+    ImageType::Pointer     shifted = Texture(size, 5.5, -1.0, 0.5);
     auto                   shift = itk::TranslationTransform<double, 3>::New();
     itk::Vector<double, 3> offset;
     offset[0] = -5.5;
@@ -289,7 +289,7 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
     shift->SetOffset(offset);
     auto undone = CoarseType::New();
     undone->SetFixedImage(fixed);
-    undone->SetMovingImage(far);
+    undone->SetMovingImage(shifted);
     undone->SetMovingTransform(shift);
     Configure(undone);
     undone->SetRegionSize(16);
