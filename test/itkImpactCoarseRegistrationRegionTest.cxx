@@ -166,8 +166,8 @@ CompareRoutes(CoarseType * resident, CoarseType * mapped, const std::string & sc
   std::cout << label << ": coarse grids, mapped against resident: max |difference| = " << difference << " mm"
             << std::endl;
   // A brick takes the steps the grid takes whole, on the same values; the inverse consistency alone reads its
-  // window in the window's own coordinates, a rounding apart: 5.5e-6 mm at most over the cases measured (plain,
-  // masks, L2, L1, NCC and cosine on a model), none without it. Ten times that.
+  // window in the window's own coordinates, a rounding apart: 8.7e-6 mm at most over the cases of this test, and
+  // none without it or where a window is the grid.
   if (!(difference < 5e-5))
   {
     std::cerr << label << ": the run from mapped files differs from the resident one." << std::endl;
@@ -326,6 +326,34 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
     if (CompareRoutes(maskedRegions, maskedMapped, scratch, "with masks") != EXIT_SUCCESS)
     {
       return EXIT_FAILURE;
+    }
+  }
+
+  // The least boxes. A grid of 7 x 6 x 5 cells, read by regions of 2: with a cost volume by boxes of one cell
+  // (CostBoxBytes 1, the least), then of 3, whose last along an axis is one cell, every step of the mapped solve
+  // takes bricks narrower than its kernels, at the ends of the grid too, and gives the resident run's field.
+  {
+    const ImageType::SizeType few = { { 14, 12, 10 } };
+    ImageType::Pointer        fewFixed = Texture(few, 0.0, 0.0, 0.0);
+    ImageType::Pointer        fewMoving = Texture(few, 1.5, -1.0, 0.5);
+    for (const itk::SizeValueType costBoxBytes : { 1, 400000 }) // 400000: (7.4 - 4) cells a side
+    {
+      auto run = [&]() {
+        auto coarse = CoarseType::New();
+        coarse->SetFixedImage(fewFixed);
+        coarse->SetMovingImage(fewMoving);
+        Configure(coarse);
+        coarse->SetRegionSize(4);
+        coarse->SetCostBoxBytes(costBoxBytes);
+        return coarse;
+      };
+      const auto resident = run();
+      ITK_TRY_EXPECT_NO_EXCEPTION(resident->Update());
+      if (CompareRoutes(resident, run(), scratch, costBoxBytes == 1 ? "boxes of one cell" : "a last box of one cell") !=
+          EXIT_SUCCESS)
+      {
+        return EXIT_FAILURE;
+      }
     }
   }
 

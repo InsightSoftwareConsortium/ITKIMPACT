@@ -714,15 +714,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
   };
   const std::vector<TBox>   whole{ TBox{ std::vector<int64_t>(Dim, 0), coarse } };
   const std::vector<TBox> & bricks = resident ? whole : boxes;
-  // The cells within `reach` of a brick, in the grid.
+  // The cells a step reads for a brick: those within `reach` of it.
   auto around = [&](const TBox & brick, const std::vector<int64_t> & reach) {
-    TBox window = brick;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      window.cell0[d] = std::max<int64_t>(0, brick.cell0[d] - reach[d]);
-      window.cell1[d] = std::min<int64_t>(coarse[d], brick.cell1[d] + reach[d]);
-    }
-    return window;
+    return Impact::CellsAround(brick, reach, coarse);
   };
   // The cells of `box` of a map of the grid ({1, C, coarse...}), on the device; undefined as the map is.
   auto cellsOn = [&](const torch::Tensor & map, const TBox & box) {

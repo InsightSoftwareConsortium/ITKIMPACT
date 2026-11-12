@@ -478,6 +478,44 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 7. The least boxes: a control grid of 9 x 7 x 5 cells by boxes of 2, whose last along each axis is one cell,
+  // narrower than the smoothing's kernel. With the maps resident and by bricks of one box (BrickBytes 1, the
+  // least): the whole-image run's field.
+  {
+    const ImageType::SizeType few = { { 18, 14, 10 } };
+    ImageType::Pointer        fewFixed = Texture(few, 0.0, 0.0, 0.0);
+    ImageType::Pointer        fewMoving = Texture(few, 1.5, -1.0, 0.5);
+    const FieldType::Pointer  fewStart = StartingField(fewFixed);
+    auto                      run = [&](unsigned int regionSize, bool mapped) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fewFixed);
+      fine->SetMovingImage(fewMoving);
+      fine->SetInitialDisplacementField(fewStart);
+      Configure(fine, 6);
+      fine->SetRegionSize(regionSize);
+      if (mapped)
+      {
+        fine->SetResidentFeatureBudget(1);
+        fine->SetBrickBytes(1);
+        fine->SetScratchDirectory(scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto   whole = run(0, false);
+    const double residentDifference =
+      MaxDifference(whole->GetOutput(), run(4, false)->GetOutput(), fewFixed->GetLargestPossibleRegion());
+    const double mappedDifference =
+      MaxDifference(whole->GetOutput(), run(4, true)->GetOutput(), fewFixed->GetLargestPossibleRegion());
+    std::cout << "boxes whose last is one cell, against whole: max |difference| = " << residentDifference
+              << " mm with the maps resident, " << mappedDifference << " mm by bricks of one box" << std::endl;
+    if (!(residentDifference < 1e-5) || !(mappedDifference < 1e-5))
+    {
+      std::cerr << "By boxes whose last is one cell, the field differs from the whole-image run's." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
   std::cout << "Test finished." << std::endl;
   return EXIT_SUCCESS;
 }
