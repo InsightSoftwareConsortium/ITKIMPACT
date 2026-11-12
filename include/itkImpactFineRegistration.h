@@ -327,14 +327,22 @@ public:
   using TransformType = Transform<double, ImageDimension, ImageDimension>;
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
-  /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it every
-   * iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped files and every
-   * iteration brings them to the device a brick at a time. 0 (the default): half the
-   * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
-   * which route a run took. */
+  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there:
+   * within it every iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped
+   * files and every iteration brings them to the device a brick at a time. 0 (the default): half the device memory
+   * free when the run starts, a quarter of the machine's on the CPU. What is held against it is GetResidentBytes(),
+   * all that grows with the image on that route: the maps, the control grid and Adam's state, and the graph of an
+   * iteration over the whole grid, 4 * (ImageDimension * (13 + ControlGridSmoothingIterations) + 6 * channels)
+   * bytes a control cell, and 4 * (channels + 4) more with a mask or SamplingPercentage below 1 (measured in 3D on
+   * the CPU and on CUDA, on 1 to 48 channels and 0 to 3 smoothing passes: a run held between 0.77 and 0.96 of
+   * it); with RegionsPerIteration, the maps and that state alone. GetResidentFeatures() tells which route a run
+   * took. The memory is read once, when the run starts: what another process takes of the device afterwards is
+   * not seen, and the resident route can then run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);
+  /** What the last run by regions counted that it would hold on the device with everything resident, in bytes. */
+  itkGetConstMacro(ResidentBytes, SizeValueType);
   /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks' cells,
    * the control grid and the optimizer's state, in files mapped to memory that the system pages in and out, removed
    * when the run ends. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs)
@@ -444,6 +452,7 @@ private:
   unsigned int  m_RegionHalo{ 0 };
   SizeValueType m_ResidentFeatureBudget{ 0 };
   bool          m_ResidentFeatures{ false };
+  SizeValueType m_ResidentBytes{ 0 };
   std::string   m_ScratchDirectory;
 
   typename TransformType::ConstPointer m_MovingTransform{ nullptr };
