@@ -581,11 +581,6 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       }
       previous = distance;
     }
-    if (!std::filesystem::is_empty(scratch))
-    {
-      std::cerr << "The runs that draw their boxes left files in the scratch directory." << std::endl;
-      return EXIT_FAILURE;
-    }
   }
 
   // 9. A moving mask, which cuts the boxes unevenly: the cells that count follow the field, and the loss is their
@@ -638,6 +633,13 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
                 << std::endl;
       return EXIT_FAILURE;
     }
+  }
+
+  // Every run from mapped files is gone, and its control grid with it: so are the files.
+  if (!std::filesystem::is_empty(scratch))
+  {
+    std::cerr << "The runs from mapped files left files in the scratch directory." << std::endl;
+    return EXIT_FAILURE;
   }
 
   std::cout << "Test finished." << std::endl;
