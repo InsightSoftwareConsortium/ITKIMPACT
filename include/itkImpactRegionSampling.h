@@ -794,13 +794,6 @@ public:
     return tensor.view(shape);
   }
 
-  /** The bytes mapped so far. */
-  std::uintmax_t
-  GetBytes() const
-  {
-    return m_Bytes;
-  }
-
 private:
   std::filesystem::path              m_Directory;
   std::vector<std::filesystem::path> m_Paths;

@@ -2513,21 +2513,27 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       return count;
     };
-    // As many boxes a side as BrickBytes holds: a cell brings its share of the mapped files, the graph on a brick's
-    // cells taking a few times that.
+    // The cells a brick reads: its own, the regularizer's next one, and the smoothing's reach.
+    const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
+    // As many boxes a side as BrickBytes holds on the device. At its peak a step holds there, in floats, Dim * (6 +
+    // the smoothing passes) for each cell the brick reads (the field along the graph) and four for each channel of
+    // each of its own cells (the two maps, the features sampled and their gradient).
     const double brickBytes =
       m_BrickBytes > 0 ? static_cast<double>(m_BrickBytes) : Impact::ResidentBudget(device) / 8.0;
-    const double held = brickBytes * static_cast<double>(cellCountTotal) / static_cast<double>(scratch.GetBytes());
-    auto         brickCells = [&](int64_t boxesASide) {
+    auto brickCells = [&](int64_t boxesASide, int64_t around) {
       double count = 1.0;
       for (unsigned int d = 0; d < Dim; ++d)
       {
-        count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d]));
+        count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d] + 2 * around));
       }
       return count;
     };
+    auto stepBytes = [&](int64_t boxesASide) {
+      return 4.0 * (static_cast<double>(Dim * (6 + m_ControlGridSmoothingIterations)) * brickCells(boxesASide, reach) +
+                    4.0 * static_cast<double>(channelCount) * brickCells(boxesASide, 0));
+    };
     int64_t boxesASide = 1;
-    while (brickCells(boxesASide) < static_cast<double>(cellCountTotal) && brickCells(boxesASide + 1) <= held)
+    while (brickCells(boxesASide, 0) < static_cast<double>(cellCountTotal) && stepBytes(boxesASide + 1) <= brickBytes)
     {
       ++boxesASide;
     }
@@ -2544,10 +2550,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                ? Impact::NarrowTo(fixedOn, brick.cell0, brick.cell1).sum().template item<int64_t>()
                                : cellCountOf(brick));
     }
-    // The cells a brick touches: its own, the regularizer's next one, and the smoothing's reach. Smoothed alone,
-    // they give the smoothed field of the whole grid on the brick's cells and the regularizer's next one.
-    const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
-    auto          touchedBy = [&](const Impact::CellBox & brick) {
+    // The cells a brick touches. Smoothed alone, they give the smoothed field of the whole grid on the brick's
+    // cells and the regularizer's next one.
+    auto touchedBy = [&](const Impact::CellBox & brick) {
       Impact::CellBox window = brick;
       for (unsigned int d = 0; d < Dim; ++d)
       {

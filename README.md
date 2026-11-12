@@ -172,7 +172,7 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   compares them whole, the dense run on them; otherwise they stay, with the control grid and the
   optimizer's state, in files of `ScratchDirectory` mapped to memory (give a directory on a disk for
   an image larger than the memory), and every iteration steps every cell, by bricks of boxes sized
-  to the device (`BrickBytes`). Either way the images are read once and the field is the
+  to the device (`BrickBytes`, the most bytes a step holds there). Either way the images are read once and the field is the
   whole-image run's, to float precision. `SetMovingTransform` applies a
   transform (an affine, a coarser pass's field) to the moving side outside the optimization;
   `GetControlGridTransform()` is the result on the control grid, `GetOutput()` the dense field,
