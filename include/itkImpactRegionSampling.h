@@ -746,14 +746,14 @@ public:
     }
     if (error)
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
-                               << " cannot be used: " << error.message() << ".");
+      itkGenericExceptionMacro(<< "The scratch directory " << m_Directory << " cannot be used: " << error.message()
+                               << ".");
     }
     // Against the space free when the run started: all that guards a system that cannot reserve a file's blocks.
     if (m_Bytes + bytes > m_Available)
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory << " has "
-                               << m_Available << " bytes free where the run maps " << m_Bytes + bytes
+      itkGenericExceptionMacro(<< "The scratch directory " << m_Directory << " has " << m_Available
+                               << " bytes free where the run maps " << m_Bytes + bytes
                                << "; set ScratchDirectory to a directory of a larger disk.");
     }
     std::random_device          random;
@@ -761,7 +761,7 @@ public:
                                                       std::to_string(random()) + "-" + std::to_string(m_Paths.size()));
     if (std::filesystem::exists(path))
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch file " << path << " exists.");
+      itkGenericExceptionMacro(<< "The scratch file " << path << " exists.");
     }
     m_Paths.push_back(path);
 #if defined(__linux__)
@@ -775,8 +775,8 @@ public:
     }
     if (failure != 0 && failure != EOPNOTSUPP && failure != EINVAL) // those two: a file system without the call
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
-                               << " cannot hold a file of " << bytes << " bytes (" << std::strerror(failure)
+      itkGenericExceptionMacro(<< "The scratch directory " << m_Directory << " cannot hold a file of " << bytes
+                               << " bytes (" << std::strerror(failure)
                                << "); set ScratchDirectory to a directory of a larger disk.");
     }
 #endif

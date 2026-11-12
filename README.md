@@ -183,9 +183,12 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   control cells; the caller keeps its readers alive.
 - **The coarse stage by regions.** `SetRegionSize(n)` on `ImpactCoarseRegistration` reads the pair the same
   way: one pass over the boxes (each with its halo, the moving image brought onto the fixed grid region by
-  region) extracts the features and pools them to the coarse grid, which stays on the device; the cost volume
+  region) extracts the features and pools them to the coarse grid; the cost volume
   is then built by boxes of that grid, each within `CostBoxBytes`, never whole, and the coupled-convex
-  iterations and the inverse consistency run on the pooled maps; `SetMovingTransform` reads the moving image
+  iterations and the inverse consistency run on the pooled maps. When those fit `ResidentFeatureBudget` they
+  stay on the device; otherwise they stay, with the fields of the solve and the coarse grid, in files of
+  `ScratchDirectory` mapped to memory, and every step goes by those boxes with the cells around each that it
+  reads: nothing held in memory then grows with the image. `SetMovingTransform` reads the moving image
   through an affine pre-alignment. The field is the whole-image run's to float precision for a model whose
   features are local; the shipped MIND bounds its variance by an image-wide mean (`mind_var_mean`), so its
   region features differ slightly where that bound binds (on the test CT pair the coarse grids differ by
