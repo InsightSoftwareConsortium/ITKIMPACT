@@ -86,6 +86,14 @@ itk_add_test(NAME itkImpactCoarseRegistrationRegionTest
   COMMAND ImpactTestDriver itkImpactCoarseRegistrationRegionTest
   ${ITK_TEST_OUTPUT_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModelDown.pt)
 
+# What the two stages hold by regions, counted on two sizes of image. Its own executable: it replaces operator new.
+add_executable(ImpactRegionMemoryTest itkImpactRegionMemoryTest.cxx)
+target_link_libraries(ImpactRegionMemoryTest PRIVATE ${Impact-Test_LIBRARIES})
+impact_link_python_embed(ImpactRegionMemoryTest)
+itk_module_target_label(ImpactRegionMemoryTest)
+itk_add_test(NAME itkImpactRegionMemoryTest
+  COMMAND ImpactRegionMemoryTest ${ITK_TEST_OUTPUT_DIR})
+
 # GoogleTest-based unit tests for the IMPACT backend. Self-contained: they use
 # synthetic images plus the tiny committed Data/ImpactToyModel.pt, so they do
 # not depend on ExternalData.
@@ -142,7 +150,7 @@ if(WIN32)
     find_package(Torch REQUIRED)
   endif()
   file(GLOB _impact_torch_dlls "${TORCH_INSTALL_PREFIX}/lib/*.dll")
-  foreach(_impact_driver ImpactTestDriver ImpactGTestDriver)
+  foreach(_impact_driver ImpactTestDriver ImpactRegionMemoryTest ImpactGTestDriver)
     if(TARGET ${_impact_driver} AND _impact_torch_dlls)
       add_custom_command(TARGET ${_impact_driver} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_impact_torch_dlls} "$<TARGET_FILE_DIR:${_impact_driver}>"

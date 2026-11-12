@@ -30,6 +30,7 @@
 #include <itkImageRegion.h>
 #include <itkImageRegionConstIterator.h>
 #include <itkImageRegionIterator.h>
+#include <itkImportImageContainer.h>
 #include <itkMacro.h>
 
 #include <torch/torch.h>
@@ -38,7 +39,9 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <string>
 #include <system_error>
@@ -621,6 +624,14 @@ struct CellBox
 {
   std::vector<int64_t> cell0;
   std::vector<int64_t> cell1;
+
+  /** Its cells. */
+  int64_t
+  Count() const
+  {
+    return std::transform_reduce(
+      cell1.begin(), cell1.end(), cell0.begin(), int64_t{ 1 }, std::multiplies<>(), std::minus<>());
+  }
 };
 
 inline std::vector<CellBox>
@@ -654,9 +665,40 @@ TileCells(const std::vector<int64_t> & cells, const std::vector<int64_t> & perBo
   return boxes;
 }
 
-/** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: Advance() starts a step
- * of the grid, StepCells() takes it on the cells [c0, c1), each cell once. The parameters, their gradient and the
- * moments may be mapped files, of which a part's step reads and writes those cells alone, on `device`. */
+/** The cells within `reach` of `box` in a grid of `cells` cells, slid into the grid where it ends, so that they keep
+ * their count along each axis (the grid's when it has fewer). What reads `reach` cells around each cell of the box
+ * finds them there, and a pooling of that half-width finds its kernel's cells at an end of the grid as the grid
+ * whole gives them, however few cells the box has. */
+inline CellBox
+CellsAround(const CellBox & box, const std::vector<int64_t> & reach, const std::vector<int64_t> & cells)
+{
+  CellBox window = box;
+  for (size_t d = 0; d < cells.size(); ++d)
+  {
+    const int64_t count = std::min(cells[d], box.cell1[d] - box.cell0[d] + 2 * reach[d]);
+    window.cell0[d] = std::clamp<int64_t>(box.cell0[d] - reach[d], 0, cells[d] - count);
+    window.cell1[d] = window.cell0[d] + count;
+  }
+  return window;
+}
+
+/** The cells of `inner` among those of `window` that `t` ({1, C, window...}) holds, as a view. */
+inline torch::Tensor
+CropTo(const torch::Tensor & t, const CellBox & window, const CellBox & inner)
+{
+  std::vector<int64_t> lo(window.cell0.size()), hi(window.cell0.size());
+  for (size_t d = 0; d < lo.size(); ++d)
+  {
+    lo[d] = inner.cell0[d] - window.cell0[d];
+    hi[d] = inner.cell1[d] - window.cell0[d];
+  }
+  return NarrowTo(t, lo, hi);
+}
+
+/** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: StepCells() takes a step
+ * on the cells [c0, c1), `steps` being the count of steps those cells will then have taken, which the caller sets.
+ * The parameters, their gradient and the moments may be mapped files, of which a part's step reads and writes those
+ * cells alone, on `device`. The moments of the cells a step leaves out stay as they are, as if it had not been. */
 struct CellAdam
 {
   torch::Tensor exponentialAverage;
@@ -666,12 +708,6 @@ struct CellAdam
   double        beta2;
   double        epsilon;
   int64_t       steps{ 0 };
-
-  void
-  Advance()
-  {
-    ++steps;
-  }
 
   void
   StepCells(torch::Tensor &              theta,
@@ -701,7 +737,7 @@ struct CellAdam
  * \brief Tensors of zeros in files of a directory, mapped shared.
  *
  * The kernel pages them in and out, so what grows with the image need not fit the memory. The files go with the
- * object, which the tensors must not outlive. */
+ * object, which the tensors must not outlive, save one kept by its caller. */
 class ScratchFiles
 {
 public:
@@ -721,8 +757,12 @@ public:
     }
   }
 
+  /** With `kept`, the file is the caller's from then on: it outlives this object, and the caller removes `*kept`
+   * once the tensor is gone. */
   torch::Tensor
-  Zeros(const std::vector<int64_t> & shape, torch::ScalarType dtype = torch::kFloat32)
+  Zeros(const std::vector<int64_t> & shape,
+        torch::ScalarType            dtype = torch::kFloat32,
+        std::filesystem::path *      kept = nullptr)
   {
     int64_t count = 1;
     for (const int64_t n : shape)
@@ -741,14 +781,14 @@ public:
     }
     if (error)
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
-                               << " cannot be used: " << error.message() << ".");
+      itkGenericExceptionMacro(<< "The scratch directory " << m_Directory << " cannot be used: " << error.message()
+                               << ".");
     }
     // Against the space free when the run started: all that guards a system that cannot reserve a file's blocks.
     if (m_Bytes + bytes > m_Available)
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory << " has "
-                               << m_Available << " bytes free where the run maps " << m_Bytes + bytes
+      itkGenericExceptionMacro(<< "The scratch directory " << m_Directory << " has " << m_Available
+                               << " bytes free where the run maps " << m_Bytes + bytes
                                << "; set ScratchDirectory to a directory of a larger disk.");
     }
     std::random_device          random;
@@ -756,7 +796,7 @@ public:
                                                       std::to_string(random()) + "-" + std::to_string(m_Paths.size()));
     if (std::filesystem::exists(path))
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch file " << path << " exists.");
+      itkGenericExceptionMacro(<< "The scratch file " << path << " exists.");
     }
     m_Paths.push_back(path);
 #if defined(__linux__)
@@ -770,8 +810,8 @@ public:
     }
     if (failure != 0 && failure != EOPNOTSUPP && failure != EINVAL) // those two: a file system without the call
     {
-      itkGenericExceptionMacro(<< "ImpactFineRegistration: the scratch directory " << m_Directory
-                               << " cannot hold a file of " << bytes << " bytes (" << std::strerror(failure)
+      itkGenericExceptionMacro(<< "The scratch directory " << m_Directory << " cannot hold a file of " << bytes
+                               << " bytes (" << std::strerror(failure)
                                << "); set ScratchDirectory to a directory of a larger disk.");
     }
 #endif
@@ -780,15 +820,13 @@ public:
 #if !defined(_WIN32)
     std::filesystem::remove(path, error); // the mapping keeps it: a killed process leaves nothing behind
 #endif
+    if (kept != nullptr)
+    {
+      *kept = path;
+      m_Paths.pop_back();
+    }
     m_Bytes += bytes;
     return tensor.view(shape);
-  }
-
-  /** The bytes mapped so far. */
-  std::uintmax_t
-  GetBytes() const
-  {
-    return m_Bytes;
   }
 
 private:
@@ -797,6 +835,64 @@ private:
   std::uintmax_t                     m_Available{ 0 };
   std::uintmax_t                     m_Bytes{ 0 };
 };
+
+/** \class MappedPixels
+ * \ingroup Impact
+ * \brief The pixels of an image in a file mapped to memory.
+ *
+ * The container holds the mapping, which lives as long as the image whose pixels it is and whatever holds that
+ * image; the file goes with it. */
+template <typename TPixel>
+class MappedPixels : public ImportImageContainer<SizeValueType, TPixel>
+{
+public:
+  ITK_DISALLOW_COPY_AND_MOVE(MappedPixels);
+
+  using Self = MappedPixels;
+  using Superclass = ImportImageContainer<SizeValueType, TPixel>;
+  using Pointer = SmartPointer<Self>;
+  using ConstPointer = SmartPointer<const Self>;
+
+  itkNewMacro(Self);
+  itkOverrideGetNameOfClassMacro(MappedPixels);
+
+  /** `count` pixels of zeros in a file of `scratch`. */
+  void
+  Map(ScratchFiles & scratch, SizeValueType count)
+  {
+    m_Mapping = scratch.Zeros({ static_cast<int64_t>(count * sizeof(TPixel)) }, torch::kUInt8, &m_Path);
+    this->SetImportPointer(static_cast<TPixel *>(m_Mapping.data_ptr()), count, /*LetContainerManageMemory=*/false);
+  }
+
+protected:
+  MappedPixels() = default;
+  ~MappedPixels() override
+  {
+    m_Mapping = torch::Tensor(); // unmapped before the file goes
+    std::error_code ignored;
+    std::filesystem::remove(m_Path, ignored);
+  }
+
+private:
+  torch::Tensor         m_Mapping;
+  std::filesystem::path m_Path;
+};
+
+/** The pixels of AllocateCellGrid's image for `cells` cells, in a file of `scratch`: of the grid the host memory
+ * then holds the pages the system keeps of it. */
+template <unsigned int Dim>
+typename MappedPixels<Vector<float, Dim>>::Pointer
+MapCellGridPixels(const std::vector<int64_t> & cells, ScratchFiles & scratch)
+{
+  SizeValueType count = 1;
+  for (const int64_t n : cells)
+  {
+    count *= static_cast<SizeValueType>(n + 2 * CellGridBorder);
+  }
+  auto pixels = MappedPixels<Vector<float, Dim>>::New();
+  pixels->Map(scratch, count);
+  return pixels;
+}
 
 /** What the pooled feature maps of a region-sampled run may take to stay resident on `device`, when the caller sets
  * no budget: half the device memory free now, or a quarter of the machine's memory on the CPU. */

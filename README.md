@@ -172,19 +172,26 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   compares them whole, the dense run on them; otherwise they stay, with the control grid and the
   optimizer's state, in files of `ScratchDirectory` mapped to memory (give a directory on a disk for
   an image larger than the memory), and every iteration steps every cell, by bricks of boxes sized
-  to the device (`BrickBytes`). Either way the images are read once and the field is the
-  whole-image run's, to float precision. `SetMovingTransform` applies a
+  to the device (`BrickBytes`, the most bytes a step holds there). Either way the images are read once and the field is the
+  whole-image run's, to float precision. `SetRegionsPerIteration(R)` steps, at every iteration, the
+  cells of `R` boxes drawn at random (afresh each time, from `Seed`), each with the whole grid's
+  gradient on its cells: an iteration then costs and holds what its boxes ask, whatever the image,
+  and the field tends to the same limit as the iterations grow. `SetMovingTransform` applies a
   transform (an affine, a coarser pass's field) to the moving side outside the optimization;
   `GetControlGridTransform()` is the result on the control grid, `GetOutput()` the dense field,
-  produced for the region requested of it (stream it to a writer); of what grows with the image the
-  host memory keeps that control grid alone, 12 bytes a cell in 3D. Static mode, point-wise distances
+  produced for the region requested of it (stream it to a writer). With the maps in mapped files
+  that control grid is a mapped file too, kept by the field it backs, and the initial field is read
+  by regions: nothing held in memory grows with the image. Static mode, point-wise distances
   and feature layers at the image's resolution (MIND) or a power of two coarser, no coarser than the
   control cells; the caller keeps its readers alive.
 - **The coarse stage by regions.** `SetRegionSize(n)` on `ImpactCoarseRegistration` reads the pair the same
   way: one pass over the boxes (each with its halo, the moving image brought onto the fixed grid region by
-  region) extracts the features and pools them to the coarse grid, which stays on the device; the cost volume
+  region) extracts the features and pools them to the coarse grid; the cost volume
   is then built by boxes of that grid, each within `CostBoxBytes`, never whole, and the coupled-convex
-  iterations and the inverse consistency run on the pooled maps; `SetMovingTransform` reads the moving image
+  iterations and the inverse consistency run on the pooled maps. When those fit `ResidentFeatureBudget` they
+  stay on the device; otherwise they stay, with the fields of the solve and the coarse grid, in files of
+  `ScratchDirectory` mapped to memory, and every step goes by those boxes with the cells around each that it
+  reads: nothing held in memory then grows with the image. `SetMovingTransform` reads the moving image
   through an affine pre-alignment. The field is the whole-image run's to float precision for a model whose
   features are local; the shipped MIND bounds its variance by an image-wide mean (`mind_var_mean`), so its
   region features differ slightly where that bound binds (on the test CT pair the coarse grids differ by

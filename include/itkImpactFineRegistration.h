@@ -263,25 +263,39 @@ public:
    * optimizer's state, and an iteration steps every cell, as the whole-image run does, by bricks of boxes brought to
    * the device one at a time; one the fixed mask does not reach costs its share of the regularizer alone.
    * A brick's loss is the dense loss restricted to its cells,
-   * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
-   * mean, which the resident route keeps exact), with
+   * weighed by its share of the cells that count (those the masks keep, the moving one where the field reads it:
+   * they are counted over the grid before the bricks are stepped), with
    * the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
+   * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
+   * iteration costs and holds then follows those boxes, not the image.
    * Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
    * a power of two coarser, no coarser than the control cells (a region then starts on the layer's lattice); the
    * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
    * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
-   * as the whole-image run resizes its dense field. The output is produced by region:
+   * as the whole-image run resizes its dense field, by regions through its own pipeline as the images are (a
+   * streaming reader, or the output of ImpactCoarseRegistration run by regions, is asked for the region around
+   * each box alone). The output is produced by region:
    * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
-   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. Of what grows with
-   * the image, the run leaves in host memory the control grid GetControlGridTransform() holds, 4 * ImageDimension
-   * bytes a control cell, written a box at a time, and the initial displacement field as the caller gave it. */
+   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. With the pooled
+   * maps in mapped files, nothing the run holds in host memory or on the device grows with the image, save about
+   * a hundred bytes a box (the lists of the boxes and their counts of cells): the control grid of
+   * GetControlGridTransform() is a mapped file too. */
   /** @{ */
-  /** Side of a box, in voxels; 0 (the default) reads the images whole. */
+  /** Side of a box, in voxels; 0 (the default) reads the images whole. A model runs on a box with RegionHalo voxels
+   * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
-  /** Most bytes of the mapped files a brick may bring to the device when the pooled maps are not resident: a brick
-   * is as many boxes a side as fit it, one at least. 0 (the default): an eighth of what ResidentFeatureBudget's
-   * default lets the maps take. The bricks set the memory, not the result. */
+  /** Boxes drawn at random at every iteration, whose cells alone take that iteration's step, with the whole grid's
+   * gradient; 0 (the default) steps every cell at every iteration. The draw is new at every iteration, from Seed,
+   * without a box twice in one, and NumberOfIterations keeps its meaning. Drawing every box at every iteration is
+   * the run with 0, to float precision; with fewer the field tends to that run's limit as the iterations grow, and
+   * GetMetricValuesPerIteration() holds the loss over the drawn boxes, scaled to the grid. */
+  itkSetMacro(RegionsPerIteration, unsigned int);
+  itkGetConstMacro(RegionsPerIteration, unsigned int);
+  /** Most bytes a step of a brick may hold on the device when the pooled maps are not resident: a brick is as many
+   * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. 0 (the default):
+   * an eighth of what ResidentFeatureBudget's default allows. The bricks set the memory, not the result. Not read
+   * with RegionsPerIteration, whose boxes are stepped one at a time. */
   itkSetMacro(BrickBytes, SizeValueType);
   itkGetConstMacro(BrickBytes, SizeValueType);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
@@ -298,14 +312,19 @@ public:
   using TransformType = Transform<double, ImageDimension, ImageDimension>;
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
-  /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it every
-   * iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped files and every
-   * iteration brings them to the device a brick at a time. 0 (the default): half the
-   * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
-   * which route a run took. */
+  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there:
+   * within it every iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped
+   * files and every iteration brings them to the device a brick at a time. 0 (the default): half the device memory
+   * free when the run starts, a quarter of the machine's on the CPU. What is held against it is GetResidentBytes(),
+   * all that grows with the image on that route: the maps, the control grid and Adam's state, and the graph of an
+   * iteration over the whole grid. GetResidentFeatures() tells which route a run took. The memory is read once,
+   * when the run starts: what another process takes of the device afterwards is not seen, and the resident route
+   * can then run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);
+  /** What the last run by regions counted that it would hold on the device with everything resident, in bytes. */
+  itkGetConstMacro(ResidentBytes, SizeValueType);
   /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks' cells,
    * the control grid and the optimizer's state, in files mapped to memory that the system pages in and out, removed
    * when the run ends. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs)
@@ -338,7 +357,11 @@ public:
   /** The (smoothed) control grid as a displacement field on its own grid, wrapped in a transform: one sample per
    * cell at the cell's centre, padded by two cells of replicated border, so that its linear interpolation is the map
    * the dense output holds at every voxel. Solves the registration if it has not run yet, without allocating the
-   * dense field. */
+   * dense field. After a run by regions whose pooled maps were not resident, the pixels of that field are a file of
+   * ScratchDirectory mapped to memory: the field's pixel container holds the mapping, so they stay valid for as
+   * long as the field, or the transform, is referenced, past the filter and its next run, and the file is removed
+   * when the last reference goes. Reading them pages them in; copying the field (to an array) brings it to memory
+   * whole. */
   DisplacementFieldTransformType *
   GetControlGridTransform();
 
@@ -406,10 +429,12 @@ private:
   std::string   m_Mode{ "Static" };
   unsigned int  m_FeatureChunkSize{ 32 };
   unsigned int  m_RegionSize{ 0 };
+  unsigned int  m_RegionsPerIteration{ 0 };
   SizeValueType m_BrickBytes{ 0 };
   unsigned int  m_RegionHalo{ 0 };
   SizeValueType m_ResidentFeatureBudget{ 0 };
   bool          m_ResidentFeatures{ false };
+  SizeValueType m_ResidentBytes{ 0 };
   std::string   m_ScratchDirectory;
 
   typename TransformType::ConstPointer m_MovingTransform{ nullptr };

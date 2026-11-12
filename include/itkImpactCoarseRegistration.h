@@ -212,9 +212,16 @@ public:
    * With RegionSize > 0 the images are never read whole. One pass over boxes of the fixed grid, each RegionSize
    * voxels a side (whole cells of the coarse grid), reads each box of the fixed image and of the
    * moving image (brought onto the fixed grid through the identity, region by region) with its halo, extracts their
-   * features and pools them to the coarse grid, which stays on the device; the cost volume is then built by boxes of
+   * features and pools them to the coarse grid; the cost volume is then built by boxes of
    * that grid, each within CostBoxBytes, never whole, and the coupled-convex iterations and the inverse consistency
-   * run on the pooled maps. The field is the whole-image run's to float precision. The images are read through their
+   * run on the pooled maps. The field is the whole-image run's to float precision. Where the pooled maps fit
+   * ResidentFeatureBudget they stay on the device with the fields of the solve, which takes each of its steps on
+   * the grid whole. Otherwise they stay in files of ScratchDirectory mapped to memory, and every step goes by the
+   * boxes of the cost volume, each brought to the device with the cells around it the step reads: the cell window's
+   * two for a cost, one for the smoothing of the chosen candidates, the displacement half-width (stretched by n /
+   * (n - 1) on an axis of n cells) and one for the inverse consistency. Nothing the run then holds in host memory or
+   * on the device grows with the image, save about a hundred bytes a box (the lists of the boxes): the coarse grid of
+   * GetCoarseGridTransform() is a mapped file too. The images are read through their
    * own pipelines (SetRequestedRegion then Update: an itk::ImageFileReader with UseStreamingOn reads those regions
    * alone; an image in memory serves them from its buffer); the caller keeps its readers alive. Request a region of
    * GetOutput() (or stream it to a writer) rather than the whole field, and take the field on the coarse grid from
@@ -222,7 +229,8 @@ public:
    * cells, is computed by regions too, each region starting on its lattice. PCA fits its basis on the whole feature
    * map and a model resampling the image to its own voxel size does not line up with the boxes: refused. */
   /** @{ */
-  /** Side of a box, in voxels; 0 (the default) reads the images whole. */
+  /** Side of a box, in voxels; 0 (the default) reads the images whole. A model runs on a box with RegionHalo voxels
+   * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
   /** Voxels read around a box, on every axis, so that its features equal those of the whole image: the receptive
@@ -237,9 +245,29 @@ public:
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
   /** Bytes a box of the cost volume may take (default 1 GiB): the coarse grid is tiled into boxes whose cost over
-   * every candidate, with the margins the cell window and the candidates read, fits it. */
+   * every candidate, with the margins the cell window and the candidates read, fits it. With the pooled maps in
+   * mapped files it bounds what a step of the solve brings to the device: 8 bytes a cell and a candidate, of which
+   * the other steps take a small part. */
   itkSetMacro(CostBoxBytes, SizeValueType);
   itkGetConstMacro(CostBoxBytes, SizeValueType);
+  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there. 0
+   * (the default): half the device memory free when the run starts, a quarter of the machine's on the CPU. What is
+   * held against it is GetResidentBytes(), all that grows with the image on that route (the maps and the masks'
+   * shares, the fields of the solve, a layer's cost at zero displacement when NormalizeLosses latches it) and a
+   * box of the cost volume. GetResidentFeatures() tells which route a run took. The memory is read once, when the
+   * run starts: what another process takes of the device afterwards is not seen, and the resident route can then
+   * run out of it. */
+  itkSetMacro(ResidentFeatureBudget, SizeValueType);
+  itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
+  itkGetConstMacro(ResidentFeatures, bool);
+  /** What the last run by regions counted that it would hold on the device with everything resident, in bytes. */
+  itkGetConstMacro(ResidentBytes, SizeValueType);
+  /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks'
+   * shares, the fields of the solve and the coarse grid, in files mapped to memory that the system pages in and
+   * out. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs) keeps them
+   * there: give one on a disk for an image larger than the memory. */
+  itkSetStringMacro(ScratchDirectory);
+  itkGetStringMacro(ScratchDirectory);
   /** Bytes requested from the images and masks over the run. */
   itkGetConstMacro(BytesRead, SizeValueType);
   /** Whether the fixed (moving) image served its regions without buffering it whole. */
@@ -247,7 +275,10 @@ public:
   itkGetConstMacro(MovingImageStreamed, bool);
   /** The field on the coarse grid as a transform: one sample per cell at the cell's centre, padded by two cells of
    * replicated border, so that its linear interpolation is the map the dense field holds at every voxel. With
-   * RegionSize > 0 it is solved without allocating the dense field. */
+   * RegionSize > 0 it is solved without allocating the dense field. After a run by regions whose pooled maps were
+   * not resident, the pixels of that field are a file of ScratchDirectory mapped to memory: the field's pixel
+   * container holds the mapping, so they stay valid for as long as the field, or the transform, is referenced, past
+   * the filter and its next run, and the file is removed when the last reference goes. */
   DisplacementFieldTransformType *
   GetCoarseGridTransform();
   /** @} */
@@ -282,16 +313,19 @@ protected:
 
   /** The coupled-convex solve both runs end in, on the two images' features pooled to the coarse grid ({1, C,
    * coarse...} a layer) and the masks' shares of its cells (undefined without a mask): sets the field on the coarse
-   * grid and returns it, in voxels. `cost` builds the cost volume of one of `boxes`, which tile the grid. The tensors
-   * and the boxes are LibTorch-backed types this header does not name. */
-  template <typename TTensor, typename TBox, typename TCost>
+   * grid and returns it, in voxels. `cost` builds the cost volume of one of `boxes`, which tile the grid. Without
+   * `scratch` the maps are on the device and the solve returns its field there; with it they are mapped files, as
+   * the fields of the solve then are in `scratch`, every step goes by `boxes`, and nothing is returned. The
+   * tensors, the boxes and the scratch files are LibTorch-backed types this header does not name. */
+  template <typename TTensor, typename TBox, typename TCost, typename TScratch>
   TTensor
   SolveOnCoarseGrid(const std::vector<TTensor> & fixedMaps,
                     const std::vector<TTensor> & movingMaps,
                     const TTensor &              fixedShare,
                     const TTensor &              movingShare,
                     const std::vector<TBox> &    boxes,
-                    TCost &&                     cost);
+                    TCost &&                     cost,
+                    TScratch *                   scratch);
 
 private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
@@ -319,6 +353,10 @@ private:
   unsigned int                         m_RegionHalo{ 0 };
   typename TransformType::ConstPointer m_MovingTransform{ nullptr };
   SizeValueType                        m_CostBoxBytes{ static_cast<SizeValueType>(1) << 30 };
+  SizeValueType                        m_ResidentFeatureBudget{ 0 };
+  bool                                 m_ResidentFeatures{ false };
+  SizeValueType                        m_ResidentBytes{ 0 };
+  std::string                          m_ScratchDirectory;
   SizeValueType                        m_BytesRead{ 0 };
   bool                                 m_FixedImageStreamed{ false };
   bool                                 m_MovingImageStreamed{ false };
