@@ -252,14 +252,11 @@ public:
   itkGetConstMacro(CostBoxBytes, SizeValueType);
   /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there. 0
    * (the default): half the device memory free when the run starts, a quarter of the machine's on the CPU. What is
-   * held against it is GetResidentBytes(), all that grows with the image on that route, and a box of the cost
-   * volume: 4 * (2 * channels + the masks + m) bytes a coarse cell, m being the larger of what the solve holds
-   * beside the maps (13 * ImageDimension with InverseConsistency, 6 * ImageDimension without) and of what a
-   * layer's cost at zero displacement takes when NormalizeLosses latches it (3 times the layer's channels for a
-   * point-wise distance, 12 for a windowed one). Measured in 3D on the CPU and on CUDA, on 1 to 48 channels, L2
-   * and NCC: a run held between 0.76 and 0.97 of it. GetResidentFeatures() tells which route a run took. The
-   * memory is read once, when the run starts: what another process takes of the device afterwards is not seen,
-   * and the resident route can then run out of it. */
+   * held against it is GetResidentBytes(), all that grows with the image on that route (the maps and the masks'
+   * shares, the fields of the solve, a layer's cost at zero displacement when NormalizeLosses latches it) and a
+   * box of the cost volume. GetResidentFeatures() tells which route a run took. The memory is read once, when the
+   * run starts: what another process takes of the device afterwards is not seen, and the resident route can then
+   * run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);

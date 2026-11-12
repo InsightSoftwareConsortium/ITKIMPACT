@@ -285,32 +285,17 @@ public:
    * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
-  /** Boxes drawn at random at every iteration, whose cells alone take that iteration's step; 0 (the default) steps
-   * every cell at every iteration. The draw is new at every iteration, from Seed, without a box twice in one, and
-   * NumberOfIterations keeps its meaning: the number of iterations, of RegionsPerIteration * RegionSize ^
-   * ImageDimension voxels each. A drawn box goes to the device alone, with the cells within twice 1 +
-   * ControlGridSmoothingIterations of it: its loss is taken over the cells that read its own through the smoothing
-   * and the regularizer, so that the gradient of its cells is the whole grid's, and Adam steps those cells with the
-   * moments they hold, corrected by the count of steps their box has taken. With the pooled maps resident or in
-   * mapped files alike, an iteration reads and writes the cells of its boxes alone: nothing in it passes over the
-   * grid, and with the maps in mapped files what it holds in host memory and on the device does not follow the
-   * image. One pass does go over the grid before the first iteration when NormalizeLosses is on, a box at a time:
-   * the losses' values at the starting field, taken over every box so that they do not follow the draw. Drawing
-   * every box at every iteration is the run with 0, to float precision; with fewer the field tends to that run's
-   * limit as the iterations grow, and GetMetricValuesPerIteration() holds the loss over the drawn boxes, scaled
-   * to the grid. */
+  /** Boxes drawn at random at every iteration, whose cells alone take that iteration's step, with the whole grid's
+   * gradient; 0 (the default) steps every cell at every iteration. The draw is new at every iteration, from Seed,
+   * without a box twice in one, and NumberOfIterations keeps its meaning. Drawing every box at every iteration is
+   * the run with 0, to float precision; with fewer the field tends to that run's limit as the iterations grow, and
+   * GetMetricValuesPerIteration() holds the loss over the drawn boxes, scaled to the grid. */
   itkSetMacro(RegionsPerIteration, unsigned int);
   itkGetConstMacro(RegionsPerIteration, unsigned int);
   /** Most bytes a step of a brick may hold on the device when the pooled maps are not resident: a brick is as many
-   * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. A step of a brick
-   * of n cells, reading w cells with those around it (1 + ControlGridSmoothingIterations each side), holds at its
-   * peak 4 * (ImageDimension * (6 + ControlGridSmoothingIterations) * w + 4 * channels * n) bytes, channels being
-   * those of all the kept feature layers (1 for the intensities): the count the bricks are sized by, measured in
-   * 3D on 1 to 48 channels and 1 and 3 smoothing passes, where a step held between 0.66 and 1.0 of it. 0 (the
-   * default): an eighth of what ResidentFeatureBudget's default lets the maps take. The bricks set the memory, not
-   * the result. With RegionsPerIteration a drawn box is stepped by itself, whatever BrickBytes: by that count its
-   * step holds what a brick of (RegionSize / GridShrinkFactor + 2 r) ^ ImageDimension cells does, reading (RegionSize
-   * / GridShrinkFactor + 4 r) ^ ImageDimension, with r = 1 + ControlGridSmoothingIterations. */
+   * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. 0 (the default):
+   * an eighth of what ResidentFeatureBudget's default allows. The bricks set the memory, not the result. Not read
+   * with RegionsPerIteration, whose boxes are stepped one at a time. */
   itkSetMacro(BrickBytes, SizeValueType);
   itkGetConstMacro(BrickBytes, SizeValueType);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
@@ -332,12 +317,9 @@ public:
    * files and every iteration brings them to the device a brick at a time. 0 (the default): half the device memory
    * free when the run starts, a quarter of the machine's on the CPU. What is held against it is GetResidentBytes(),
    * all that grows with the image on that route: the maps, the control grid and Adam's state, and the graph of an
-   * iteration over the whole grid, 4 * (ImageDimension * (13 + ControlGridSmoothingIterations) + 6 * channels)
-   * bytes a control cell, and 4 * (channels + 4) more with a mask or SamplingPercentage below 1 (measured in 3D on
-   * the CPU and on CUDA, on 1 to 48 channels and 0 to 3 smoothing passes: a run held between 0.77 and 0.96 of
-   * it); with RegionsPerIteration, the maps and that state alone. GetResidentFeatures() tells which route a run
-   * took. The memory is read once, when the run starts: what another process takes of the device afterwards is
-   * not seen, and the resident route can then run out of it. */
+   * iteration over the whole grid. GetResidentFeatures() tells which route a run took. The memory is read once,
+   * when the run starts: what another process takes of the device afterwards is not seen, and the resident route
+   * can then run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);

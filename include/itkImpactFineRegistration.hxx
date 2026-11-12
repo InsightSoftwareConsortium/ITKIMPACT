@@ -2162,7 +2162,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // the two maps, the control grid, its gradient, Adam's two moments and the masks' cells. Stepping every cell,
   // an iteration's graph over the whole grid besides: Dim * (13 + the smoothing passes) for the field and its
   // state, six a channel (the two maps, the features sampled, their difference and the gradients back), and a
-  // channel and four more when the cells that count are drawn (a mask, SamplingPercentage).
+  // channel and four more when the cells that count are drawn (a mask, SamplingPercentage). Measured in 3D on the
+  // CPU and on CUDA, on 1 to 48 channels and 0 to 3 passes: a run held between 0.77 and 0.96 of that count.
   const auto    smoothingPasses = static_cast<int64_t>(m_ControlGridSmoothingIterations);
   const bool    drawsCells = m_FixedMask.IsNotNull() || m_MovingMask.IsNotNull() || m_SamplingPercentage < 1.0;
   const int64_t residentFloats = drawsBoxes ? 2 * channelCount + 4 * static_cast<int64_t>(Dim) + 2
@@ -2497,8 +2498,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     // A brick: as many boxes a side as BrickBytes holds on the device. At its peak a step holds there, in floats,
     // Dim * (6 + the smoothing passes) for each cell the brick reads (the field along the graph) and four for each
-    // channel of each of its own cells (the two maps, the features sampled and their gradient). A drawn box is a
-    // unit by itself.
+    // channel of each of its own cells (the two maps, the features sampled and their gradient): measured in 3D on
+    // 1 to 48 channels and 1 and 3 passes, a step held between 0.66 and 1.0 of that count. A drawn box is a unit
+    // by itself.
     const double brickBytes =
       m_BrickBytes > 0 ? static_cast<double>(m_BrickBytes) : Impact::ResidentBudget(device) / 8.0;
     auto brickCells = [&](int64_t boxesASide, int64_t around) {
