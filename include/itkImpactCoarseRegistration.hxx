@@ -714,31 +714,9 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
   };
   const std::vector<TBox>   whole{ TBox{ std::vector<int64_t>(Dim, 0), coarse } };
   const std::vector<TBox> & bricks = resident ? whole : boxes;
-  // The cells a step reads for a brick: those within `reach` of it.
-  auto around = [&](const TBox & brick, const std::vector<int64_t> & reach) {
-    return Impact::CellsAround(brick, reach, coarse);
-  };
   // The cells of `box` of a map of the grid ({1, C, coarse...}), on the device; undefined as the map is.
   auto cellsOn = [&](const torch::Tensor & map, const TBox & box) {
     return map.defined() ? Impact::NarrowTo(map, box.cell0, box.cell1).to(device) : map;
-  };
-  // The cells of `brick` among those of `window` that `t` ({1, C, window...}) holds.
-  auto cropTo = [&](const torch::Tensor & t, const TBox & window, const TBox & brick) {
-    std::vector<int64_t> lo(Dim), hi(Dim);
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      lo[d] = brick.cell0[d] - window.cell0[d];
-      hi[d] = brick.cell1[d] - window.cell0[d];
-    }
-    return Impact::NarrowTo(t, lo, hi);
-  };
-  auto cellsOf = [&](const TBox & box) {
-    int64_t count = 1;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      count *= box.cell1[d] - box.cell0[d];
-    }
-    return count;
   };
 
   // ---- Each layer's distance and weight. With the normalization the weight also divides the layer by its cost at
@@ -764,24 +742,24 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
         torch::Tensor              weighted, held; // with masks: the sums of the weighted terms and of the weights
         for (const TBox & brick : bricks)
         {
-          const TBox          window = around(brick, reach);
+          const TBox          window = Impact::CellsAround(brick, reach, coarse);
           const torch::Tensor f = cellsOn(fixed[l], window);
           const torch::Tensor m = cellsOn(moving[l], window);
           const torch::Tensor cellWeight =
             masked ? Impact::CoarseMaskWeight(cellsOn(fixedShare, window), cellsOn(movingShare, window))
                    : torch::Tensor();
           const torch::Tensor terms =
-            cropTo(distance.IsPerPointMean() ? distance.forwardPoints(f, m).nan_to_num(1.0).unsqueeze(1)
-                                             : Impact::CoarseLayerCost<Dim>(distance, f, m, cellWeight),
-                   window,
-                   brick);
+            Impact::CropTo(distance.IsPerPointMean() ? distance.forwardPoints(f, m).nan_to_num(1.0).unsqueeze(1)
+                                                     : Impact::CoarseLayerCost<Dim>(distance, f, m, cellWeight),
+                           window,
+                           brick);
           if (!masked)
           {
             value += terms.mean().template item<double>() *
-                     (static_cast<double>(cellsOf(brick)) / static_cast<double>(cellCount));
+                     (static_cast<double>(brick.Count()) / static_cast<double>(cellCount));
             continue;
           }
-          const torch::Tensor brickWeight = cropTo(cellWeight, window, brick);
+          const torch::Tensor brickWeight = Impact::CropTo(cellWeight, window, brick);
           const torch::Tensor sum = (terms * brickWeight).sum();
           const torch::Tensor total = brickWeight.sum();
           weighted = weighted.defined() ? weighted + sum : sum;
@@ -896,11 +874,12 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
       const std::vector<int64_t> reach(Dim, 1);
       for (const TBox & brick : bricks)
       {
-        const TBox window = around(brick, reach);
+        const TBox window = Impact::CellsAround(brick, reach, coarse);
         Impact::WriteCells(
           smoothed,
           brick.cell0,
-          cropTo(smoothBox(gather(Impact::NarrowTo(argmin, window.cell0, window.cell1, 0).to(device))), window, brick));
+          Impact::CropTo(
+            smoothBox(gather(Impact::NarrowTo(argmin, window.cell0, window.cell1, 0).to(device))), window, brick));
       }
     };
     argminPass(nullptr, 0.0);
@@ -984,7 +963,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
     {
       for (const TBox & brick : bricks)
       {
-        const TBox         window = around(brick, reach);
+        const TBox         window = Impact::CellsAround(brick, reach, coarse);
         std::vector<float> ratioVals(Dim);
         for (unsigned int c = 0; c < Dim; ++c)
         {
@@ -992,7 +971,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveOnCoarseGrid(const std
           ratioVals[c] = static_cast<float>(coarse[d]) / static_cast<float>(window.cell1[d] - window.cell0[d]);
         }
         const torch::Tensor ratio = torch::tensor(ratioVals, torch::kFloat32).to(device).reshape(scaleShape);
-        const torch::Tensor identity = cropTo(identityOf(window), window, brick);
+        const torch::Tensor identity = Impact::CropTo(identityOf(window), window, brick);
         const torch::Tensor own1 = cellsOn(f1, brick);
         const torch::Tensor own2 = cellsOn(f2, brick);
         Impact::WriteCells(

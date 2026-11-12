@@ -27,6 +27,7 @@
 #include "ImpactLoss.h"
 #include "itkImpactRegionSampling.h"
 
+#include <itkImageAlgorithm.h>
 #include <itkResampleImageFilter.h>
 #include <itkLinearInterpolateImageFunction.h>
 #include <itkIdentityTransform.h>
@@ -2192,11 +2193,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   for (size_t b = 0; b < boxes.size(); ++b)
   {
     const Impact::CellBox & box = boxes[b];
-    int64_t                 count = 1;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      count *= box.cell1[d] - box.cell0[d];
-    }
+    int64_t                 count = box.Count();
     if (fixedOn.defined())
     {
       std::vector<int64_t> lowPad(Dim);
@@ -2256,37 +2253,19 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     for (const Impact::CellBox & box : boxes)
     {
-      // The field's region those voxels' points fall in: the bounds of the corners of their box, the map from the
-      // fixed grid's indices to the field's being affine, a sample around for the interpolation and round-off.
-      typename DisplacementFieldType::RegionType read;
-      ContinuousIndex<double, Dim>               lowest, highest;
-      lowest.Fill(std::numeric_limits<double>::max());
-      highest.Fill(std::numeric_limits<double>::lowest());
-      for (unsigned int corner = 0; corner < (1u << Dim); ++corner)
-      {
-        typename FixedImageType::IndexType voxel;
-        for (unsigned int a = 0; a < Dim; ++a)
-        {
-          double             unused;
-          const unsigned int d = Dim - 1 - a;
-          voxel[a] = ((corner >> a) & 1u) ? voxelAt(a, voxelBelow(d, box.cell1[d] - 1, unused) + 1)
-                                          : voxelAt(a, voxelBelow(d, box.cell0[d], unused));
-        }
-        typename FixedImageType::PointType point;
-        m_FixedImage->TransformIndexToPhysicalPoint(voxel, point);
-        ContinuousIndex<double, Dim> index;
-        initial->TransformPhysicalPointToContinuousIndex(point, index);
-        for (unsigned int a = 0; a < Dim; ++a)
-        {
-          lowest[a] = std::min(lowest[a], index[a]);
-          highest[a] = std::max(highest[a], index[a]);
-        }
-      }
+      // The field's region that holds the fixed voxels the box's cells blend, and a sample around for round-off.
+      RegionType voxels;
       for (unsigned int a = 0; a < Dim; ++a)
       {
-        read.SetIndex(a, static_cast<IndexValueType>(std::floor(lowest[a])) - 1);
-        read.SetSize(a, static_cast<SizeValueType>(std::floor(highest[a]) - std::floor(lowest[a])) + 4);
+        double             unused;
+        const unsigned int d = Dim - 1 - a;
+        const auto         first = voxelAt(a, voxelBelow(d, box.cell0[d], unused));
+        voxels.SetIndex(a, first);
+        voxels.SetSize(a,
+                       static_cast<SizeValueType>(voxelAt(a, voxelBelow(d, box.cell1[d] - 1, unused) + 1) - first + 1));
       }
+      auto read = ImageAlgorithm::EnlargeRegionOverBox(voxels, m_FixedImage.GetPointer(), initial);
+      read.PadByRadius(1);
       if (!read.Crop(initial->GetLargestPossibleRegion()))
       {
         continue; // the field does not reach the box: its cells start at zero
@@ -2493,7 +2472,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       if (theta.grad().defined())
       {
-        adam.Advance();
+        ++adam.steps;
         adam.StepCells(theta, theta.grad(), wholeStart, cells, device);
         theta.grad().zero_();
       }
@@ -2509,14 +2488,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // regularizer's differences whose first cell lies among them. ----
     torch::Tensor    gradient = atHome(thetaShape);
     Impact::CellAdam adam{ atHome(thetaShape), atHome(thetaShape), m_LearningRate, m_Beta1, m_Beta2, adamEpsilon };
-    auto             cellCountOf = [&](const Impact::CellBox & box) {
-      int64_t count = 1;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        count *= box.cell1[d] - box.cell0[d];
-      }
-      return count;
-    };
     // The cells within `reach` of a box: the regularizer's next cell and the smoothing's reach. They are the cells
     // the box's loss reads (smoothed alone, they give the smoothed field of the whole grid on the box's cells and
     // the regularizer's next one), and the cells whose loss reads the box's.
@@ -2567,7 +2538,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     auto readingOf =
       [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) -> Reading {
-      Reading reading{ {}, {}, std::vector<int64_t>(Dim), std::vector<int64_t>(Dim), cellCountOf(box) };
+      Reading reading{ {}, {}, std::vector<int64_t>(Dim), std::vector<int64_t>(Dim), box.Count() };
       if (fixedOn.defined())
       {
         reading.counted = Impact::NarrowTo(fixedOn, box.cell0, box.cell1).to(device);
@@ -2634,7 +2605,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         // Nothing of it counts: its edges alone, no map read.
         return regularizer(smoothed, box.cell0, box.cell1, origin);
       }
-      const torch::Tensor rows = drawRows(reading.counted, cellCountOf(box));
+      const torch::Tensor rows = drawRows(reading.counted, box.Count());
       const double        share = static_cast<double>(reading.count) / countedCells;
       torch::Tensor       total = torch::zeros({}, onDevice);
       if (!rows.defined() || rows.numel() > 0)
@@ -2730,17 +2701,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           loss.backward();
         }
         lossValue += loss.template item<double>();
-        covered += cellCountOf(part);
+        covered += part.Count();
         if (control.grad().defined())
         {
-          std::vector<int64_t> lo(Dim), hi(Dim);
-          for (unsigned int d = 0; d < Dim; ++d)
-          {
-            lo[d] = kept.cell0[d] - window.cell0[d];
-            hi[d] = kept.cell1[d] - window.cell0[d];
-          }
           Impact::NarrowTo(gradient, kept.cell0, kept.cell1)
-            .add_(Impact::NarrowTo(control.grad(), lo, hi).to(gradient.device()));
+            .add_(Impact::CropTo(control.grad(), window, kept).to(gradient.device()));
         }
       }
       for (size_t i = 0; i < perIteration; ++i)
@@ -2767,14 +2732,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     for (const Impact::CellBox & box : boxes)
     {
       const Impact::CellBox window = Impact::CellsAround(box, smoothingReach, cells);
-      std::vector<int64_t>  lo(Dim), hi(Dim);
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        lo[d] = box.cell0[d] - window.cell0[d];
-        hi[d] = box.cell1[d] - window.cell0[d];
-      }
       Impact::WriteCellsToCellGrid<Dim>(
-        Impact::NarrowTo(smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), lo, hi, 2),
+        Impact::CropTo(smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window, box),
         box.cell0,
         cells,
         m_FixedImage.GetPointer(),
