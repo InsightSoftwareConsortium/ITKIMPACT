@@ -2226,74 +2226,129 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   }
   if (m_InitialDisplacementField.IsNotNull())
   {
-    m_InitialDisplacementField->Update();
+    // Read by regions through the field's own pipeline, as the images are: for the cells of a box, the region of
+    // the field around the fixed voxels they blend.
+    DisplacementFieldType * const initial = m_InitialDisplacementField;
+    initial->UpdateOutputInformation();
     using FieldInterpolatorType = VectorLinearInterpolateImageFunction<DisplacementFieldType, double>;
     auto interpolator = FieldInterpolatorType::New();
-    interpolator->SetInputImage(m_InitialDisplacementField);
     // Filled in host memory: the mapped grid itself, or a grid the device then takes.
     torch::Tensor start = m_ResidentFeatures ? torch::zeros(thetaShape, torch::kFloat32) : theta;
     float * const buffer = start.data_ptr<float>();
     const auto &  direction = m_FixedImage->GetDirection();
-    for (int64_t flat = 0; flat < cellCountTotal; ++flat)
+    // Resizing the dense field to the control grid blends, along each axis, the two voxels around the cell's
+    // centre. The field is read at those voxels: one given on a coarser grid is then its dense field, resized.
+    // The lower of the two along tensor axis d for cell c, and the upper one's share.
+    auto voxelBelow = [&](unsigned int d, int64_t c, double & share) {
+      const double centre = std::max(
+        (static_cast<double>(c) + 0.5) * static_cast<double>(spatial[d]) / static_cast<double>(cells[d]) - 0.5, 0.0);
+      const int64_t below = std::min(static_cast<int64_t>(centre), spatial[d] - 1);
+      share = centre - static_cast<double>(below);
+      return below;
+    };
+    auto voxelAt = [&](unsigned int a, int64_t offset) {
+      return fixedRegion.GetIndex()[a] + std::min(offset, static_cast<int64_t>(fixedRegion.GetSize()[a]) - 1);
+    };
+    for (const Impact::CellBox & box : boxes)
     {
-      // Resizing the dense field to the control grid blends, along each axis, the two voxels around the cell's
-      // centre. The field is read at those voxels: one given on a coarser grid is then its dense field, resized.
-      int64_t                  rest = flat;
-      std::array<int64_t, Dim> below{};
-      std::array<double, Dim>  share{};
-      for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
+      // The field's region those voxels' points fall in: the bounds of the corners of their box, the map from the
+      // fixed grid's indices to the field's being affine, a sample around for the interpolation and round-off.
+      typename DisplacementFieldType::RegionType read;
+      ContinuousIndex<double, Dim>               lowest, highest;
+      lowest.Fill(std::numeric_limits<double>::max());
+      highest.Fill(std::numeric_limits<double>::lowest());
+      for (unsigned int corner = 0; corner < (1u << Dim); ++corner)
       {
-        const int64_t c = rest % cells[d];
-        rest /= cells[d];
-        const double centre = std::max(
-          (static_cast<double>(c) + 0.5) * static_cast<double>(spatial[d]) / static_cast<double>(cells[d]) - 0.5, 0.0);
-        below[Dim - 1 - d] = std::min(static_cast<int64_t>(centre), spatial[d] - 1);
-        share[Dim - 1 - d] = centre - static_cast<double>(below[Dim - 1 - d]);
-      }
-      Vector<double, Dim> u; // millimetres, ITK order
-      u.Fill(0.0);
-      bool inside = true;
-      for (unsigned int corner = 0; inside && corner < (1u << Dim); ++corner)
-      {
-        double                             weight = 1.0;
         typename FixedImageType::IndexType voxel;
         for (unsigned int a = 0; a < Dim; ++a)
         {
-          const bool above = (corner >> a) & 1u;
-          weight *= above ? share[a] : 1.0 - share[a];
-          voxel[a] = fixedRegion.GetIndex()[a] +
-                     std::min(below[a] + (above ? 1 : 0), static_cast<int64_t>(fixedRegion.GetSize()[a]) - 1);
-        }
-        if (weight == 0.0)
-        {
-          continue;
+          double             unused;
+          const unsigned int d = Dim - 1 - a;
+          voxel[a] = ((corner >> a) & 1u) ? voxelAt(a, voxelBelow(d, box.cell1[d] - 1, unused) + 1)
+                                          : voxelAt(a, voxelBelow(d, box.cell0[d], unused));
         }
         typename FixedImageType::PointType point;
         m_FixedImage->TransformIndexToPhysicalPoint(voxel, point);
-        inside = interpolator->IsInsideBuffer(point);
-        if (inside)
+        ContinuousIndex<double, Dim> index;
+        initial->TransformPhysicalPointToContinuousIndex(point, index);
+        for (unsigned int a = 0; a < Dim; ++a)
         {
-          const auto value = interpolator->Evaluate(point);
-          for (unsigned int r = 0; r < Dim; ++r)
+          lowest[a] = std::min(lowest[a], index[a]);
+          highest[a] = std::max(highest[a], index[a]);
+        }
+      }
+      for (unsigned int a = 0; a < Dim; ++a)
+      {
+        read.SetIndex(a, static_cast<IndexValueType>(std::floor(lowest[a])) - 1);
+        read.SetSize(a, static_cast<SizeValueType>(std::floor(highest[a]) - std::floor(lowest[a])) + 4);
+      }
+      if (!read.Crop(initial->GetLargestPossibleRegion()))
+      {
+        continue; // the field does not reach the box: its cells start at zero
+      }
+      initial->SetRequestedRegion(read);
+      initial->Update();
+      interpolator->SetInputImage(initial); // which takes the bounds of what is buffered
+      std::vector<int64_t> cell = box.cell0;
+      for (bool more = true; more;)
+      {
+        int64_t                  flat = 0;
+        std::array<int64_t, Dim> below{};
+        std::array<double, Dim>  share{};
+        for (unsigned int d = 0; d < Dim; ++d)
+        {
+          flat = flat * cells[d] + cell[d];
+          below[Dim - 1 - d] = voxelBelow(d, cell[d], share[Dim - 1 - d]);
+        }
+        Vector<double, Dim> u; // millimetres, ITK order
+        u.Fill(0.0);
+        bool inside = true;
+        for (unsigned int corner = 0; inside && corner < (1u << Dim); ++corner)
+        {
+          double                             weight = 1.0;
+          typename FixedImageType::IndexType voxel;
+          for (unsigned int a = 0; a < Dim; ++a)
           {
-            u[r] += weight * static_cast<double>(value[r]);
+            const bool above = (corner >> a) & 1u;
+            weight *= above ? share[a] : 1.0 - share[a];
+            voxel[a] = voxelAt(a, below[a] + (above ? 1 : 0));
+          }
+          if (weight == 0.0)
+          {
+            continue;
+          }
+          typename FixedImageType::PointType point;
+          m_FixedImage->TransformIndexToPhysicalPoint(voxel, point);
+          inside = interpolator->IsInsideBuffer(point);
+          if (inside)
+          {
+            const auto value = interpolator->Evaluate(point);
+            for (unsigned int r = 0; r < Dim; ++r)
+            {
+              u[r] += weight * static_cast<double>(value[r]);
+            }
           }
         }
-      }
-      if (!inside)
-      {
-        continue;
-      }
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        const unsigned int a = Dim - 1 - d;
-        double             voxels = 0.0;
-        for (unsigned int r = 0; r < Dim; ++r)
+        for (unsigned int d = 0; inside && d < Dim; ++d)
         {
-          voxels += direction[r][a] * static_cast<double>(u[r]);
+          const unsigned int a = Dim - 1 - d;
+          double             voxels = 0.0;
+          for (unsigned int r = 0; r < Dim; ++r)
+          {
+            voxels += direction[r][a] * static_cast<double>(u[r]);
+          }
+          voxels /= fixedSpacing[a];
+          buffer[static_cast<size_t>(d) * cellCountTotal + flat] = static_cast<float>(voxels);
         }
-        voxels /= fixedSpacing[a];
-        buffer[static_cast<size_t>(d) * cellCountTotal + flat] = static_cast<float>(voxels);
+        more = false; // the next cell of the box, the last axis fastest
+        for (int d = static_cast<int>(Dim) - 1; !more && d >= 0; --d)
+        {
+          more = ++cell[d] < box.cell1[d];
+          if (!more)
+          {
+            cell[d] = box.cell0[d];
+          }
+        }
       }
     }
     theta = m_ResidentFeatures ? start.to(device) : start;
