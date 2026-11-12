@@ -266,6 +266,8 @@ public:
    * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
    * mean, which the resident route keeps exact), with
    * the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
+   * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
+   * iteration costs and holds then follows those boxes, not the image.
    * Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
    * a power of two coarser, no coarser than the control cells (a region then starts on the layer's lattice); the
    * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
@@ -283,6 +285,22 @@ public:
    * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
+  /** Boxes drawn at random at every iteration, whose cells alone take that iteration's step; 0 (the default) steps
+   * every cell at every iteration. The draw is new at every iteration, from Seed, without a box twice in one, and
+   * NumberOfIterations keeps its meaning: the number of iterations, of RegionsPerIteration * RegionSize ^
+   * ImageDimension voxels each. A drawn box goes to the device alone, with the cells within twice 1 +
+   * ControlGridSmoothingIterations of it: its loss is taken over the cells that read its own through the smoothing
+   * and the regularizer, so that the gradient of its cells is the whole grid's, and Adam steps those cells with the
+   * moments they hold, corrected by the count of steps their box has taken. With the pooled maps resident or in
+   * mapped files alike, an iteration reads and writes the cells of its boxes alone: nothing in it passes over the
+   * grid, and with the maps in mapped files what it holds in host memory and on the device does not follow the
+   * image. One pass does go over the grid before the first iteration when NormalizeLosses is on, a box at a time:
+   * the losses' values at the starting field, taken over every box so that they do not follow the draw. Drawing
+   * every box at every iteration is the run with 0, to float precision; with fewer the field tends to that run's
+   * limit as the iterations grow, and GetMetricValuesPerIteration() holds the loss over the drawn boxes, scaled
+   * to the grid. */
+  itkSetMacro(RegionsPerIteration, unsigned int);
+  itkGetConstMacro(RegionsPerIteration, unsigned int);
   /** Most bytes a step of a brick may hold on the device when the pooled maps are not resident: a brick is as many
    * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. A step of a brick
    * of n cells, reading w cells with those around it (1 + ControlGridSmoothingIterations each side), holds at its
@@ -290,7 +308,9 @@ public:
    * those of all the kept feature layers (1 for the intensities): the count the bricks are sized by, measured in
    * 3D on 1 to 48 channels and 1 and 3 smoothing passes, where a step held between 0.66 and 1.0 of it. 0 (the
    * default): an eighth of what ResidentFeatureBudget's default lets the maps take. The bricks set the memory, not
-   * the result. */
+   * the result. With RegionsPerIteration a drawn box is stepped by itself, whatever BrickBytes: by that count its
+   * step holds what a brick of (RegionSize / GridShrinkFactor + 2 r) ^ ImageDimension cells does, reading (RegionSize
+   * / GridShrinkFactor + 4 r) ^ ImageDimension, with r = 1 + ControlGridSmoothingIterations. */
   itkSetMacro(BrickBytes, SizeValueType);
   itkGetConstMacro(BrickBytes, SizeValueType);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
@@ -419,6 +439,7 @@ private:
   std::string   m_Mode{ "Static" };
   unsigned int  m_FeatureChunkSize{ 32 };
   unsigned int  m_RegionSize{ 0 };
+  unsigned int  m_RegionsPerIteration{ 0 };
   SizeValueType m_BrickBytes{ 0 };
   unsigned int  m_RegionHalo{ 0 };
   SizeValueType m_ResidentFeatureBudget{ 0 };

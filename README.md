@@ -173,7 +173,10 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   optimizer's state, in files of `ScratchDirectory` mapped to memory (give a directory on a disk for
   an image larger than the memory), and every iteration steps every cell, by bricks of boxes sized
   to the device (`BrickBytes`, the most bytes a step holds there). Either way the images are read once and the field is the
-  whole-image run's, to float precision. `SetMovingTransform` applies a
+  whole-image run's, to float precision. `SetRegionsPerIteration(R)` steps, at every iteration, the
+  cells of `R` boxes drawn at random (afresh each time, from `Seed`), each with the whole grid's
+  gradient on its cells: an iteration then costs and holds what its boxes ask, whatever the image,
+  and the field tends to the same limit as the iterations grow. `SetMovingTransform` applies a
   transform (an affine, a coarser pass's field) to the moving side outside the optimization;
   `GetControlGridTransform()` is the result on the control grid, `GetOutput()` the dense field,
   produced for the region requested of it (stream it to a writer). With the maps in mapped files

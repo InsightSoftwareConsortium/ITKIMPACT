@@ -145,13 +145,15 @@ struct Peaks
 };
 
 // Both stages by regions from mapped files on a pair of `side` voxels a side, on `device`: the coarse stage, then
-// the fine stage started from the coarse stage's field, which it asks by regions. With `brickBytes`, the fine
-// stage alone, its bricks of that many bytes.
+// the fine stage started from the coarse stage's field, which it asks by regions. With `brickBytes` or
+// `regionsPerIteration`, the fine stage alone: its bricks of that many bytes, or that many boxes drawn at every
+// iteration.
 bool
 Run(unsigned int        side,
     const std::string & device,
     const std::string & temporary,
     itk::SizeValueType  brickBytes,
+    unsigned int        regionsPerIteration,
     Peaks &             coarsePeaks,
     Peaks &             finePeaks)
 {
@@ -210,7 +212,8 @@ Run(unsigned int        side,
   coarse->SetResidentFeatureBudget(1);            // nothing fits: mapped files
   coarse->SetScratchDirectory(scratch);
   coarse->SetDevice(device);
-  if (brickBytes == 0)
+  const bool bothStages = brickBytes == 0 && regionsPerIteration == 0;
+  if (bothStages)
   {
     coarsePeaks = measured([&]() { coarse->GetCoarseGridTransform(); });
   }
@@ -218,7 +221,7 @@ Run(unsigned int        side,
   auto fine = FineType::New();
   fine->SetFixedImage(fixedReader->GetOutput());
   fine->SetMovingImage(movingReader->GetOutput());
-  if (brickBytes == 0)
+  if (bothStages)
   {
     fine->SetInitialDisplacementField(coarse->GetOutput());
   }
@@ -226,6 +229,7 @@ Run(unsigned int        side,
   fine->SetControlGridSmoothingIterations(1);
   fine->SetNumberOfIterations(2);
   fine->SetRegionSize(16);
+  fine->SetRegionsPerIteration(regionsPerIteration);
   fine->SetResidentFeatureBudget(1);
   fine->SetBrickBytes(brickBytes > 0 ? brickBytes : 1); // 1: bricks of one box
   fine->SetScratchDirectory(scratch);
@@ -267,9 +271,9 @@ main(int argc, char * argv[])
     constexpr unsigned int lesser = 48, greater = 96;
     const double           added = std::pow(greater, 3) - std::pow(lesser, 3);
     Peaks                  coarseLesser, fineLesser, coarseGreater, fineGreater;
-    if (!Run(lesser, device, temporary, 0, coarseLesser, fineLesser) ||
-        !Run(lesser, device, temporary, 0, coarseLesser, fineLesser) ||
-        !Run(greater, device, temporary, 0, coarseGreater, fineGreater))
+    if (!Run(lesser, device, temporary, 0, 0, coarseLesser, fineLesser) ||
+        !Run(lesser, device, temporary, 0, 0, coarseLesser, fineLesser) ||
+        !Run(greater, device, temporary, 0, 0, coarseGreater, fineGreater))
     {
       std::cerr << "The runs should read by regions and keep their maps in mapped files." << std::endl;
       return EXIT_FAILURE;
@@ -290,11 +294,22 @@ main(int argc, char * argv[])
       status = EXIT_FAILURE;
     }
 
+    // The same of the fine stage stepping the boxes it draws, four at every iteration.
+    Peaks unused, drawnLesser, drawnGreater;
+    Run(lesser, device, temporary, 0, 4, unused, drawnLesser);
+    Run(greater, device, temporary, 0, 4, unused, drawnGreater);
+    if (grows("fine (four boxes drawn an iteration)", "host", drawnLesser.host, drawnGreater.host) ||
+        grows("fine (four boxes drawn an iteration)", "device", drawnLesser.device, drawnGreater.device))
+    {
+      std::cerr << "What an iteration over the boxes it draws holds grows with the image." << std::endl;
+      status = EXIT_FAILURE;
+    }
+
     // BrickBytes bounds what a step of the fine stage holds on the device: bricks of several boxes hold more than
     // those of one, within it.
     constexpr itk::SizeValueType brickBytes = 6000000; // two boxes a side
-    Peaks                        unused, fineBricks;
-    Run(greater, device, temporary, brickBytes, unused, fineBricks);
+    Peaks                        fineBricks;
+    Run(greater, device, temporary, brickBytes, 0, unused, fineBricks);
     std::cout << device << ", fine stage, bricks within " << brickBytes << " bytes: " << fineBricks.device
               << " bytes at most on the device, " << fineGreater.device << " by bricks of one box" << std::endl;
     if (!(fineBricks.device > fineGreater.device && fineBricks.device <= static_cast<double>(brickBytes)))

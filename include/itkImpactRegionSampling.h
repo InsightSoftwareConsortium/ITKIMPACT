@@ -674,7 +674,9 @@ CellsAround(const CellBox & box, const std::vector<int64_t> & reach, const std::
 
 /** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: Advance() starts a step
  * of the grid, StepCells() takes it on the cells [c0, c1), each cell once. The parameters, their gradient and the
- * moments may be mapped files, of which a part's step reads and writes those cells alone, on `device`. */
+ * moments may be mapped files, of which a part's step reads and writes those cells alone, on `device`. When the
+ * parts do not step together, `steps` is set before a part's step to the count of steps that part has taken: the
+ * moments of the cells left out stay as they are, as if the step had not been. */
 struct CellAdam
 {
   torch::Tensor exponentialAverage;
