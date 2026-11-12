@@ -39,7 +39,9 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <string>
 #include <system_error>
@@ -622,6 +624,14 @@ struct CellBox
 {
   std::vector<int64_t> cell0;
   std::vector<int64_t> cell1;
+
+  /** Its cells. */
+  int64_t
+  Count() const
+  {
+    return std::transform_reduce(
+      cell1.begin(), cell1.end(), cell0.begin(), int64_t{ 1 }, std::multiplies<>(), std::minus<>());
+  }
 };
 
 inline std::vector<CellBox>
@@ -672,11 +682,23 @@ CellsAround(const CellBox & box, const std::vector<int64_t> & reach, const std::
   return window;
 }
 
-/** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: Advance() starts a step
- * of the grid, StepCells() takes it on the cells [c0, c1), each cell once. The parameters, their gradient and the
- * moments may be mapped files, of which a part's step reads and writes those cells alone, on `device`. When the
- * parts do not step together, `steps` is set before a part's step to the count of steps that part has taken: the
- * moments of the cells left out stay as they are, as if the step had not been. */
+/** The cells of `inner` among those of `window` that `t` ({1, C, window...}) holds, as a view. */
+inline torch::Tensor
+CropTo(const torch::Tensor & t, const CellBox & window, const CellBox & inner)
+{
+  std::vector<int64_t> lo(window.cell0.size()), hi(window.cell0.size());
+  for (size_t d = 0; d < lo.size(); ++d)
+  {
+    lo[d] = inner.cell0[d] - window.cell0[d];
+    hi[d] = inner.cell1[d] - window.cell0[d];
+  }
+  return NarrowTo(t, lo, hi);
+}
+
+/** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: StepCells() takes a step
+ * on the cells [c0, c1), `steps` being the count of steps those cells will then have taken, which the caller sets.
+ * The parameters, their gradient and the moments may be mapped files, of which a part's step reads and writes those
+ * cells alone, on `device`. The moments of the cells a step leaves out stay as they are, as if it had not been. */
 struct CellAdam
 {
   torch::Tensor exponentialAverage;
@@ -686,12 +708,6 @@ struct CellAdam
   double        beta2;
   double        epsilon;
   int64_t       steps{ 0 };
-
-  void
-  Advance()
-  {
-    ++steps;
-  }
 
   void
   StepCells(torch::Tensor &              theta,
