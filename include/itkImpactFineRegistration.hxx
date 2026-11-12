@@ -2553,13 +2553,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // The cells a brick touches. Smoothed alone, they give the smoothed field of the whole grid on the brick's
     // cells and the regularizer's next one.
     auto touchedBy = [&](const Impact::CellBox & brick) {
-      Impact::CellBox window = brick;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        window.cell0[d] = std::max<int64_t>(0, brick.cell0[d] - reach);
-        window.cell1[d] = std::min<int64_t>(cells[d], brick.cell1[d] + reach);
-      }
-      return window;
+      return Impact::CellsAround(brick, std::vector<int64_t>(Dim, reach), cells);
     };
     // One brick's loss for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when given, takes
     // each layer's unweighted value times the brick's share.
@@ -2699,19 +2693,18 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       cells,
       m_FixedImage.GetPointer(),
       m_ResidentFeatures ? nullptr : Impact::MapCellGridPixels<Dim>(cells, scratch).GetPointer());
-    const auto smoothingReach = static_cast<int64_t>(m_ControlGridSmoothingIterations);
+    const std::vector<int64_t> smoothingReach(Dim, static_cast<int64_t>(m_ControlGridSmoothingIterations));
     for (const Impact::CellBox & box : boxes)
     {
-      std::vector<int64_t> w0(Dim), w1(Dim), lo(Dim), hi(Dim);
+      const Impact::CellBox window = Impact::CellsAround(box, smoothingReach, cells);
+      std::vector<int64_t>  lo(Dim), hi(Dim);
       for (unsigned int d = 0; d < Dim; ++d)
       {
-        w0[d] = std::max<int64_t>(0, box.cell0[d] - smoothingReach);
-        w1[d] = std::min<int64_t>(cells[d], box.cell1[d] + smoothingReach);
-        lo[d] = box.cell0[d] - w0[d];
-        hi[d] = box.cell1[d] - w0[d];
+        lo[d] = box.cell0[d] - window.cell0[d];
+        hi[d] = box.cell1[d] - window.cell0[d];
       }
       Impact::WriteCellsToCellGrid<Dim>(
-        Impact::NarrowTo(smoothControl(Impact::NarrowTo(theta, w0, w1).to(device)), lo, hi, 2),
+        Impact::NarrowTo(smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), lo, hi, 2),
         box.cell0,
         cells,
         m_FixedImage.GetPointer(),

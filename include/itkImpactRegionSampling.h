@@ -655,6 +655,23 @@ TileCells(const std::vector<int64_t> & cells, const std::vector<int64_t> & perBo
   return boxes;
 }
 
+/** The cells within `reach` of `box` in a grid of `cells` cells, slid into the grid where it ends, so that they keep
+ * their count along each axis (the grid's when it has fewer). What reads `reach` cells around each cell of the box
+ * finds them there, and a pooling of that half-width finds its kernel's cells at an end of the grid as the grid
+ * whole gives them, however few cells the box has. */
+inline CellBox
+CellsAround(const CellBox & box, const std::vector<int64_t> & reach, const std::vector<int64_t> & cells)
+{
+  CellBox window = box;
+  for (size_t d = 0; d < cells.size(); ++d)
+  {
+    const int64_t count = std::min(cells[d], box.cell1[d] - box.cell0[d] + 2 * reach[d]);
+    window.cell0[d] = std::clamp<int64_t>(box.cell0[d] - reach[d], 0, cells[d] - count);
+    window.cell1[d] = window.cell0[d] + count;
+  }
+  return window;
+}
+
 /** Adam (torch::optim::Adam's update, no weight decay) on a grid of cells stepped by parts: Advance() starts a step
  * of the grid, StepCells() takes it on the cells [c0, c1), each cell once. The parameters, their gradient and the
  * moments may be mapped files, of which a part's step reads and writes those cells alone, on `device`. */
