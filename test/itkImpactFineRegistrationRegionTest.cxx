@@ -588,6 +588,58 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 9. A moving mask, which cuts the boxes unevenly: the cells that count follow the field, and the loss is their
+  // mean over the grid. By bricks, and with every box drawn at every iteration, from resident maps and from mapped
+  // files: the field of the dense iterations on the resident maps.
+  {
+    using MaskType = FineType::MaskImageType;
+    auto movingMask = MaskType::New();
+    movingMask->SetRegions(moving->GetLargestPossibleRegion());
+    movingMask->Allocate();
+    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    {
+      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
+    }
+    auto masked = [&](unsigned int regionsPerIteration, bool mapped) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fixed);
+      fine->SetMovingImage(moving);
+      fine->SetMovingMask(movingMask);
+      fine->SetInitialDisplacementField(start);
+      Configure(fine, 6);
+      fine->SetRegionSize(16);
+      fine->SetRegionsPerIteration(regionsPerIteration);
+      if (mapped)
+      {
+        fine->SetResidentFeatureBudget(1);
+        fine->SetBrickBytes(1);
+        fine->SetScratchDirectory(scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto resident = masked(0, false);
+    auto       differenceOf = [&](unsigned int regionsPerIteration, bool mapped) {
+      return MaxDifference(
+        resident->GetOutput(), masked(regionsPerIteration, mapped)->GetOutput(), fixed->GetLargestPossibleRegion());
+    };
+    const double bricksDifference = differenceOf(0, true);
+    const double everyResident = differenceOf(18, false);
+    const double everyMapped = differenceOf(18, true);
+    const double unmasked = MaxDifference(resident->GetOutput(), denseField, fixed->GetLargestPossibleRegion());
+    std::cout << "with a moving mask, against the dense iterations on resident maps: max |difference| = "
+              << bricksDifference << " mm by bricks, " << everyResident << " and " << everyMapped
+              << " mm with every box drawn, resident and mapped; " << unmasked << " mm from the run without the mask"
+              << std::endl;
+    if (!(bricksDifference < 1e-5) || !(everyResident < 1e-5) || !(everyMapped < 1e-5) || !(unmasked > 1e-4))
+    {
+      std::cerr << "With a moving mask, the runs by units differ from the dense iterations on resident maps."
+                << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
   std::cout << "Test finished." << std::endl;
   return EXIT_SUCCESS;
 }
