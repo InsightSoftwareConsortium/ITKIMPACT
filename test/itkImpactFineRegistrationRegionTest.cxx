@@ -254,11 +254,14 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 3. The pair streamed from disk, by regions: the same field, read in pieces, produced for the region asked.
+  // 3. The pair and the starting field streamed from disk, by regions: the same field, read in pieces, produced for
+  // the region asked.
   const std::string fixedFile = temporary + "/itkImpactFineRegistrationRegionTest_fixed.mha";
   const std::string movingFile = temporary + "/itkImpactFineRegistrationRegionTest_moving.mha";
+  const std::string startFile = temporary + "/itkImpactFineRegistrationRegionTest_start.mha";
   ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(fixed, fixedFile));
   ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(moving, movingFile));
+  ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(start, startFile));
   using ReaderType = itk::ImageFileReader<ImageType>;
   auto fixedReader = ReaderType::New();
   fixedReader->SetFileName(fixedFile);
@@ -266,10 +269,13 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   auto movingReader = ReaderType::New();
   movingReader->SetFileName(movingFile);
   movingReader->UseStreamingOn();
+  auto startReader = itk::ImageFileReader<FieldType>::New();
+  startReader->SetFileName(startFile);
+  startReader->UseStreamingOn();
   auto streamed = FineType::New();
   streamed->SetFixedImage(fixedReader->GetOutput());
   streamed->SetMovingImage(movingReader->GetOutput());
-  streamed->SetInitialDisplacementField(start);
+  streamed->SetInitialDisplacementField(startReader->GetOutput());
   Configure(streamed, 6);
   streamed->SetRegionSize(16);
   streamed->UpdateOutputInformation();
@@ -296,9 +302,10 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "The readers served the whole images where regions were requested." << std::endl;
     return EXIT_FAILURE;
   }
-  if (fixedReader->GetOutput()->GetBufferedRegion() == fixed->GetLargestPossibleRegion())
+  if (fixedReader->GetOutput()->GetBufferedRegion() == fixed->GetLargestPossibleRegion() ||
+      startReader->GetOutput()->GetBufferedRegion() == fixed->GetLargestPossibleRegion())
   {
-    std::cerr << "The fixed reader holds the whole image after the run." << std::endl;
+    std::cerr << "A reader holds its whole image after the run." << std::endl;
     return EXIT_FAILURE;
   }
   std::cout << "bytes read over the streamed run: " << streamed->GetBytesRead() << std::endl;
