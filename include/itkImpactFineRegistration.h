@@ -283,9 +283,14 @@ public:
    * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
-  /** Most bytes of the mapped files a brick may bring to the device when the pooled maps are not resident: a brick
-   * is as many boxes a side as fit it, one at least. 0 (the default): an eighth of what ResidentFeatureBudget's
-   * default lets the maps take. The bricks set the memory, not the result. */
+  /** Most bytes a step of a brick may hold on the device when the pooled maps are not resident: a brick is as many
+   * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. A step of a brick
+   * of n cells, reading w cells with those around it (1 + ControlGridSmoothingIterations each side), holds at its
+   * peak 4 * (ImageDimension * (6 + ControlGridSmoothingIterations) * w + 4 * channels * n) bytes, channels being
+   * those of all the kept feature layers (1 for the intensities): the count the bricks are sized by, measured in
+   * 3D on 1 to 48 channels and 1 and 3 smoothing passes, where a step held between 0.66 and 1.0 of it. 0 (the
+   * default): an eighth of what ResidentFeatureBudget's default lets the maps take. The bricks set the memory, not
+   * the result. */
   itkSetMacro(BrickBytes, SizeValueType);
   itkGetConstMacro(BrickBytes, SizeValueType);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
