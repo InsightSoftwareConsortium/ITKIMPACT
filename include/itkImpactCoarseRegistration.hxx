@@ -1352,18 +1352,29 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           }
           channelCount += channels[l];
         }
-        const double residentBytes =
-          static_cast<double>(cellCount) * 4.0 *
-          static_cast<double>(2 * channelCount + (fixedMask.IsNotNull() ? 1 : 0) + (movingMask.IsNotNull() ? 1 : 0));
-        double budget = static_cast<double>(m_ResidentFeatureBudget);
-        if (m_ResidentFeatureBudget == 0)
+        // What the run holds on the device at its peak with everything resident, in floats a cell: the two maps
+        // and the masks' shares, with the larger of what the solve holds beside them (the fields of its two
+        // problems and of the inverse consistency, a step of it) and of what a layer's cost at zero displacement
+        // takes over the whole grid, a point-wise distance three times the layer's channels and a windowed one
+        // twelve. And a box of the cost volume, whatever the grid.
+        const int64_t masks = (fixedMask.IsNotNull() ? 1 : 0) + (movingMask.IsNotNull() ? 1 : 0);
+        int64_t       latchFloats = 0;
+        for (size_t l = 0; featureMode && m_NormalizeLosses && !m_BalanceLosses && l < layerCount; ++l)
         {
-          // Of the memory left once the solve's own fields, resident with the maps, are on the device: the two
-          // problems' and the inverse consistency's four, two more in a step of it, and a problem's choices.
-          budget = Impact::ResidentBudget(device) -
-                   0.5 * static_cast<double>(cellCount) * static_cast<double>(8 * Dim * 4 + 8);
+          const bool pointwise =
+            Impact::LossFactory::Instance()
+              .Create(m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)])
+              ->IsPerPointMean();
+          latchFloats = std::max(latchFloats, (pointwise ? 3 : 12) * channels[l] + 2 + (masks > 0 ? 4 : 0));
         }
-        m_ResidentFeatures = residentBytes <= budget;
+        const int64_t residentFloats =
+          2 * channelCount + masks + std::max(static_cast<int64_t>(Dim) * (m_InverseConsistency ? 13 : 6), latchFloats);
+        m_ResidentBytes =
+          static_cast<SizeValueType>(cellCount * residentFloats * 4) +
+          std::min(m_CostBoxBytes, static_cast<SizeValueType>(cellCount) * static_cast<SizeValueType>(8 * L));
+        m_ResidentFeatures =
+          static_cast<double>(m_ResidentBytes) <=
+          (m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device));
         for (size_t l = 0; l < layerCount; ++l)
         {
           fixedMaps[l] = atHome(channels[l]);
@@ -1559,6 +1570,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os
   os << indent << "RegionHalo: " << m_RegionHalo << std::endl;
   os << indent << "CostBoxBytes: " << m_CostBoxBytes << std::endl;
   os << indent << "ResidentFeatureBudget: " << m_ResidentFeatureBudget << std::endl;
+  os << indent << "ResidentBytes: " << m_ResidentBytes << std::endl;
   os << indent << "ScratchDirectory: " << m_ScratchDirectory << std::endl;
   os << indent << "MovingTransform: " << (m_MovingTransform.IsNull() ? "none" : "set") << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;

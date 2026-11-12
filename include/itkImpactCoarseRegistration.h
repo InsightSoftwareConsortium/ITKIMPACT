@@ -250,12 +250,21 @@ public:
    * the other steps take a small part. */
   itkSetMacro(CostBoxBytes, SizeValueType);
   itkGetConstMacro(CostBoxBytes, SizeValueType);
-  /** Most bytes the pooled feature maps of both images and the masks' shares may take to stay resident on the
-   * device. 0 (the default): half the device memory free when the run starts, a quarter of the machine's on the
-   * CPU, less what the fields of the solve take beside them. GetResidentFeatures() tells which route a run took. */
+  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there. 0
+   * (the default): half the device memory free when the run starts, a quarter of the machine's on the CPU. What is
+   * held against it is GetResidentBytes(), all that grows with the image on that route, and a box of the cost
+   * volume: 4 * (2 * channels + the masks + m) bytes a coarse cell, m being the larger of what the solve holds
+   * beside the maps (13 * ImageDimension with InverseConsistency, 6 * ImageDimension without) and of what a
+   * layer's cost at zero displacement takes when NormalizeLosses latches it (3 times the layer's channels for a
+   * point-wise distance, 12 for a windowed one). Measured in 3D on the CPU and on CUDA, on 1 to 48 channels, L2
+   * and NCC: a run held between 0.76 and 0.97 of it. GetResidentFeatures() tells which route a run took. The
+   * memory is read once, when the run starts: what another process takes of the device afterwards is not seen,
+   * and the resident route can then run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);
+  /** What the last run by regions counted that it would hold on the device with everything resident, in bytes. */
+  itkGetConstMacro(ResidentBytes, SizeValueType);
   /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks'
    * shares, the fields of the solve and the coarse grid, in files mapped to memory that the system pages in and
    * out. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs) keeps them
@@ -349,6 +358,7 @@ private:
   SizeValueType                        m_CostBoxBytes{ static_cast<SizeValueType>(1) << 30 };
   SizeValueType                        m_ResidentFeatureBudget{ 0 };
   bool                                 m_ResidentFeatures{ false };
+  SizeValueType                        m_ResidentBytes{ 0 };
   std::string                          m_ScratchDirectory;
   SizeValueType                        m_BytesRead{ 0 };
   bool                                 m_FixedImageStreamed{ false };

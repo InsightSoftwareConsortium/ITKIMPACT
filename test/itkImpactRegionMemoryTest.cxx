@@ -20,7 +20,8 @@
 // two pairs streamed from disk, one of eight times the voxels of the other, a control cell a voxel, and the most
 // bytes it held at once, on the host and on the device, must be the same to within a quarter of a byte a voxel
 // added. A single array of floats over the cells of the greater pair is three times what a run holds at most, and
-// would add three bytes a voxel; the lists of the boxes, which do grow, add a few hundredths.
+// would add three bytes a voxel; the lists of the boxes, which do grow, add a few hundredths. With the maps resident
+// on the device, what a run holds there is within what it counted to choose that route.
 //
 // The host's bytes are counted where they are allocated, which a resident set size cannot tell from the pages of
 // the mapped files the system keeps: operator new, replaced here, counts the C++ heap (the images, the vectors),
@@ -41,6 +42,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <string>
 #if defined(__APPLE__)
@@ -144,23 +146,37 @@ struct Peaks
   double device{ 0.0 };
 };
 
-// Both stages by regions from mapped files on a pair of `side` voxels a side, on `device`: the coarse stage, then
-// the fine stage started from the coarse stage's field, which it asks by regions. With `brickBytes` or
-// `regionsPerIteration`, the fine stage alone: its bricks of that many bytes, or that many boxes drawn at every
-// iteration.
-bool
-Run(unsigned int        side,
-    const std::string & device,
-    const std::string & temporary,
-    itk::SizeValueType  brickBytes,
-    unsigned int        regionsPerIteration,
-    Peaks &             coarsePeaks,
-    Peaks &             finePeaks)
+// How a pair of `side` voxels a side is run. By default both stages from mapped files, the fine stage started from
+// the coarse stage's field, which it asks by regions, and stepping every cell by bricks of one box. With
+// `brickBytes` its bricks hold that many bytes, with `regionsPerIteration` it steps that many boxes drawn at every
+// iteration. `resident` keeps the maps on the device, each stage on its own; `masked` gives both images a mask.
+struct Settings
+{
+  unsigned int       side{ 48 };
+  bool               resident{ false };
+  bool               masked{ false };
+  itk::SizeValueType brickBytes{ 0 };
+  unsigned int       regionsPerIteration{ 0 };
+};
+
+// What a run held, what each stage counted it would hold resident, and whether it ran as asked: by regions, the
+// maps where the settings put them.
+struct Held
+{
+  Peaks  coarse;
+  Peaks  fine;
+  double coarseCounted{ 0.0 };
+  double fineCounted{ 0.0 };
+  bool   asAsked{ false };
+};
+
+Held
+Run(const std::string & device, const std::string & temporary, const Settings & settings)
 {
   const std::string fixedFile = temporary + "/itkImpactRegionMemoryTest_fixed.mha";
   const std::string movingFile = temporary + "/itkImpactRegionMemoryTest_moving.mha";
-  WriteTexture(side, 0.0, fixedFile);
-  WriteTexture(side, 1.0, movingFile);
+  WriteTexture(settings.side, 0.0, fixedFile);
+  WriteTexture(settings.side, 1.0, movingFile);
   auto fixedReader = ReaderType::New();
   fixedReader->SetFileName(fixedFile);
   fixedReader->UseStreamingOn();
@@ -170,8 +186,19 @@ Run(unsigned int        side,
   // What a reader keeps once it has opened its file is the reader's, not a stage's.
   fixedReader->UpdateOutputInformation();
   movingReader->UpdateOutputInformation();
+  using MaskType = itk::Image<unsigned char, 3>;
+  MaskType::Pointer mask;
+  if (settings.masked)
+  {
+    mask = MaskType::New();
+    mask->SetRegions(fixedReader->GetOutput()->GetLargestPossibleRegion());
+    mask->Allocate();
+    mask->FillBuffer(1);
+  }
   const std::string scratch = temporary + "/itkImpactRegionMemoryTest_scratch";
   std::filesystem::create_directories(scratch);
+  // Nothing fits a budget of one byte; everything fits the largest.
+  const itk::SizeValueType budget = settings.resident ? std::numeric_limits<itk::SizeValueType>::max() : 1;
 
   const torch::Device torchDevice(device);
   auto                measured = [&](auto && run) {
@@ -202,26 +229,32 @@ Run(unsigned int        side,
     return peaks;
   };
 
+  Held held;
   auto coarse = CoarseType::New();
   coarse->SetFixedImage(fixedReader->GetOutput());
   coarse->SetMovingImage(movingReader->GetOutput());
+  coarse->SetFixedMask(mask);
+  coarse->SetMovingMask(mask);
   coarse->SetGridSpacing(1);
   coarse->SetDisplacementHalfWidth(1); // 27 candidates
   coarse->SetRegionSize(16);
   coarse->SetCostBoxBytes(27 * 8 * 20 * 20 * 20); // boxes of 16 cells with their margins
-  coarse->SetResidentFeatureBudget(1);            // nothing fits: mapped files
+  coarse->SetResidentFeatureBudget(budget);
   coarse->SetScratchDirectory(scratch);
   coarse->SetDevice(device);
-  const bool bothStages = brickBytes == 0 && regionsPerIteration == 0;
-  if (bothStages)
+  const bool fineAlone = settings.brickBytes > 0 || settings.regionsPerIteration > 0;
+  if (!fineAlone)
   {
-    coarsePeaks = measured([&]() { coarse->GetCoarseGridTransform(); });
+    held.coarse = measured([&]() { coarse->GetCoarseGridTransform(); });
+    held.coarseCounted = static_cast<double>(coarse->GetResidentBytes());
   }
 
   auto fine = FineType::New();
   fine->SetFixedImage(fixedReader->GetOutput());
   fine->SetMovingImage(movingReader->GetOutput());
-  if (bothStages)
+  fine->SetFixedMask(mask);
+  fine->SetMovingMask(mask);
+  if (!fineAlone && !settings.resident)
   {
     fine->SetInitialDisplacementField(coarse->GetOutput());
   }
@@ -229,14 +262,17 @@ Run(unsigned int        side,
   fine->SetControlGridSmoothingIterations(1);
   fine->SetNumberOfIterations(2);
   fine->SetRegionSize(16);
-  fine->SetRegionsPerIteration(regionsPerIteration);
-  fine->SetResidentFeatureBudget(1);
-  fine->SetBrickBytes(brickBytes > 0 ? brickBytes : 1); // 1: bricks of one box
+  fine->SetRegionsPerIteration(settings.regionsPerIteration);
+  fine->SetResidentFeatureBudget(budget);
+  fine->SetBrickBytes(settings.brickBytes > 0 ? settings.brickBytes : 1); // 1: bricks of one box
   fine->SetScratchDirectory(scratch);
   fine->SetDevice(device);
-  finePeaks = measured([&]() { fine->GetControlGridTransform(); });
-  return !coarse->GetResidentFeatures() && !fine->GetResidentFeatures() &&
-         fixedReader->GetOutput()->GetBufferedRegion() != fixedReader->GetOutput()->GetLargestPossibleRegion();
+  held.fine = measured([&]() { fine->GetControlGridTransform(); });
+  held.fineCounted = static_cast<double>(fine->GetResidentBytes());
+  held.asAsked = (fineAlone || coarse->GetResidentFeatures() == settings.resident) &&
+                 fine->GetResidentFeatures() == settings.resident &&
+                 fixedReader->GetOutput()->GetBufferedRegion() != fixedReader->GetOutput()->GetLargestPossibleRegion();
+  return held;
 }
 } // namespace
 
@@ -270,36 +306,42 @@ main(int argc, char * argv[])
     // takes what the libraries allocate once for the process.
     constexpr unsigned int lesser = 48, greater = 96;
     const double           added = std::pow(greater, 3) - std::pow(lesser, 3);
-    Peaks                  coarseLesser, fineLesser, coarseGreater, fineGreater;
-    if (!Run(lesser, device, temporary, 0, 0, coarseLesser, fineLesser) ||
-        !Run(lesser, device, temporary, 0, 0, coarseLesser, fineLesser) ||
-        !Run(greater, device, temporary, 0, 0, coarseGreater, fineGreater))
+    auto                   mapped = [&](unsigned int side, itk::SizeValueType brickBytes, unsigned int perIteration) {
+      Settings settings;
+      settings.side = side;
+      settings.brickBytes = brickBytes;
+      settings.regionsPerIteration = perIteration;
+      return Run(device, temporary, settings);
+    };
+    mapped(lesser, 0, 0);
+    const Held atLesser = mapped(lesser, 0, 0);
+    const Held atGreater = mapped(greater, 0, 0);
+    if (!atLesser.asAsked || !atGreater.asAsked)
     {
       std::cerr << "The runs should read by regions and keep their maps in mapped files." << std::endl;
       return EXIT_FAILURE;
     }
-    auto grows = [&](const char * stage, const char * where, double atLesser, double atGreater) {
-      const double perVoxel = (atGreater - atLesser) / added;
-      std::cout << device << ", " << stage << " stage, " << where << ": " << atLesser << " bytes at most on " << lesser
-                << "^3 voxels, " << atGreater << " on " << greater << "^3: " << perVoxel << " byte a voxel added"
-                << std::endl;
+    auto grows = [&](const char * stage, const char * where, double lesserPeak, double greaterPeak) {
+      const double perVoxel = (greaterPeak - lesserPeak) / added;
+      std::cout << device << ", " << stage << " stage, " << where << ": " << lesserPeak << " bytes at most on "
+                << lesser << "^3 voxels, " << greaterPeak << " on " << greater << "^3: " << perVoxel
+                << " byte a voxel added" << std::endl;
       return !(perVoxel < 0.25);
     };
-    if (grows("coarse", "host", coarseLesser.host, coarseGreater.host) ||
-        grows("coarse", "device", coarseLesser.device, coarseGreater.device) ||
-        grows("fine", "host", fineLesser.host, fineGreater.host) ||
-        grows("fine", "device", fineLesser.device, fineGreater.device))
+    if (grows("coarse", "host", atLesser.coarse.host, atGreater.coarse.host) ||
+        grows("coarse", "device", atLesser.coarse.device, atGreater.coarse.device) ||
+        grows("fine", "host", atLesser.fine.host, atGreater.fine.host) ||
+        grows("fine", "device", atLesser.fine.device, atGreater.fine.device))
     {
       std::cerr << "What a run by regions holds grows with the image." << std::endl;
       status = EXIT_FAILURE;
     }
 
     // The same of the fine stage stepping the boxes it draws, four at every iteration.
-    Peaks unused, drawnLesser, drawnGreater;
-    Run(lesser, device, temporary, 0, 4, unused, drawnLesser);
-    Run(greater, device, temporary, 0, 4, unused, drawnGreater);
-    if (grows("fine (four boxes drawn an iteration)", "host", drawnLesser.host, drawnGreater.host) ||
-        grows("fine (four boxes drawn an iteration)", "device", drawnLesser.device, drawnGreater.device))
+    const Held drawnLesser = mapped(lesser, 0, 4);
+    const Held drawnGreater = mapped(greater, 0, 4);
+    if (grows("fine (four boxes drawn an iteration)", "host", drawnLesser.fine.host, drawnGreater.fine.host) ||
+        grows("fine (four boxes drawn an iteration)", "device", drawnLesser.fine.device, drawnGreater.fine.device))
     {
       std::cerr << "What an iteration over the boxes it draws holds grows with the image." << std::endl;
       status = EXIT_FAILURE;
@@ -308,13 +350,45 @@ main(int argc, char * argv[])
     // BrickBytes bounds what a step of the fine stage holds on the device: bricks of several boxes hold more than
     // those of one, within it.
     constexpr itk::SizeValueType brickBytes = 6000000; // two boxes a side
-    Peaks                        fineBricks;
-    Run(greater, device, temporary, brickBytes, 0, unused, fineBricks);
-    std::cout << device << ", fine stage, bricks within " << brickBytes << " bytes: " << fineBricks.device
-              << " bytes at most on the device, " << fineGreater.device << " by bricks of one box" << std::endl;
-    if (!(fineBricks.device > fineGreater.device && fineBricks.device <= static_cast<double>(brickBytes)))
+    const Held                   bricks = mapped(greater, brickBytes, 0);
+    std::cout << device << ", fine stage, bricks within " << brickBytes << " bytes: " << bricks.fine.device
+              << " bytes at most on the device, " << atGreater.fine.device << " by bricks of one box" << std::endl;
+    if (!(bricks.fine.device > atGreater.fine.device && bricks.fine.device <= static_cast<double>(brickBytes)))
     {
       std::cerr << "BrickBytes does not bound what a brick's step holds on the device." << std::endl;
+      status = EXIT_FAILURE;
+    }
+
+    // With the maps resident, a stage holds on the device no more than it counted to choose that route, and no less
+    // than half of it: stepping every cell, without a mask and with both, and stepping the boxes it draws, on the
+    // greater pair, where one box's own step is little of the whole.
+    auto within = [&](const char * stage, double peak, double counted) {
+      std::cout << device << ", " << stage << ", maps resident: " << peak << " bytes at most on the device, " << counted
+                << " counted" << std::endl;
+      return peak <= counted && peak > 0.5 * counted;
+    };
+    for (const bool masked : { false, true })
+    {
+      Settings settings;
+      settings.resident = true;
+      settings.masked = masked;
+      const Held        every = Run(device, temporary, settings);
+      const std::string label = masked ? " stage with masks" : " stage";
+      if (!every.asAsked || !within(("coarse" + label).c_str(), every.coarse.device, every.coarseCounted) ||
+          !within(("fine" + label).c_str(), every.fine.device, every.fineCounted))
+      {
+        std::cerr << "With the maps resident a stage holds more than it counted, or less than half." << std::endl;
+        status = EXIT_FAILURE;
+      }
+    }
+    Settings settings;
+    settings.side = greater;
+    settings.resident = true;
+    settings.regionsPerIteration = 4;
+    const Held drawn = Run(device, temporary, settings);
+    if (!drawn.asAsked || !within("fine stage, four boxes drawn an iteration", drawn.fine.device, drawn.fineCounted))
+    {
+      std::cerr << "With the maps resident the drawn boxes hold more than was counted, or less than half." << std::endl;
       status = EXIT_FAILURE;
     }
   }

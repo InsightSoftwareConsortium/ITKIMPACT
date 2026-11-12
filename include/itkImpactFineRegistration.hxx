@@ -2156,18 +2156,22 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     channelCount += c;
   }
-  const double residentBytes = static_cast<double>(cellCountTotal) * static_cast<double>(channelCount) * 4.0 * 2.0 +
-                               (m_MovingMask.IsNotNull() ? static_cast<double>(cellCountTotal) * 4.0 : 0.0);
-  double budget = static_cast<double>(m_ResidentFeatureBudget);
-  if (m_ResidentFeatureBudget == 0)
-  {
-    // Of the memory left once the control grid and Adam's state, resident with the maps, are on the device.
-    budget = Impact::ResidentBudget(device) -
-             0.5 * static_cast<double>(cellCountTotal) * static_cast<double>(3 * Dim + 1) * 4.0;
-  }
-  m_ResidentFeatures = residentBytes <= budget;
   const bool drawsBoxes = m_RegionsPerIteration > 0; // an iteration steps those boxes alone
-  auto       atHome = [&](const std::vector<int64_t> & shape) {
+  // What the run holds on the device at its peak with everything resident, in floats a cell. With the boxes drawn:
+  // the two maps, the control grid, its gradient, Adam's two moments and the masks' cells. Stepping every cell,
+  // an iteration's graph over the whole grid besides: Dim * (13 + the smoothing passes) for the field and its
+  // state, six a channel (the two maps, the features sampled, their difference and the gradients back), and a
+  // channel and four more when the cells that count are drawn (a mask, SamplingPercentage).
+  const auto    smoothingPasses = static_cast<int64_t>(m_ControlGridSmoothingIterations);
+  const bool    drawsCells = m_FixedMask.IsNotNull() || m_MovingMask.IsNotNull() || m_SamplingPercentage < 1.0;
+  const int64_t residentFloats = drawsBoxes ? 2 * channelCount + 4 * static_cast<int64_t>(Dim) + 2
+                                            : static_cast<int64_t>(Dim) * (13 + smoothingPasses) + 6 * channelCount +
+                                                (drawsCells ? channelCount + 4 : 0);
+  m_ResidentBytes = static_cast<SizeValueType>(cellCountTotal * residentFloats * 4);
+  m_ResidentFeatures =
+    static_cast<double>(m_ResidentBytes) <=
+    (m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device));
+  auto atHome = [&](const std::vector<int64_t> & shape) {
     return m_ResidentFeatures ? torch::zeros(shape, onDevice) : scratch.Zeros(shape);
   };
 
@@ -2761,6 +2765,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os, 
   os << indent << "BrickBytes: " << m_BrickBytes << std::endl;
   os << indent << "RegionHalo: " << m_RegionHalo << std::endl;
   os << indent << "ResidentFeatureBudget: " << m_ResidentFeatureBudget << std::endl;
+  os << indent << "ResidentBytes: " << m_ResidentBytes << std::endl;
   os << indent << "ScratchDirectory: " << m_ScratchDirectory << std::endl;
 }
 
