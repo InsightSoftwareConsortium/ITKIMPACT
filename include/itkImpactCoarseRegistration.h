@@ -25,6 +25,7 @@
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
+#include <itkTransform.h>
 #include <itkImpactModelConfiguration.h>
 #include <itkImpactLossNormalization.h>
 
@@ -49,7 +50,9 @@ namespace itk
  * global regularization (an increasing-coupling argmin/smoothing schedule) to obtain a smooth
  * coarse field, finally upsampled to full resolution. All heavy computation uses LibTorch. The
  * cost is on raw intensities by default, or on deep features of any configured IMPACT
- * TorchScript model (not tied to MIND specifically).
+ * TorchScript model (not tied to MIND specifically). With the authors' settings (one MIND layer, L2,
+ * GridSpacing 6, DisplacementHalfWidth 4, inverse consistency) on an isotropic pair without masks, the field is
+ * theirs: test/itkImpactConvexAdamParityTest.py compares the two.
  *
  * The output is a geometry-correct itk displacement field on the fixed grid (physical
  * millimetres, ITK x,y,z, fixed->moving), sharing the ImpactFineRegistration convention
@@ -185,21 +188,15 @@ public:
   itkGetConstMacro(Seed, unsigned int);
 
   /** \name Coarse search parameters.
-   * Counted in voxels of the fixed image's finest axis, s_min = min_a s_a, and derived per axis, so that
-   * the cells and the capture range are (nearly) isotropic in millimetres; on an isotropic image every
-   * axis takes the numbers as they are. */
+   * Counted in voxels of the fixed image, the same number along every axis whatever its spacing, as ConvexAdam
+   * counts them. */
   /** @{ */
-  /** Cell size of the coarse grid the cost volume runs on, in voxels of the finest axis: along axis a a
-   * cell spans gs_a = max(1, round(GridSpacing * s_min / s_a)) voxels (avg-pool kernel and stride), a
-   * cell of about GridSpacing * s_min mm. The cost smoothing, the NCC/LNCC window and the displacement
-   * smoothing are counted in cells. Default 4. */
+  /** Cell size of the coarse grid the cost volume runs on, in voxels (avg-pool kernel and stride). The cost
+   * smoothing, the NCC/LNCC window and the displacement smoothing are counted in cells. Default 4. */
   itkSetMacro(GridSpacing, unsigned int);
   itkGetConstMacro(GridSpacing, unsigned int);
-  /** Displacement search half-width, in cells of the finest axis: the capture range is R =
-   * DisplacementHalfWidth * GridSpacing * s_min mm each way, which axis a covers with hw_a = ceil(R /
-   * (gs_a * s_a)) cells, so the candidates are the box prod_a (2 hw_a + 1). The coupling penalty
-   * weighs a move of one cell along axis a by (gs_a * s_a / (GridSpacing * s_min))^2, so that a
-   * distance in millimetres costs the same along every axis. Default 3. */
+  /** Displacement search half-width, in cells: DisplacementHalfWidth * GridSpacing voxels each way along every
+   * axis, (2 DisplacementHalfWidth + 1)^Dim candidates. Default 3. */
   itkSetMacro(DisplacementHalfWidth, unsigned int);
   itkGetConstMacro(DisplacementHalfWidth, unsigned int);
   /** Also solve the backward (moving->fixed) coarse problem and symmetrize the two fields
@@ -209,6 +206,50 @@ public:
   itkSetMacro(InverseConsistency, bool);
   itkGetConstMacro(InverseConsistency, bool);
   itkBooleanMacro(InverseConsistency);
+  /** @} */
+
+  /** \name Region sampling: an out-of-core run.
+   * With RegionSize > 0 the images are never read whole. One pass over boxes of the fixed grid, each RegionSize
+   * voxels a side (whole cells of the coarse grid), reads each box of the fixed image and of the
+   * moving image (brought onto the fixed grid through the identity, region by region) with its halo, extracts their
+   * features and pools them to the coarse grid, which stays on the device; the cost volume is then built by boxes of
+   * that grid, each within CostBoxBytes, never whole, and the coupled-convex iterations and the inverse consistency
+   * run on the pooled maps. The field is the whole-image run's to float precision. The images are read through their
+   * own pipelines (SetRequestedRegion then Update: an itk::ImageFileReader with UseStreamingOn reads those regions
+   * alone; an image in memory serves them from its buffer); the caller keeps its readers alive. Request a region of
+   * GetOutput() (or stream it to a writer) rather than the whole field, and take the field on the coarse grid from
+   * GetCoarseGridTransform(). A feature layer a power of two coarser than the image, no coarser than the coarse
+   * cells, is computed by regions too, each region starting on its lattice. PCA fits its basis on the whole feature
+   * map and a model resampling the image to its own voxel size does not line up with the boxes: refused. */
+  /** @{ */
+  /** Side of a box, in voxels; 0 (the default) reads the images whole. */
+  itkSetMacro(RegionSize, unsigned int);
+  itkGetConstMacro(RegionSize, unsigned int);
+  /** Voxels read around a box, on every axis, so that its features equal those of the whole image: the receptive
+   * field of the feature model, in its input's voxels (0 for a point-wise model). */
+  itkSetMacro(RegionHalo, unsigned int);
+  itkGetConstMacro(RegionHalo, unsigned int);
+  /** A transform from the fixed to the moving physical space the moving image and its mask are read through with
+   * RegionSize (an affine pre-alignment): each of their regions is brought onto the fixed grid through it, by linear
+   * interpolation (nearest neighbour for the mask), by a resampler that asks the moving image for that region alone.
+   * Without one, the identity. */
+  using TransformType = Transform<double, ImageDimension, ImageDimension>;
+  itkSetConstObjectMacro(MovingTransform, TransformType);
+  itkGetConstObjectMacro(MovingTransform, TransformType);
+  /** Bytes a box of the cost volume may take (default 1 GiB): the coarse grid is tiled into boxes whose cost over
+   * every candidate, with the margins the cell window and the candidates read, fits it. */
+  itkSetMacro(CostBoxBytes, SizeValueType);
+  itkGetConstMacro(CostBoxBytes, SizeValueType);
+  /** Bytes requested from the images and masks over the run. */
+  itkGetConstMacro(BytesRead, SizeValueType);
+  /** Whether the fixed (moving) image served its regions without buffering it whole. */
+  itkGetConstMacro(FixedImageStreamed, bool);
+  itkGetConstMacro(MovingImageStreamed, bool);
+  /** The field on the coarse grid as a transform: one sample per cell at the cell's centre, padded by two cells of
+   * replicated border, so that its linear interpolation is the map the dense field holds at every voxel. With
+   * RegionSize > 0 it is solved without allocating the dense field. */
+  DisplacementFieldTransformType *
+  GetCoarseGridTransform();
   /** @} */
 
   /** The output displacement field (== GetOutput()), fixed grid, millimetres, x,y,z. */
@@ -230,6 +271,27 @@ protected:
 
   void
   GenerateData() override;
+
+  /** With RegionSize > 0: the requested region of the dense field, interpolated from the coarse grid. */
+  void
+  DynamicThreadedGenerateData(const typename Superclass::OutputImageRegionType & region) override;
+
+  /** The region-sampled run (RegionSize > 0): solves the coarse grid without reading an image whole. */
+  void
+  SolveByRegions();
+
+  /** The coupled-convex solve both runs end in, on the two images' features pooled to the coarse grid ({1, C,
+   * coarse...} a layer) and the masks' shares of its cells (undefined without a mask): sets the field on the coarse
+   * grid and returns it, in voxels. `cost` builds the cost volume of one of `boxes`, which tile the grid. The tensors
+   * and the boxes are LibTorch-backed types this header does not name. */
+  template <typename TTensor, typename TBox, typename TCost>
+  TTensor
+  SolveOnCoarseGrid(const std::vector<TTensor> & fixedMaps,
+                    const std::vector<TTensor> & movingMaps,
+                    const TTensor &              fixedShare,
+                    const TTensor &              movingShare,
+                    const std::vector<TBox> &    boxes,
+                    TCost &&                     cost);
 
 private:
   typename FixedImageType::ConstPointer  m_FixedImage{ nullptr };
@@ -253,7 +315,18 @@ private:
   unsigned int m_DisplacementHalfWidth{ 3 };
   bool         m_InverseConsistency{ true };
 
+  unsigned int                         m_RegionSize{ 0 };
+  unsigned int                         m_RegionHalo{ 0 };
+  typename TransformType::ConstPointer m_MovingTransform{ nullptr };
+  SizeValueType                        m_CostBoxBytes{ static_cast<SizeValueType>(1) << 30 };
+  SizeValueType                        m_BytesRead{ 0 };
+  bool                                 m_FixedImageStreamed{ false };
+  bool                                 m_MovingImageStreamed{ false };
+  ModifiedTimeType                     m_SolvedTime{ 0 };
+
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };
+  typename DisplacementFieldType::Pointer          m_CoarseGrid{ nullptr };
+  typename DisplacementFieldTransformType::Pointer m_CoarseGridTransform{ nullptr };
 };
 
 } // end namespace itk

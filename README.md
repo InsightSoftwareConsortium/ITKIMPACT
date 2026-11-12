@@ -164,6 +164,32 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   or IMPACT feature loss) plus a diffusion regularizer with `torch::optim::Adam` — all on
   device, no per-iteration CPU↔GPU round trip. Optional low-resolution control grid
   (`GridShrinkFactor`) and PCA channel reduction.
+- **By regions (out of core).** With `SetRegionSize(n)` the fine stage never reads an image whole:
+  it reads boxes of `n` voxels through the images' own pipelines (an `itk::ImageFileReader` with
+  `UseStreamingOn()`, or an image in memory, same code) and holds the control grid alone on the
+  device. One pass over the boxes pools each image's features to the control grid; when the pooled
+  maps fit `ResidentFeatureBudget` (half the free device memory by default) every iteration
+  compares them whole, the dense run on them; otherwise they stay, with the control grid and the
+  optimizer's state, in files of `ScratchDirectory` mapped to memory (give a directory on a disk for
+  an image larger than the memory), and every iteration steps every cell, by bricks of boxes sized
+  to the device (`BrickBytes`). Either way the images are read once and the field is the
+  whole-image run's, to float precision. `SetMovingTransform` applies a
+  transform (an affine, a coarser pass's field) to the moving side outside the optimization;
+  `GetControlGridTransform()` is the result on the control grid, `GetOutput()` the dense field,
+  produced for the region requested of it (stream it to a writer); of what grows with the image the
+  host memory keeps that control grid alone, 12 bytes a cell in 3D. Static mode, point-wise distances
+  and feature layers at the image's resolution (MIND) or a power of two coarser, no coarser than the
+  control cells; the caller keeps its readers alive.
+- **The coarse stage by regions.** `SetRegionSize(n)` on `ImpactCoarseRegistration` reads the pair the same
+  way: one pass over the boxes (each with its halo, the moving image brought onto the fixed grid region by
+  region) extracts the features and pools them to the coarse grid, which stays on the device; the cost volume
+  is then built by boxes of that grid, each within `CostBoxBytes`, never whole, and the coupled-convex
+  iterations and the inverse consistency run on the pooled maps; `SetMovingTransform` reads the moving image
+  through an affine pre-alignment. The field is the whole-image run's to float precision for a model whose
+  features are local; the shipped MIND bounds its variance by an image-wide mean (`mind_var_mean`), so its
+  region features differ slightly where that bound binds (on the test CT pair the coarse grids differ by
+  0.01 mm on average). `GetCoarseGridTransform()` is it on the coarse grid, `GetOutput()` the dense field for the
+  region requested.
 
 Both output a geometry-correct `itk::DisplacementFieldTransform` (physical millimetres,
 fixed→moving); the ITK↔Torch axis/units/direction conventions are handled internally.

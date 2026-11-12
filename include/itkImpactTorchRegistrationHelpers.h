@@ -41,6 +41,7 @@
 #include <itkIdentityTransform.h>
 #include <itkNearestNeighborInterpolateImageFunction.h>
 #include <itkResampleImageFilter.h>
+#include <itkVectorLinearInterpolateImageFunction.h>
 
 #include <torch/torch.h>
 
@@ -384,82 +385,27 @@ PcaSweepDimensions(const std::vector<ImpactModelConfiguration> & configs, unsign
   return dimensions;
 }
 
-/** \name Voxel counts read in units of the finest voxel side
- * The registration stages count their cells, windows and steps in voxels of the fixed image's finest axis, s_min, and
- * derive each axis's own count from it, so that they are (nearly) isotropic in millimetres. On an isotropic image the
- * derived counts are the given ones on every axis. Every vector here runs in tensor order (z, y, x). */
-/** @{ */
-/** The voxel sides of `spacing` (ITK order, x first) in tensor order (z, y, x). */
-template <unsigned int Dim, typename TSpacing>
-std::vector<double>
-TensorVoxelSides(const TSpacing & spacing)
-{
-  std::vector<double> sides(Dim);
-  for (unsigned int a = 0; a < Dim; ++a)
-  {
-    sides[a] = spacing[Dim - 1 - a];
-  }
-  return sides;
-}
-
-/** Per axis, `count` voxels of the finest axis in voxels of axis a, max(1, round(count * s_min / s_a)). */
+/** Per axis, a window of `kernel` voxels of the image on a map of shape `mapShape` ({1, C, spatial...}) over an image
+ * of `spatial` voxels (tensor order): along each axis the odd number of the map's voxels nearest the same length, a
+ * voxel of the map being its rounded pooling factor of the image's. `kernel` on every axis of a map pooled alike
+ * along all of them. */
 inline std::vector<int64_t>
-IsotropicVoxelCounts(const std::vector<double> & sides, double count)
+IsotropicWindow(const std::vector<int64_t> & spatial, c10::IntArrayRef mapShape, int64_t kernel)
 {
-  const double         finest = *std::min_element(sides.begin(), sides.end());
-  std::vector<int64_t> counts(sides.size());
-  for (size_t a = 0; a < sides.size(); ++a)
+  std::vector<double> side(spatial.size());
+  for (size_t a = 0; a < spatial.size(); ++a)
   {
-    counts[a] = std::max<int64_t>(1, std::llround(count * finest / sides[a]));
-  }
-  return counts;
-}
-
-/** Per axis, the number of cells of `cells[a]` voxels a search of `halfWidth` cells of `cellSize` voxels of the finest
- * axis reaches each way: ceil(R / (cells[a] * s_a)), R = halfWidth * cellSize * s_min mm. */
-inline std::vector<int64_t>
-CaptureHalfWidths(const std::vector<double> &  sides,
-                  const std::vector<int64_t> & cells,
-                  int64_t                      cellSize,
-                  int64_t                      halfWidth)
-{
-  const double         finest = *std::min_element(sides.begin(), sides.end());
-  std::vector<int64_t> halfWidths(sides.size());
-  for (size_t a = 0; a < sides.size(); ++a)
-  {
-    // cell_ref / cell_a, exactly 1 on an isotropic image; the tolerance keeps 1 from rounding up.
-    const double ratio = (static_cast<double>(cellSize) * finest) / (static_cast<double>(cells[a]) * sides[a]);
-    halfWidths[a] = static_cast<int64_t>(std::ceil(static_cast<double>(halfWidth) * ratio - 1e-9));
-  }
-  return halfWidths;
-}
-
-/** Per axis, a window of `kernel` voxels along the finest axis in millimetres of a map of shape `mapShape` ({1, C,
- * spatial...}) over an image of `spatial` voxels of `sides` mm: along each axis the odd number of voxels nearest the
- * same length, the map's voxel side being the image's times its rounded pooling factor. `kernel` on every axis of an
- * isotropic map. */
-inline std::vector<int64_t>
-IsotropicWindow(const std::vector<double> &  sides,
-                const std::vector<int64_t> & spatial,
-                c10::IntArrayRef             mapShape,
-                int64_t                      kernel)
-{
-  std::vector<double> side(sides.size());
-  for (size_t a = 0; a < sides.size(); ++a)
-  {
-    const int64_t pooling =
-      std::max<int64_t>(1, std::llround(static_cast<double>(spatial[a]) / static_cast<double>(mapShape[2 + a])));
-    side[a] = sides[a] * static_cast<double>(pooling);
+    side[a] = static_cast<double>(
+      std::max<int64_t>(1, std::llround(static_cast<double>(spatial[a]) / static_cast<double>(mapShape[2 + a]))));
   }
   const double         smallest = *std::min_element(side.begin(), side.end());
-  std::vector<int64_t> window(sides.size());
-  for (size_t a = 0; a < sides.size(); ++a)
+  std::vector<int64_t> window(spatial.size());
+  for (size_t a = 0; a < spatial.size(); ++a)
   {
     window[a] = 2 * static_cast<int64_t>(std::floor(static_cast<double>(kernel) * (smallest / side[a]) / 2.0)) + 1;
   }
   return window;
 }
-/** @} */
 
 /** \name Masks
  * A voxel counts where the fixed mask and the moving mask warped by the current field both hold (>= 0.5), as the
@@ -633,6 +579,103 @@ WriteVoxelFieldToDisplacement(const torch::Tensor &                             
       physical[r] = accumulator;
     }
     oit.Set(physical);
+  }
+}
+
+/** The cells replicated past each side of a cell grid (BuildCellGrid's border). */
+constexpr int64_t CellGridBorder = 2;
+
+/** BuildCellGrid's image for a field of `cells` cells (tensor order), allocated, its values left to the caller. */
+template <unsigned int Dim, typename TFixedImage>
+typename Image<Vector<float, Dim>, Dim>::Pointer
+AllocateCellGrid(const std::vector<int64_t> & cells, const TFixedImage * fixed)
+{
+  using FieldType = Image<Vector<float, Dim>, Dim>;
+  auto                            grid = FieldType::New();
+  typename FieldType::SizeType    size;
+  typename FieldType::SpacingType spacing;
+  typename FieldType::PointType   origin;
+  std::vector<double>             shift(Dim); // the first sample's position, in voxels of each ITK axis
+  const auto &                    fixedSize = fixed->GetLargestPossibleRegion().GetSize();
+  for (unsigned int a = 0; a < Dim; ++a)
+  {
+    const int64_t count = cells[Dim - 1 - a];
+    const double  stretch = static_cast<double>(fixedSize[a]) / static_cast<double>(count);
+    size[a] = static_cast<SizeValueType>(count + 2 * CellGridBorder);
+    spacing[a] = fixed->GetSpacing()[a] * stretch;
+    shift[a] = (stretch - 1.0) / 2.0 - static_cast<double>(CellGridBorder) * stretch;
+  }
+  typename FieldType::PointType first; // the first voxel of the region, whatever its index
+  fixed->TransformIndexToPhysicalPoint(fixed->GetLargestPossibleRegion().GetIndex(), first);
+  for (unsigned int r = 0; r < Dim; ++r)
+  {
+    double offset = 0.0;
+    for (unsigned int c = 0; c < Dim; ++c)
+    {
+      offset += fixed->GetDirection()[r][c] * fixed->GetSpacing()[c] * shift[c];
+    }
+    origin[r] = first[r] + offset;
+  }
+  typename FieldType::RegionType region;
+  region.SetSize(size);
+  grid->SetRegions(region);
+  grid->SetSpacing(spacing);
+  grid->SetOrigin(origin);
+  grid->SetDirection(fixed->GetDirection());
+  grid->Allocate();
+  return grid;
+}
+
+/** A field on a grid of cells ({1, Dim, cells...}, in voxels of the fixed grid, tensor order), one sample at each
+ * cell's centre, the cells sharing the fixed image's extent, as a displacement image in millimetres on its own grid,
+ * padded by two cells of replicated border each side: its linear interpolation gives at every fixed voxel what the
+ * trilinear upsampling of the field to the fixed size (align_corners=false) gives, ConvexAdam's. */
+template <unsigned int Dim, typename TFixedImage>
+typename Image<Vector<float, Dim>, Dim>::Pointer
+BuildCellGrid(const torch::Tensor & voxelField, const TFixedImage * fixed)
+{
+  namespace F = torch::nn::functional;
+  const std::vector<int64_t> padding(2 * Dim, CellGridBorder);
+  const torch::Tensor        padded = F::pad(voxelField, F::PadFuncOptions(padding).mode(torch::kReplicate));
+  auto                       grid =
+    AllocateCellGrid<Dim>(std::vector<int64_t>(voxelField.sizes().begin() + 2, voxelField.sizes().end()), fixed);
+  WriteVoxelFieldToDisplacement<Dim>(padded, fixed->GetSpacing(), fixed->GetDirection(), grid);
+  return grid;
+}
+
+/** The region `region` of `output`, a dense displacement field on `fixed`'s grid, interpolated linearly from the
+ * cell grid `grid` (BuildCellGrid's). */
+template <unsigned int Dim, typename TFixedImage>
+void
+InterpolateCellGrid(const Image<Vector<float, Dim>, Dim> *                      grid,
+                    const TFixedImage *                                         fixed,
+                    Image<Vector<float, Dim>, Dim> *                            output,
+                    const typename Image<Vector<float, Dim>, Dim>::RegionType & region)
+{
+  using FieldType = Image<Vector<float, Dim>, Dim>;
+  using InterpolatorType = VectorLinearInterpolateImageFunction<FieldType, double>;
+  auto interpolator = InterpolatorType::New();
+  interpolator->SetInputImage(grid);
+  const auto &                                   gridSize = grid->GetLargestPossibleRegion().GetSize();
+  ImageRegionIteratorWithIndex<FieldType>        it(output, region);
+  typename TFixedImage::PointType                point;
+  typename InterpolatorType::ContinuousIndexType index;
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    fixed->TransformIndexToPhysicalPoint(it.GetIndex(), point);
+    grid->TransformPhysicalPointToContinuousIndex(point, index);
+    for (unsigned int a = 0; a < Dim; ++a)
+    {
+      // Round-off can put a voxel a hair past the padded grid.
+      index[a] = std::clamp(index[a], 0.0, static_cast<double>(gridSize[a] - 1));
+    }
+    const auto         u = interpolator->EvaluateAtContinuousIndex(index);
+    Vector<float, Dim> value;
+    for (unsigned int a = 0; a < Dim; ++a)
+    {
+      value[a] = static_cast<float>(u[a]);
+    }
+    it.Set(value);
   }
 }
 

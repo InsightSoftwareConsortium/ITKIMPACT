@@ -28,7 +28,9 @@ set(ImpactTests
   itkImageToTensorFilterTest.cxx
   itkTensorToImageFilterTest.cxx
   itkImageToFeaturesMapTest.cxx
-  itkInterpolateVectorImageFunctionTest.cxx)
+  itkInterpolateVectorImageFunctionTest.cxx
+  itkImpactFineRegistrationRegionTest.cxx
+  itkImpactCoarseRegistrationRegionTest.cxx)
 
 CreateTestDriver(Impact "${Impact-Test_LIBRARIES}" "${ImpactTests}")
 
@@ -74,6 +76,15 @@ itk_add_test(NAME itkImageToFeaturesMapTest
 
 itk_add_test(NAME itkInterpolateVectorImageFunctionTest
   COMMAND ImpactTestDriver itkInterpolateVectorImageFunctionTest)
+
+# The region-sampled (out-of-core) fine stage against the whole-image one, on synthetic images written to the
+# test's temporary directory and streamed back.
+itk_add_test(NAME itkImpactFineRegistrationRegionTest
+  COMMAND ImpactTestDriver itkImpactFineRegistrationRegionTest
+  ${ITK_TEST_OUTPUT_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModelDown.pt)
+itk_add_test(NAME itkImpactCoarseRegistrationRegionTest
+  COMMAND ImpactTestDriver itkImpactCoarseRegistrationRegionTest
+  ${ITK_TEST_OUTPUT_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModelDown.pt)
 
 # GoogleTest-based unit tests for the IMPACT backend. Self-contained: they use
 # synthetic images plus the tiny committed Data/ImpactToyModel.pt, so they do

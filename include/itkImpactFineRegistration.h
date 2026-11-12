@@ -28,6 +28,7 @@
 #include <itkImage.h>
 #include <itkVector.h>
 #include <itkDisplacementFieldTransform.h>
+#include <itkTransform.h>
 #include <itkImpactModelConfiguration.h>
 #include <itkImpactLossNormalization.h>
 
@@ -40,7 +41,13 @@ namespace itk
 /** \class ImpactFineRegistration
  *
  * \brief Fast dense displacement-field registration refined with a Torch-backed Adam
- * optimizer (stage 2), in the spirit of the ConvexAdam instance-optimization step.
+ * optimizer (stage 2): ConvexAdam's instance optimization.
+ *
+ * With the authors' settings (one MIND layer, L2, no loss normalization, GridShrinkFactor 2, three smoothing
+ * passes, 79 steps for their 80 iterations, a learning rate of 2 voxels, a regularization weight of 1.25) on a
+ * pair without masks, it is their algorithm, down to their grid conventions, the scale of their sampling grid
+ * included: the control field is divided by (n - 1)/2 cells where the grid counts n/2, so the field returned is
+ * (n - 1)/n of the displacement that was matched. test/itkImpactConvexAdamParityTest.py compares the two.
  *
  * Self-contained ITK filter: takes a fixed and a moving image (plus an optional initial
  * displacement field as a warm start) and produces a dense displacement field mapping the
@@ -152,10 +159,9 @@ public:
    * the seeded generator (0 or a missing entry = all), as the metric's SubsetFeatures. */
   itkSetMacro(SubsetFeatures, std::vector<unsigned int>);
   itkGetConstReferenceMacro(SubsetFeatures, std::vector<unsigned int>);
-  /** Side of the window the "LNCC" distance correlates each channel over, in voxels of the compared feature
-   * map along its finest axis in millimetres; along each other axis the window takes the odd number of
-   * voxels nearest the same length (the map's voxel side being the fixed image's times its pooling
-   * factor), so it is (nearly) a cube in millimetres. Odd; default 5. */
+  /** Side of the window the "LNCC" distance correlates each channel over, in voxels of the fixed image: on a
+   * feature map pooled along some axes, the odd number of the map's voxels nearest that length along each. Odd;
+   * default 5. */
   itkSetMacro(LNCCKernel, unsigned int);
   itkGetConstMacro(LNCCKernel, unsigned int);
   /** Share of the voxels the feature similarity reads at every iteration, drawn anew at random from the seeded
@@ -188,37 +194,35 @@ public:
   itkGetConstMacro(Seed, unsigned int);
 
   /** \name Adam / displacement-field optimization parameters.
-   * The control grid, its step and its smoothing are counted in voxels of the fixed image's finest axis,
-   * s_min = min_a s_a, and derived per axis, so that they are (nearly) isotropic in millimetres; on an
-   * isotropic image every axis takes the numbers as they are. */
+   * The control grid, its step and its smoothing are counted in voxels of the fixed image, the same number along
+   * every axis whatever its spacing, as ConvexAdam counts them. */
   /** @{ */
-  /** Number of Adam iterations (default 80, as in ConvexAdam). */
+  /** Number of Adam steps (default 80). ConvexAdam returns the field its last iteration evaluates, before that
+   * iteration's step: its selected_niter iterations are selected_niter - 1 steps here. */
   itkSetMacro(NumberOfIterations, unsigned int);
   itkGetConstMacro(NumberOfIterations, unsigned int);
-  /** Adam learning rate, in units of s_min: the displacement is optimized in units of the finest voxel
-   * side, so a step moves up to LearningRate * s_min mm along every axis (default 1.0). */
+  /** Adam learning rate, in voxels: a step moves up to LearningRate voxels along every axis (default 1.0). */
   itkSetMacro(LearningRate, double);
   itkGetConstMacro(LearningRate, double);
   itkSetMacro(Beta1, double);
   itkGetConstMacro(Beta1, double);
   itkSetMacro(Beta2, double);
   itkGetConstMacro(Beta2, double);
+  /** Adam's epsilon (default 1e-8), against the gradient per control cell, as ConvexAdam's, whose parameters count
+   * cells: divided by GridShrinkFactor against the gradient per voxel this filter steps. */
   itkSetMacro(Epsilon, double);
   itkGetConstMacro(Epsilon, double);
-  /** Weight of the diffusion regularizer: the mean squared gradient of the (smoothed) displacement in mm
-   * per mm, summed over the axes -- on an isotropic image the gradient in voxels per voxel, as ConvexAdam's
-   * (default 1.25). */
+  /** Weight of the diffusion regularizer: the mean squared gradient of the (smoothed) displacement in voxels per
+   * voxel, summed over the axes, as ConvexAdam's (default 1.25). */
   itkSetMacro(RegularizationWeight, double);
   itkGetConstMacro(RegularizationWeight, double);
-  /** Low-resolution control-grid shrink factor, in voxels of the finest axis: along axis a the field is
-   * optimized on a grid shrink_a = max(1, round(GridShrinkFactor * s_min / s_a)) times coarser than the
-   * image, and upsampled to full resolution each iteration (ConvexAdam-style) -- faster on large volumes
-   * and adds regularity. Default 1 (full resolution). */
+  /** Low-resolution control-grid shrink factor: the field is optimized on a grid GridShrinkFactor times coarser
+   * than the image along every axis (ConvexAdam's grid_sp_adam) and upsampled to full resolution each iteration --
+   * faster on large volumes and adds regularity. Default 1 (full resolution). */
   itkSetMacro(GridShrinkFactor, unsigned int);
   itkGetConstMacro(GridShrinkFactor, unsigned int);
   /** Number of 3x3x3 average-pool smoothing passes applied to the control grid each iteration
-   * (B-spline-like control-point smoothing), in control cells, which GridShrinkFactor makes (nearly)
-   * isotropic in millimetres. Default 0. */
+   * (B-spline-like control-point smoothing), in control cells. Default 0. */
   itkSetMacro(ControlGridSmoothingIterations, unsigned int);
   itkGetConstMacro(ControlGridSmoothingIterations, unsigned int);
   /** In feature mode, re-extract the moving feature maps from the currently-warped moving image
@@ -249,6 +253,74 @@ public:
   itkGetConstMacro(FeatureChunkSize, unsigned int);
   /** @} */
 
+  /** \name Region sampling: an out-of-core run.
+   * With RegionSize > 0 the images are never read whole: one pass reads them by boxes of the fixed grid, each
+   * RegionSize voxels a side (rounded to whole cells of the control grid), with the region of the
+   * moving image each reads, through the images' own pipelines (SetRequestedRegion then Update: an
+   * itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them from its
+   * buffer), and keeps their features pooled to the control grid. The iterations read no image. Where the pooled maps
+   * do not fit the device they stay in files of ScratchDirectory mapped to memory, with the control grid and the
+   * optimizer's state, and an iteration steps every cell, as the whole-image run does, by bricks of boxes brought to
+   * the device one at a time; one the fixed mask does not reach costs its share of the regularizer alone.
+   * A brick's loss is the dense loss restricted to its cells,
+   * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
+   * mean, which the resident route keeps exact), with
+   * the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
+   * Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
+   * a power of two coarser, no coarser than the control cells (a region then starts on the layer's lattice); the
+   * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
+   * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
+   * as the whole-image run resizes its dense field. The output is produced by region:
+   * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
+   * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. Of what grows with
+   * the image, the run leaves in host memory the control grid GetControlGridTransform() holds, 4 * ImageDimension
+   * bytes a control cell, written a box at a time, and the initial displacement field as the caller gave it. */
+  /** @{ */
+  /** Side of a box, in voxels; 0 (the default) reads the images whole. */
+  itkSetMacro(RegionSize, unsigned int);
+  itkGetConstMacro(RegionSize, unsigned int);
+  /** Most bytes of the mapped files a brick may bring to the device when the pooled maps are not resident: a brick
+   * is as many boxes a side as fit it, one at least. 0 (the default): an eighth of what ResidentFeatureBudget's
+   * default lets the maps take. The bricks set the memory, not the result. */
+  itkSetMacro(BrickBytes, SizeValueType);
+  itkGetConstMacro(BrickBytes, SizeValueType);
+  /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
+   * receptive field of the feature model, in its input's voxels, so that its features on the box equal those of the
+   * whole image (0 for a point-wise model). */
+  itkSetMacro(RegionHalo, unsigned int);
+  itkGetConstMacro(RegionHalo, unsigned int);
+  /** A transform from the fixed to the moving physical space applied before the field, outside the optimization and
+   * its regularizer (an affine pre-alignment, or a coarser registration's field): a fixed point x reads the moving
+   * image at T(x + u(x)). Each region of the moving image is brought onto the fixed grid through it, by linear
+   * interpolation (nearest neighbour for the moving mask); evaluated at the corners of a lattice of at most four
+   * voxels a step and interpolated linearly between them, exact for a linear transform. Unset: the identity, the
+   * moving image read on its own grid where the fixed one places it. */
+  using TransformType = Transform<double, ImageDimension, ImageDimension>;
+  itkSetConstObjectMacro(MovingTransform, TransformType);
+  itkGetConstObjectMacro(MovingTransform, TransformType);
+  /** Most bytes the pooled feature maps of both images may take to stay resident on the device: within it every
+   * iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped files and every
+   * iteration brings them to the device a brick at a time. 0 (the default): half the
+   * device memory free when the run starts, a quarter of the machine's on the CPU. GetResidentFeatures() tells
+   * which route a run took. */
+  itkSetMacro(ResidentFeatureBudget, SizeValueType);
+  itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
+  itkGetConstMacro(ResidentFeatures, bool);
+  /** Where the run keeps what grows with the image when the pooled maps are not resident: the maps, the masks' cells,
+   * the control grid and the optimizer's state, in files mapped to memory that the system pages in and out, removed
+   * when the run ends. Empty (the default): the system's temporary directory. A directory held in memory (a tmpfs)
+   * keeps them there: give one on a disk for an image larger than the memory. On Linux a file's blocks are reserved
+   * when it is mapped, so a directory too small raises an exception then; elsewhere the run checks the space free
+   * when it starts, and a disk that fills up afterwards kills the process at a write. */
+  itkSetStringMacro(ScratchDirectory);
+  itkGetStringMacro(ScratchDirectory);
+  /** Bytes requested from the images and masks over the run. */
+  itkGetConstMacro(BytesRead, SizeValueType);
+  /** Whether the fixed (moving) image served its regions without buffering it whole. */
+  itkGetConstMacro(FixedImageStreamed, bool);
+  itkGetConstMacro(MovingImageStreamed, bool);
+  /** @} */
+
   /** \name Outputs. */
   /** @{ */
   /** The output displacement field (== GetOutput()), on the fixed grid, in millimetres. */
@@ -262,6 +334,13 @@ public:
   /** The moving image warped onto the fixed grid by the final field (for inspection). */
   WarpedImageType *
   GetWarpedMovingImage();
+
+  /** The (smoothed) control grid as a displacement field on its own grid, wrapped in a transform: one sample per
+   * cell at the cell's centre, padded by two cells of replicated border, so that its linear interpolation is the map
+   * the dense output holds at every voxel. Solves the registration if it has not run yet, without allocating the
+   * dense field. */
+  DisplacementFieldTransformType *
+  GetControlGridTransform();
 
   /** The total (similarity + regularization) loss recorded at each Adam iteration. */
   const std::vector<double> &
@@ -286,6 +365,14 @@ protected:
   void
   GenerateData() override;
 
+  /** With RegionSize > 0: the requested region of the dense field, interpolated from the control grid. */
+  void
+  DynamicThreadedGenerateData(const typename Superclass::OutputImageRegionType & region) override;
+
+  /** The region-sampled run (RegionSize > 0): solves the control grid without reading an image whole. */
+  void
+  SolveByRegions();
+
 private:
   typename FixedImageType::ConstPointer   m_FixedImage{ nullptr };
   typename MovingImageType::ConstPointer  m_MovingImage{ nullptr };
@@ -303,26 +390,40 @@ private:
   std::string  m_Device{ "cpu" };
   unsigned int m_Seed{ 0 };
 
-  unsigned int m_NumberOfIterations{ 80 };
-  double       m_LearningRate{ 1.0 };
-  double       m_Beta1{ 0.9 };
-  double       m_Beta2{ 0.999 };
-  double       m_Epsilon{ 1e-8 };
-  double       m_RegularizationWeight{ 1.25 };
-  unsigned int m_GridShrinkFactor{ 1 };
-  unsigned int m_ControlGridSmoothingIterations{ 0 };
-  int          m_FeatureMapUpdateInterval{ -1 };
-  bool         m_NormalizeLosses{ true };
-  unsigned int m_LNCCKernel{ 5 };
-  double       m_SamplingPercentage{ 1.0 };
-  unsigned int m_BatchSize{ 0 };
-  std::string  m_Mode{ "Static" };
-  unsigned int m_FeatureChunkSize{ 32 };
+  unsigned int  m_NumberOfIterations{ 80 };
+  double        m_LearningRate{ 1.0 };
+  double        m_Beta1{ 0.9 };
+  double        m_Beta2{ 0.999 };
+  double        m_Epsilon{ 1e-8 };
+  double        m_RegularizationWeight{ 1.25 };
+  unsigned int  m_GridShrinkFactor{ 1 };
+  unsigned int  m_ControlGridSmoothingIterations{ 0 };
+  int           m_FeatureMapUpdateInterval{ -1 };
+  bool          m_NormalizeLosses{ true };
+  unsigned int  m_LNCCKernel{ 5 };
+  double        m_SamplingPercentage{ 1.0 };
+  unsigned int  m_BatchSize{ 0 };
+  std::string   m_Mode{ "Static" };
+  unsigned int  m_FeatureChunkSize{ 32 };
+  unsigned int  m_RegionSize{ 0 };
+  SizeValueType m_BrickBytes{ 0 };
+  unsigned int  m_RegionHalo{ 0 };
+  SizeValueType m_ResidentFeatureBudget{ 0 };
+  bool          m_ResidentFeatures{ false };
+  std::string   m_ScratchDirectory;
+
+  typename TransformType::ConstPointer m_MovingTransform{ nullptr };
+  SizeValueType                        m_BytesRead{ 0 };
+  bool                                 m_FixedImageStreamed{ false };
+  bool                                 m_MovingImageStreamed{ false };
+  ModifiedTimeType                     m_SolvedTime{ 0 };
 
   // Auxiliary outputs (the primary displacement field is the ImageSource output 0).
   typename DisplacementFieldTransformType::Pointer m_DisplacementFieldTransform{ nullptr };
   typename WarpedImageType::Pointer                m_WarpedMovingImage{ nullptr };
   std::vector<double>                              m_MetricValuesPerIteration;
+  typename DisplacementFieldType::Pointer          m_ControlGrid{ nullptr };
+  typename DisplacementFieldTransformType::Pointer m_ControlGridTransform{ nullptr };
 };
 
 } // end namespace itk
