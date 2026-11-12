@@ -167,7 +167,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     return EXIT_FAILURE;
   }
   const FieldType * regionField = regions->GetOutput();
-  auto              bricks = FineType::New();
+  FineType::Pointer bricks = FineType::New();
   bricks->SetFixedImage(fixed);
   bricks->SetMovingImage(moving);
   bricks->SetInitialDisplacementField(start);
@@ -187,11 +187,6 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "A budget of one byte should leave nothing resident." << std::endl;
     return EXIT_FAILURE;
   }
-  if (!std::filesystem::is_empty(scratch))
-  {
-    std::cerr << "The run left files in its scratch directory." << std::endl;
-    return EXIT_FAILURE;
-  }
   if (bricks->GetBytesRead() != regions->GetBytesRead())
   {
     std::cerr << "By bricks, the images should be read once, as with the maps resident: " << bricks->GetBytesRead()
@@ -204,6 +199,27 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   {
     std::cerr << "The field of every cell by bricks differs from the dense one by " << brickDifference << " mm."
               << std::endl;
+    return EXIT_FAILURE;
+  }
+  // The control grid of the run by bricks is a file mapped to memory, which the grid keeps: it outlives the filter,
+  // and the file goes with it.
+  {
+    FineType::DisplacementFieldTransformType::Pointer mapped = bricks->GetControlGridTransform();
+    bricks = nullptr;
+    const FieldType * residentGrid = regions->GetControlGridTransform()->GetDisplacementField();
+    const double      gridDifference =
+      MaxDifference(mapped->GetDisplacementField(), residentGrid, residentGrid->GetLargestPossibleRegion());
+    std::cout << "control grid by bricks, past its filter, vs resident: max |difference| = " << gridDifference << " mm"
+              << std::endl;
+    if (gridDifference > 1e-5)
+    {
+      std::cerr << "The control grid of the run by bricks is not the resident run's." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+  if (!std::filesystem::is_empty(scratch))
+  {
+    std::cerr << "The run left files in its scratch directory." << std::endl;
     return EXIT_FAILURE;
   }
   const double difference = MaxDifference(denseField, regionField, fixed->GetLargestPossibleRegion());
