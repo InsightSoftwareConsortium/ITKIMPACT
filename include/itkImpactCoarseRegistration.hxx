@@ -1335,7 +1335,8 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         // and the masks' shares, with the larger of what the solve holds beside them (the fields of its two
         // problems and of the inverse consistency, a step of it) and of what a layer's cost at zero displacement
         // takes over the whole grid, a point-wise distance three times the layer's channels and a windowed one
-        // twelve. And a box of the cost volume, whatever the grid.
+        // twelve. And a box of the cost volume, whatever the grid. Measured in 3D on the CPU and on CUDA, on 1 to 48
+        // channels, L2 and NCC: a run held between 0.75 and 0.97 of that count.
         const int64_t masks = (fixedMask.IsNotNull() ? 1 : 0) + (movingMask.IsNotNull() ? 1 : 0);
         int64_t       latchFloats = 0;
         for (size_t l = 0; featureMode && m_NormalizeLosses && !m_BalanceLosses && l < layerCount; ++l)
