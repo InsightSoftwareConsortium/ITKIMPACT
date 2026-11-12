@@ -182,6 +182,7 @@ Run(unsigned int        side,
     int64_t                heldOnDevice = 0;
     if (torchDevice.is_cuda())
     {
+      torch::zeros({ 1 }, torchDevice); // the allocator counts a device once CUDA holds something on it
       c10::cuda::CUDACachingAllocator::resetPeakStats(index);
       heldOnDevice = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
     }
