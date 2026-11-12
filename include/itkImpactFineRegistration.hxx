@@ -2554,23 +2554,28 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       perUnit[d] = boxesASide * perBox[d];
     }
     const std::vector<Impact::CellBox> units = Impact::TileCells(cells, perUnit);
-    // The loss of the cells of `box` for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when
-    // given, takes each layer's unweighted value times the box's share.
-    auto partLoss = [&](const Impact::CellBox &      box,
-                        const torch::Tensor &        smoothed,
-                        const std::vector<int64_t> & origin,
-                        std::vector<double> *        raw) -> torch::Tensor {
-      torch::Tensor counted; // the cells of the box the fixed mask counts; undefined without one
-      int64_t       count = cellCountOf(box);
+    // How the cells of `box` read the moving map for the smoothed field `smoothed` of the cells from `origin` on:
+    // the grid that samples it over its cells [m0, m1), and the cells that count, by both masks at that field
+    // (`counted`, undefined when all do; `count` of them). A box the fixed mask leaves out reads nothing.
+    struct Reading
+    {
+      torch::Tensor        grid;
+      torch::Tensor        counted;
+      std::vector<int64_t> m0;
+      std::vector<int64_t> m1;
+      int64_t              count;
+    };
+    auto readingOf =
+      [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) -> Reading {
+      Reading reading{ {}, {}, std::vector<int64_t>(Dim), std::vector<int64_t>(Dim), cellCountOf(box) };
       if (fixedOn.defined())
       {
-        counted = Impact::NarrowTo(fixedOn, box.cell0, box.cell1).to(device);
-        count = counted.sum().template item<int64_t>();
+        reading.counted = Impact::NarrowTo(fixedOn, box.cell0, box.cell1).to(device);
+        reading.count = reading.counted.sum().template item<int64_t>();
       }
-      if (count == 0)
+      if (reading.count == 0)
       {
-        // Nothing of it counts: its edges alone, no map read.
-        return regularizer(smoothed, box.cell0, box.cell1, origin);
+        return reading;
       }
       // Where each cell reads the moving map, in cells: q = c + u (voxels -> cells), and the cells of
       // the moving map the box reads: what q reaches, one around for the interpolation and one spare, within the
@@ -2580,8 +2585,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         own = own.narrow(2 + static_cast<int64_t>(d), box.cell0[d] - origin[d], box.cell1[d] - box.cell0[d]);
       }
-      const torch::Tensor  q = cellPositions(box.cell0, box.cell1) + own * voxelsToCells;
-      std::vector<int64_t> m0(Dim), m1(Dim);
+      const torch::Tensor q = cellPositions(box.cell0, box.cell1) + own * voxelsToCells;
       {
         torch::NoGradGuard  noGrad;
         const torch::Tensor reached = q.detach().flatten(2);
@@ -2591,40 +2595,56 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         {
           const auto low = static_cast<int64_t>(std::floor(bounds[0][0][d].template item<double>())) - 1;
           const auto high = static_cast<int64_t>(std::ceil(bounds[1][0][d].template item<double>())) + 2;
-          m0[d] = std::clamp<int64_t>(low, 0, cells[d] - 1);
-          m1[d] = std::clamp<int64_t>(high, 1, cells[d]);
-          if (m1[d] - m0[d] < 2)
+          reading.m0[d] = std::clamp<int64_t>(low, 0, cells[d] - 1);
+          reading.m1[d] = std::clamp<int64_t>(high, 1, cells[d]);
+          if (reading.m1[d] - reading.m0[d] < 2)
           {
-            if (m1[d] < cells[d])
-              ++m1[d];
-            else if (m0[d] > 0)
-              --m0[d];
+            if (reading.m1[d] < cells[d])
+              ++reading.m1[d];
+            else if (reading.m0[d] > 0)
+              --reading.m0[d];
           }
         }
       }
-      std::vector<torch::Tensor> fixedLayers(losses.size()), movingLayers(losses.size());
-      for (size_t l = 0; l < losses.size(); ++l)
-      {
-        fixedLayers[l] = Impact::NarrowTo(fixedMaps[l], box.cell0, box.cell1).to(device);
-        movingLayers[l] = Impact::NarrowTo(movingMaps[l], m0, m1).to(device);
-      }
-      const torch::Tensor grid = gridIn(q, m0, m1);
+      reading.grid = gridIn(q, reading.m0, reading.m1);
       if (movingShare.defined())
       {
         torch::NoGradGuard  noGrad;
-        const torch::Tensor holds =
-          F::grid_sample(Impact::NarrowTo(movingShare, m0, m1).to(device), grid.detach(), sampleOpts) >= 0.5;
-        counted = counted.defined() ? counted.logical_and(holds) : holds;
+        const torch::Tensor holds = F::grid_sample(Impact::NarrowTo(movingShare, reading.m0, reading.m1).to(device),
+                                                   reading.grid.detach(),
+                                                   sampleOpts) >= 0.5;
+        reading.counted = reading.counted.defined() ? reading.counted.logical_and(holds) : holds;
+        reading.count = reading.counted.sum().template item<int64_t>();
       }
-      const torch::Tensor rows = drawRows(counted, cellCountOf(box));
-      const double        share = static_cast<double>(count) / totalCount;
+      return reading;
+    };
+    // The cells that count over the grid, the dense mean's divisor. A moving mask makes them follow the field:
+    // `survivors` then holds each unit's, as of the field it was last counted at.
+    double               countedCells = movingShare.defined() ? 0.0 : totalCount;
+    std::vector<int64_t> survivors(movingShare.defined() ? units.size() : 0, 0);
+    // The loss of the cells of `box` for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when
+    // given, takes each layer's unweighted value times the box's share.
+    auto partLoss = [&](const Impact::CellBox &      box,
+                        const torch::Tensor &        smoothed,
+                        const std::vector<int64_t> & origin,
+                        std::vector<double> *        raw) -> torch::Tensor {
+      const Reading reading = readingOf(box, smoothed, origin);
+      if (reading.count == 0)
+      {
+        // Nothing of it counts: its edges alone, no map read.
+        return regularizer(smoothed, box.cell0, box.cell1, origin);
+      }
+      const torch::Tensor rows = drawRows(reading.counted, cellCountOf(box));
+      const double        share = static_cast<double>(reading.count) / countedCells;
       torch::Tensor       total = torch::zeros({}, onDevice);
       if (!rows.defined() || rows.numel() > 0)
       {
         for (size_t l = 0; l < losses.size(); ++l)
         {
-          const torch::Tensor sampled = F::grid_sample(pick(l, movingLayers[l]), grid, sampleOpts);
-          const torch::Tensor value = rowsLoss(l, pick(l, fixedLayers[l]), sampled, rows);
+          const torch::Tensor fixedLayer = Impact::NarrowTo(fixedMaps[l], box.cell0, box.cell1).to(device);
+          const torch::Tensor movingLayer = Impact::NarrowTo(movingMaps[l], reading.m0, reading.m1).to(device);
+          const torch::Tensor sampled = F::grid_sample(pick(l, movingLayer), reading.grid, sampleOpts);
+          const torch::Tensor value = rowsLoss(l, pick(l, fixedLayer), sampled, rows);
           if (raw != nullptr)
           {
             (*raw)[l] += value.template item<double>() * share;
@@ -2650,6 +2670,28 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
       drawSubsets(channels);
+      for (size_t i = 0; drawsBoxes && i < perIteration; ++i)
+      {
+        std::swap(order[i], order[i + schedule() % (order.size() - i)]);
+      }
+      if (movingShare.defined())
+      {
+        // The units of this iteration are counted again at the field they are about to be stepped from; the
+        // others keep the count of their last step, the first iteration counting every unit. With every unit at
+        // every iteration the divisor is the dense run's.
+        torch::NoGradGuard noGrad;
+        for (size_t i = 0; i < (iteration == 0 ? units.size() : perIteration); ++i)
+        {
+          const size_t          u = iteration == 0 ? i : order[i];
+          const Impact::CellBox window = around(units[u]);
+          const int64_t         count = readingOf(units[u],
+                                          smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)),
+                                          window.cell0)
+                                  .count;
+          countedCells += static_cast<double>(count - survivors[u]);
+          survivors[u] = count;
+        }
+      }
       if (normalizes && !normalization.IsLatched(0))
       {
         // Each layer's value at the starting field, without the graph, summed over every unit: the dense run's
@@ -2666,10 +2708,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         {
           normalization.Latch(l, raw[l]);
         }
-      }
-      for (size_t i = 0; drawsBoxes && i < perIteration; ++i)
-      {
-        std::swap(order[i], order[i + schedule() % (order.size() - i)]);
       }
       // The gradient of the units' cells. The bricks, which cover the grid, each back-propagate their own loss
       // through the smoothing passes to the cells it reads, and those gradients add up on the cells bricks share. A

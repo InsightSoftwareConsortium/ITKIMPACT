@@ -263,8 +263,8 @@ public:
    * optimizer's state, and an iteration steps every cell, as the whole-image run does, by bricks of boxes brought to
    * the device one at a time; one the fixed mask does not reach costs its share of the regularizer alone.
    * A brick's loss is the dense loss restricted to its cells,
-   * weighed by its share of the counted cells (the fixed mask's: with a moving mask, an approximation of the dense
-   * mean, which the resident route keeps exact), with
+   * weighed by its share of the cells that count (those the masks keep, the moving one where the field reads it:
+   * they are counted over the grid before the bricks are stepped), with
    * the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
    * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
    * iteration costs and holds then follows those boxes, not the image.
