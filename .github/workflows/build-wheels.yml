@@ -26,8 +26,8 @@ env:
   EXCLUDE_LINUX: "libtorch.so;libtorch_cpu.so;libtorch_cuda.so;libtorch_global_deps.so;libtorch_python.so;libc10.so;libc10_cuda.so;libgomp.so.1"
   EXCLUDE_WINDOWS: "torch.dll;torch_cpu.dll;torch_cuda.dll;torch_python.dll;c10.dll;c10_cuda.dll"
   # ITKPythonBuilds release (prebuilt wrapping-enabled ITK) and ITKPythonPackage build scripts.
-  ITK_PACKAGE_VERSION: "v5.4.6"
-  ITKPYTHONPACKAGE_TAG: "v5.4.6"
+  ITK_PACKAGE_VERSION: "v5.4.8"
+  ITKPYTHONPACKAGE_TAG: "v5.4.8"
   ITKPYTHONPACKAGE_ORG: "InsightSoftwareConsortium"
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        python3-minor-version: ["10", "11"]  # cp versions shipped in ITKPythonBuilds v5.4.6
+        python3-minor-version: ["10", "11"]  # cp versions shipped in ITKPythonBuilds v5.4.8
     steps:
       - uses: actions/checkout@v4
 
@@ -87,7 +87,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        python3-minor-version: ["10", "11"]  # cp versions shipped in ITKPythonBuilds v5.4.6
+        python3-minor-version: ["10", "11"]  # cp versions shipped in ITKPythonBuilds v5.4.8
     steps:
       - uses: lukka/get-cmake@v4.2.3
 
