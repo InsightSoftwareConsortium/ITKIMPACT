@@ -1,5 +1,5 @@
 # Local copy of InsightSoftwareConsortium/ITKRemoteModuleBuildTestPackageAction
-# .github/workflows/build-test-cxx.yml @ v5.4.6, with the `macos-15-intel` matrix
+# .github/workflows/build-test-cxx.yml @ v5.4.8, with the `macos-26-intel` matrix
 # entry removed: torch ships no x86-macOS wheel past 2.2, so this torch-linking
 # module cannot be built there, and the upstream matrix force-includes it regardless
 # of os-list. Keep in sync with upstream when bumping the ITK version.
@@ -29,7 +29,7 @@ on:
         required: false
         type: string
         # release-5.4 branch 2026-04-20
-        default: 'v5.4.6'
+        default: 'v5.4.8'
       itk-module-deps:
         description: 'Colon-delimited list of ITK remote module dependencies to build. Format as module_name@tag:...'
         # example: MeshToPolyData@3ad8f08:BSplineGradient@0.3.0
@@ -51,7 +51,7 @@ on:
         description: 'JSON-formatted array of runner OS labels to build on (default: all platforms)'
         required: false
         type: string
-        default: '["ubuntu-22.04", "windows-2022", "macos-15"]'
+        default: '["ubuntu-22.04", "windows-2022", "macos-26"]'
 
 jobs:
   build-test-cxx:
@@ -69,13 +69,13 @@ jobs:
             c-compiler: "cl.exe"
             cxx-compiler: "cl.exe"
             cmake-build-type: "Release"
-          - os: macos-15
+          - os: macos-26
             c-compiler: "clang"
             cxx-compiler: "clang++"
             cmake-build-type: "MinSizeRel"
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Shorten build root
       shell: bash
@@ -124,7 +124,7 @@ jobs:
         choco install -y ${{ inputs.choco-packages }}
 
     - name: Set up Python 3.11
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: "3.11"
 
@@ -134,12 +134,12 @@ jobs:
         python -m pip install ninja
 
     - name: Get specific version of CMake, Ninja
-      uses: lukka/get-cmake@v4.2.3
+      uses: lukka/get-cmake@v4.4.2
 
-    - name: 'Specific XCode version = 16.2'
-      if: matrix.os == 'macos-15-intel' || matrix.os == 'macos-15'
+    - name: 'Specific XCode version = 26.6'
+      if: matrix.os == 'macos-26-intel' || matrix.os == 'macos-26'
       run: |
-        sudo xcode-select -s "/Applications/Xcode_16.2.0.app"
+        sudo xcode-select -s "/Applications/Xcode_26.6.0.app"
 
     - name: Download ITK
       shell: bash
