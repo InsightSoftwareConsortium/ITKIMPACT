@@ -28,6 +28,7 @@
 // reversed, shared with the elastix metric so both cut the same patch.
 #include "itkImpactOnlineInference.h"
 #include "itkImpactBatchBudget.h"
+#include "itkImageRegionConstIteratorWithIndex.h"
 
 #include <mutex>
 
