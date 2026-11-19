@@ -1861,8 +1861,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         point = m_MovingTransform->TransformPoint(point);
       }
-      ContinuousIndex<double, Dim> movingIndex;
-      m_MovingImage->TransformPhysicalPointToContinuousIndex(point, movingIndex);
+      const auto movingIndex = m_MovingImage->template TransformPhysicalPointToContinuousIndex<double>(point);
       for (unsigned int d = 0; d < Dim; ++d)
       {
         buffer[static_cast<size_t>(d) * total + flat] = static_cast<float>(movingIndex[Dim - 1 - d]);

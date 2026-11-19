@@ -673,7 +673,7 @@ InterpolateCellGrid(const Image<Vector<float, Dim>, Dim> *                      
   for (it.GoToBegin(); !it.IsAtEnd(); ++it)
   {
     fixed->TransformIndexToPhysicalPoint(it.GetIndex(), point);
-    grid->TransformPhysicalPointToContinuousIndex(point, index);
+    index = grid->template TransformPhysicalPointToContinuousIndex<double>(point);
     for (unsigned int a = 0; a < Dim; ++a)
     {
       // Round-off can put a voxel a hair past the padded grid.
