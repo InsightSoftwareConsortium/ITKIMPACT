@@ -27,6 +27,7 @@
 #include "ImpactLoss.h"
 #include "itkImpactRegionSampling.h"
 
+#include <itkImageAlgorithm.h>
 #include <itkResampleImageFilter.h>
 #include <itkLinearInterpolateImageFunction.h>
 #include <itkIdentityTransform.h>
@@ -2156,16 +2157,22 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     channelCount += c;
   }
-  const double residentBytes = static_cast<double>(cellCountTotal) * static_cast<double>(channelCount) * 4.0 * 2.0 +
-                               (m_MovingMask.IsNotNull() ? static_cast<double>(cellCountTotal) * 4.0 : 0.0);
-  double budget = static_cast<double>(m_ResidentFeatureBudget);
-  if (m_ResidentFeatureBudget == 0)
-  {
-    // Of the memory left once the control grid and Adam's state, resident with the maps, are on the device.
-    budget = Impact::ResidentBudget(device) -
-             0.5 * static_cast<double>(cellCountTotal) * static_cast<double>(3 * Dim + 1) * 4.0;
-  }
-  m_ResidentFeatures = residentBytes <= budget;
+  const bool drawsBoxes = m_RegionsPerIteration > 0; // an iteration steps those boxes alone
+  // What the run holds on the device at its peak with everything resident, in floats a cell. With the boxes drawn:
+  // the two maps, the control grid, its gradient, Adam's two moments and the masks' cells. Stepping every cell,
+  // an iteration's graph over the whole grid besides: Dim * (13 + the smoothing passes) for the field and its
+  // state, six a channel (the two maps, the features sampled, their difference and the gradients back), and a
+  // channel and four more when the cells that count are drawn (a mask, SamplingPercentage). Measured in 3D on the
+  // CPU and on CUDA, on 1 to 48 channels and 0 to 3 passes: a run held between 0.77 and 0.96 of that count.
+  const auto    smoothingPasses = static_cast<int64_t>(m_ControlGridSmoothingIterations);
+  const bool    drawsCells = m_FixedMask.IsNotNull() || m_MovingMask.IsNotNull() || m_SamplingPercentage < 1.0;
+  const int64_t residentFloats = drawsBoxes ? 2 * channelCount + 4 * static_cast<int64_t>(Dim) + 2
+                                            : static_cast<int64_t>(Dim) * (13 + smoothingPasses) + 6 * channelCount +
+                                                (drawsCells ? channelCount + 4 : 0);
+  m_ResidentBytes = static_cast<SizeValueType>(cellCountTotal * residentFloats * 4);
+  m_ResidentFeatures =
+    static_cast<double>(m_ResidentBytes) <=
+    (m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device));
   auto atHome = [&](const std::vector<int64_t> & shape) {
     return m_ResidentFeatures ? torch::zeros(shape, onDevice) : scratch.Zeros(shape);
   };
@@ -2187,11 +2194,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   for (size_t b = 0; b < boxes.size(); ++b)
   {
     const Impact::CellBox & box = boxes[b];
-    int64_t                 count = 1;
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      count *= box.cell1[d] - box.cell0[d];
-    }
+    int64_t                 count = box.Count();
     if (fixedOn.defined())
     {
       std::vector<int64_t> lowPad(Dim);
@@ -2226,74 +2229,111 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   }
   if (m_InitialDisplacementField.IsNotNull())
   {
-    m_InitialDisplacementField->Update();
+    // Read by regions through the field's own pipeline, as the images are: for the cells of a box, the region of
+    // the field around the fixed voxels they blend.
+    DisplacementFieldType * const initial = m_InitialDisplacementField;
+    initial->UpdateOutputInformation();
     using FieldInterpolatorType = VectorLinearInterpolateImageFunction<DisplacementFieldType, double>;
     auto interpolator = FieldInterpolatorType::New();
-    interpolator->SetInputImage(m_InitialDisplacementField);
     // Filled in host memory: the mapped grid itself, or a grid the device then takes.
     torch::Tensor start = m_ResidentFeatures ? torch::zeros(thetaShape, torch::kFloat32) : theta;
     float * const buffer = start.data_ptr<float>();
     const auto &  direction = m_FixedImage->GetDirection();
-    for (int64_t flat = 0; flat < cellCountTotal; ++flat)
+    // Resizing the dense field to the control grid blends, along each axis, the two voxels around the cell's
+    // centre. The field is read at those voxels: one given on a coarser grid is then its dense field, resized.
+    // The lower of the two along tensor axis d for cell c, and the upper one's share.
+    auto voxelBelow = [&](unsigned int d, int64_t c, double & share) {
+      const double centre = std::max(
+        (static_cast<double>(c) + 0.5) * static_cast<double>(spatial[d]) / static_cast<double>(cells[d]) - 0.5, 0.0);
+      const int64_t below = std::min(static_cast<int64_t>(centre), spatial[d] - 1);
+      share = centre - static_cast<double>(below);
+      return below;
+    };
+    auto voxelAt = [&](unsigned int a, int64_t offset) {
+      return fixedRegion.GetIndex()[a] + std::min(offset, static_cast<int64_t>(fixedRegion.GetSize()[a]) - 1);
+    };
+    for (const Impact::CellBox & box : boxes)
     {
-      // Resizing the dense field to the control grid blends, along each axis, the two voxels around the cell's
-      // centre. The field is read at those voxels: one given on a coarser grid is then its dense field, resized.
-      int64_t                  rest = flat;
-      std::array<int64_t, Dim> below{};
-      std::array<double, Dim>  share{};
-      for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
+      // The field's region that holds the fixed voxels the box's cells blend, and a sample around for round-off.
+      RegionType voxels;
+      for (unsigned int a = 0; a < Dim; ++a)
       {
-        const int64_t c = rest % cells[d];
-        rest /= cells[d];
-        const double centre = std::max(
-          (static_cast<double>(c) + 0.5) * static_cast<double>(spatial[d]) / static_cast<double>(cells[d]) - 0.5, 0.0);
-        below[Dim - 1 - d] = std::min(static_cast<int64_t>(centre), spatial[d] - 1);
-        share[Dim - 1 - d] = centre - static_cast<double>(below[Dim - 1 - d]);
+        double             unused;
+        const unsigned int d = Dim - 1 - a;
+        const auto         first = voxelAt(a, voxelBelow(d, box.cell0[d], unused));
+        voxels.SetIndex(a, first);
+        voxels.SetSize(a,
+                       static_cast<SizeValueType>(voxelAt(a, voxelBelow(d, box.cell1[d] - 1, unused) + 1) - first + 1));
       }
-      Vector<double, Dim> u; // millimetres, ITK order
-      u.Fill(0.0);
-      bool inside = true;
-      for (unsigned int corner = 0; inside && corner < (1u << Dim); ++corner)
+      auto read = ImageAlgorithm::EnlargeRegionOverBox(voxels, m_FixedImage.GetPointer(), initial);
+      read.PadByRadius(1);
+      if (!read.Crop(initial->GetLargestPossibleRegion()))
       {
-        double                             weight = 1.0;
-        typename FixedImageType::IndexType voxel;
-        for (unsigned int a = 0; a < Dim; ++a)
+        continue; // the field does not reach the box: its cells start at zero
+      }
+      initial->SetRequestedRegion(read);
+      initial->Update();
+      interpolator->SetInputImage(initial); // which takes the bounds of what is buffered
+      std::vector<int64_t> cell = box.cell0;
+      for (bool more = true; more;)
+      {
+        int64_t                  flat = 0;
+        std::array<int64_t, Dim> below{};
+        std::array<double, Dim>  share{};
+        for (unsigned int d = 0; d < Dim; ++d)
         {
-          const bool above = (corner >> a) & 1u;
-          weight *= above ? share[a] : 1.0 - share[a];
-          voxel[a] = fixedRegion.GetIndex()[a] +
-                     std::min(below[a] + (above ? 1 : 0), static_cast<int64_t>(fixedRegion.GetSize()[a]) - 1);
+          flat = flat * cells[d] + cell[d];
+          below[Dim - 1 - d] = voxelBelow(d, cell[d], share[Dim - 1 - d]);
         }
-        if (weight == 0.0)
+        Vector<double, Dim> u; // millimetres, ITK order
+        u.Fill(0.0);
+        bool inside = true;
+        for (unsigned int corner = 0; inside && corner < (1u << Dim); ++corner)
         {
-          continue;
-        }
-        typename FixedImageType::PointType point;
-        m_FixedImage->TransformIndexToPhysicalPoint(voxel, point);
-        inside = interpolator->IsInsideBuffer(point);
-        if (inside)
-        {
-          const auto value = interpolator->Evaluate(point);
-          for (unsigned int r = 0; r < Dim; ++r)
+          double                             weight = 1.0;
+          typename FixedImageType::IndexType voxel;
+          for (unsigned int a = 0; a < Dim; ++a)
           {
-            u[r] += weight * static_cast<double>(value[r]);
+            const bool above = (corner >> a) & 1u;
+            weight *= above ? share[a] : 1.0 - share[a];
+            voxel[a] = voxelAt(a, below[a] + (above ? 1 : 0));
+          }
+          if (weight == 0.0)
+          {
+            continue;
+          }
+          typename FixedImageType::PointType point;
+          m_FixedImage->TransformIndexToPhysicalPoint(voxel, point);
+          inside = interpolator->IsInsideBuffer(point);
+          if (inside)
+          {
+            const auto value = interpolator->Evaluate(point);
+            for (unsigned int r = 0; r < Dim; ++r)
+            {
+              u[r] += weight * static_cast<double>(value[r]);
+            }
           }
         }
-      }
-      if (!inside)
-      {
-        continue;
-      }
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        const unsigned int a = Dim - 1 - d;
-        double             voxels = 0.0;
-        for (unsigned int r = 0; r < Dim; ++r)
+        for (unsigned int d = 0; inside && d < Dim; ++d)
         {
-          voxels += direction[r][a] * static_cast<double>(u[r]);
+          const unsigned int a = Dim - 1 - d;
+          double             voxels = 0.0;
+          for (unsigned int r = 0; r < Dim; ++r)
+          {
+            voxels += direction[r][a] * static_cast<double>(u[r]);
+          }
+          voxels /= fixedSpacing[a];
+          buffer[static_cast<size_t>(d) * cellCountTotal + flat] = static_cast<float>(voxels);
         }
-        voxels /= fixedSpacing[a];
-        buffer[static_cast<size_t>(d) * cellCountTotal + flat] = static_cast<float>(voxels);
+        more = false; // the next cell of the box, the last axis fastest
+        for (int d = static_cast<int>(Dim) - 1; !more && d >= 0; --d)
+        {
+          more = ++cell[d] < box.cell1[d];
+          if (!more)
+          {
+            cell[d] = box.cell0[d];
+          }
+        }
       }
     }
     theta = m_ResidentFeatures ? start.to(device) : start;
@@ -2388,7 +2428,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       Impact::WriteCells(movingShare, box.cell0, pooled.share);
     }
   }
-  if (m_ResidentFeatures)
+  if (m_ResidentFeatures && !drawsBoxes)
   {
     // ---- The dense iterations on the pooled maps. ----
     theta.set_requires_grad(true);
@@ -2433,7 +2473,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       if (theta.grad().defined())
       {
-        adam.Advance();
+        ++adam.steps;
         adam.StepCells(theta, theta.grad(), wholeStart, cells, device);
         theta.grad().zero_();
       }
@@ -2442,76 +2482,73 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   }
   else
   {
-    // ---- By bricks: an iteration steps every cell, the whole-image run's schedule, a brick of boxes at a time. A
-    // brick's loss is the dense loss restricted to its cells, weighed by its share of the counted cells, plus the
-    // regularizer's differences whose first cell lies in it. An iteration brings to the device the cells its bricks
-    // touch, one brick at a time: the control grid, its gradient and Adam's moments are mapped like the maps. ----
-    torch::Tensor    gradient = scratch.Zeros(thetaShape);
-    Impact::CellAdam adam{
-      scratch.Zeros(thetaShape), scratch.Zeros(thetaShape), m_LearningRate, m_Beta1, m_Beta2, adamEpsilon
+    // ---- By units of the grid, brought to the device one at a time: the control grid, its gradient and Adam's
+    // moments are at home like the maps. RegionsPerIteration 0 steps every cell at every iteration, the whole-image
+    // run's schedule, by bricks of boxes; otherwise an iteration steps the cells of the boxes it draws. The loss of
+    // a set of cells is the dense loss restricted to them, weighed by their share of the counted cells, plus the
+    // regularizer's differences whose first cell lies among them. ----
+    torch::Tensor    gradient = atHome(thetaShape);
+    Impact::CellAdam adam{ atHome(thetaShape), atHome(thetaShape), m_LearningRate, m_Beta1, m_Beta2, adamEpsilon };
+    // The cells within `reach` of a box: the regularizer's next cell and the smoothing's reach. They are the cells
+    // the box's loss reads (smoothed alone, they give the smoothed field of the whole grid on the box's cells and
+    // the regularizer's next one), and the cells whose loss reads the box's.
+    const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
+    auto          around = [&](const Impact::CellBox & box) {
+      return Impact::CellsAround(box, std::vector<int64_t>(Dim, reach), cells);
     };
-    auto cellCountOf = [&](const Impact::CellBox & box) {
-      int64_t count = 1;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        count *= box.cell1[d] - box.cell0[d];
-      }
-      return count;
-    };
-    // As many boxes a side as BrickBytes holds: a cell brings its share of the mapped files, the graph on a brick's
-    // cells taking a few times that.
+    // A brick: as many boxes a side as BrickBytes holds on the device. At its peak a step holds there, in floats,
+    // Dim * (6 + the smoothing passes) for each cell the brick reads (the field along the graph) and four for each
+    // channel of each of its own cells (the two maps, the features sampled and their gradient): measured in 3D on
+    // 1 to 48 channels and 1 and 3 passes, a step held between 0.66 and 1.0 of that count. A drawn box is a unit
+    // by itself.
     const double brickBytes =
       m_BrickBytes > 0 ? static_cast<double>(m_BrickBytes) : Impact::ResidentBudget(device) / 8.0;
-    const double held = brickBytes * static_cast<double>(cellCountTotal) / static_cast<double>(scratch.GetBytes());
-    auto         brickCells = [&](int64_t boxesASide) {
+    auto brickCells = [&](int64_t boxesASide, int64_t around) {
       double count = 1.0;
       for (unsigned int d = 0; d < Dim; ++d)
       {
-        count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d]));
+        count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d] + 2 * around));
       }
       return count;
     };
+    auto stepBytes = [&](int64_t boxesASide) {
+      return 4.0 * (static_cast<double>(Dim * (6 + m_ControlGridSmoothingIterations)) * brickCells(boxesASide, reach) +
+                    4.0 * static_cast<double>(channelCount) * brickCells(boxesASide, 0));
+    };
     int64_t boxesASide = 1;
-    while (brickCells(boxesASide) < static_cast<double>(cellCountTotal) && brickCells(boxesASide + 1) <= held)
+    while (!drawsBoxes && brickCells(boxesASide, 0) < static_cast<double>(cellCountTotal) &&
+           stepBytes(boxesASide + 1) <= brickBytes)
     {
       ++boxesASide;
     }
-    std::vector<int64_t> perBrick(Dim);
+    std::vector<int64_t> perUnit(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
-      perBrick[d] = boxesASide * perBox[d];
+      perUnit[d] = boxesASide * perBox[d];
     }
-    const std::vector<Impact::CellBox> bricks = Impact::TileCells(cells, perBrick);
-    std::vector<int64_t>               countByBrick; // the cells of each the fixed mask counts
-    for (const Impact::CellBox & brick : bricks)
+    const std::vector<Impact::CellBox> units = Impact::TileCells(cells, perUnit);
+    // How the cells of `box` read the moving map for the smoothed field `smoothed` of the cells from `origin` on:
+    // the grid that samples it over its cells [m0, m1), and the cells that count, by both masks at that field
+    // (`counted`, undefined when all do; `count` of them). A box the fixed mask leaves out reads nothing.
+    struct Reading
     {
-      countByBrick.push_back(fixedOn.defined()
-                               ? Impact::NarrowTo(fixedOn, brick.cell0, brick.cell1).sum().template item<int64_t>()
-                               : cellCountOf(brick));
-    }
-    // The cells a brick touches: its own, the regularizer's next one, and the smoothing's reach. Smoothed alone,
-    // they give the smoothed field of the whole grid on the brick's cells and the regularizer's next one.
-    const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
-    auto          touchedBy = [&](const Impact::CellBox & brick) {
-      Impact::CellBox window = brick;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        window.cell0[d] = std::max<int64_t>(0, brick.cell0[d] - reach);
-        window.cell1[d] = std::min<int64_t>(cells[d], brick.cell1[d] + reach);
-      }
-      return window;
+      torch::Tensor        grid;
+      torch::Tensor        counted;
+      std::vector<int64_t> m0;
+      std::vector<int64_t> m1;
+      int64_t              count;
     };
-    // One brick's loss for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when given, takes
-    // each layer's unweighted value times the brick's share.
-    auto brickLoss = [&](size_t                       b,
-                         const torch::Tensor &        smoothed,
-                         const std::vector<int64_t> & origin,
-                         std::vector<double> *        raw) -> torch::Tensor {
-      const Impact::CellBox & box = bricks[b];
-      if (countByBrick[b] == 0)
+    auto readingOf =
+      [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) -> Reading {
+      Reading reading{ {}, {}, std::vector<int64_t>(Dim), std::vector<int64_t>(Dim), box.Count() };
+      if (fixedOn.defined())
       {
-        // Nothing of it counts: its edges alone, nothing read.
-        return regularizer(smoothed, box.cell0, box.cell1, origin);
+        reading.counted = Impact::NarrowTo(fixedOn, box.cell0, box.cell1).to(device);
+        reading.count = reading.counted.sum().template item<int64_t>();
+      }
+      if (reading.count == 0)
+      {
+        return reading;
       }
       // Where each cell reads the moving map, in cells: q = c + u (voxels -> cells), and the cells of
       // the moving map the box reads: what q reaches, one around for the interpolation and one spare, within the
@@ -2521,8 +2558,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         own = own.narrow(2 + static_cast<int64_t>(d), box.cell0[d] - origin[d], box.cell1[d] - box.cell0[d]);
       }
-      const torch::Tensor  q = cellPositions(box.cell0, box.cell1) + own * voxelsToCells;
-      std::vector<int64_t> m0(Dim), m1(Dim);
+      const torch::Tensor q = cellPositions(box.cell0, box.cell1) + own * voxelsToCells;
       {
         torch::NoGradGuard  noGrad;
         const torch::Tensor reached = q.detach().flatten(2);
@@ -2532,45 +2568,56 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         {
           const auto low = static_cast<int64_t>(std::floor(bounds[0][0][d].template item<double>())) - 1;
           const auto high = static_cast<int64_t>(std::ceil(bounds[1][0][d].template item<double>())) + 2;
-          m0[d] = std::clamp<int64_t>(low, 0, cells[d] - 1);
-          m1[d] = std::clamp<int64_t>(high, 1, cells[d]);
-          if (m1[d] - m0[d] < 2)
+          reading.m0[d] = std::clamp<int64_t>(low, 0, cells[d] - 1);
+          reading.m1[d] = std::clamp<int64_t>(high, 1, cells[d]);
+          if (reading.m1[d] - reading.m0[d] < 2)
           {
-            if (m1[d] < cells[d])
-              ++m1[d];
-            else if (m0[d] > 0)
-              --m0[d];
+            if (reading.m1[d] < cells[d])
+              ++reading.m1[d];
+            else if (reading.m0[d] > 0)
+              --reading.m0[d];
           }
         }
       }
-      std::vector<torch::Tensor> fixedLayers(losses.size()), movingLayers(losses.size());
-      for (size_t l = 0; l < losses.size(); ++l)
-      {
-        fixedLayers[l] = Impact::NarrowTo(fixedMaps[l], box.cell0, box.cell1).to(device);
-        movingLayers[l] = Impact::NarrowTo(movingMaps[l], m0, m1).to(device);
-      }
-      const torch::Tensor grid = gridIn(q, m0, m1);
-      torch::Tensor       counted;
-      if (fixedOn.defined())
-      {
-        counted = Impact::NarrowTo(fixedOn, box.cell0, box.cell1).to(device);
-      }
+      reading.grid = gridIn(q, reading.m0, reading.m1);
       if (movingShare.defined())
       {
         torch::NoGradGuard  noGrad;
-        const torch::Tensor holds =
-          F::grid_sample(Impact::NarrowTo(movingShare, m0, m1).to(device), grid.detach(), sampleOpts) >= 0.5;
-        counted = counted.defined() ? counted.logical_and(holds) : holds;
+        const torch::Tensor holds = F::grid_sample(Impact::NarrowTo(movingShare, reading.m0, reading.m1).to(device),
+                                                   reading.grid.detach(),
+                                                   sampleOpts) >= 0.5;
+        reading.counted = reading.counted.defined() ? reading.counted.logical_and(holds) : holds;
+        reading.count = reading.counted.sum().template item<int64_t>();
       }
-      const torch::Tensor rows = drawRows(counted, cellCountOf(box));
-      const double        share = static_cast<double>(countByBrick[b]) / totalCount;
+      return reading;
+    };
+    // The cells that count over the grid, the dense mean's divisor. A moving mask makes them follow the field:
+    // `survivors` then holds each unit's, as of the field it was last counted at.
+    double               countedCells = movingShare.defined() ? 0.0 : totalCount;
+    std::vector<int64_t> survivors(movingShare.defined() ? units.size() : 0, 0);
+    // The loss of the cells of `box` for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when
+    // given, takes each layer's unweighted value times the box's share.
+    auto partLoss = [&](const Impact::CellBox &      box,
+                        const torch::Tensor &        smoothed,
+                        const std::vector<int64_t> & origin,
+                        std::vector<double> *        raw) -> torch::Tensor {
+      const Reading reading = readingOf(box, smoothed, origin);
+      if (reading.count == 0)
+      {
+        // Nothing of it counts: its edges alone, no map read.
+        return regularizer(smoothed, box.cell0, box.cell1, origin);
+      }
+      const torch::Tensor rows = drawRows(reading.counted, box.Count());
+      const double        share = static_cast<double>(reading.count) / countedCells;
       torch::Tensor       total = torch::zeros({}, onDevice);
       if (!rows.defined() || rows.numel() > 0)
       {
         for (size_t l = 0; l < losses.size(); ++l)
         {
-          const torch::Tensor sampled = F::grid_sample(pick(l, movingLayers[l]), grid, sampleOpts);
-          const torch::Tensor value = rowsLoss(l, pick(l, fixedLayers[l]), sampled, rows);
+          const torch::Tensor fixedLayer = Impact::NarrowTo(fixedMaps[l], box.cell0, box.cell1).to(device);
+          const torch::Tensor movingLayer = Impact::NarrowTo(movingMaps[l], reading.m0, reading.m1).to(device);
+          const torch::Tensor sampled = F::grid_sample(pick(l, movingLayer), reading.grid, sampleOpts);
+          const torch::Tensor value = rowsLoss(l, pick(l, fixedLayer), sampled, rows);
           if (raw != nullptr)
           {
             (*raw)[l] += value.template item<double>() * share;
@@ -2578,77 +2625,117 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           total = total + layerWeights[l] * normalized(l, value) * share;
         }
       }
-      const torch::Tensor loss = total + regularizer(smoothed, box.cell0, box.cell1, origin);
-      return loss;
+      return total + regularizer(smoothed, box.cell0, box.cell1, origin);
     };
+    // The schedule. RegionsPerIteration 0: every brick at every iteration, in the files' order. Otherwise that many
+    // boxes, drawn afresh from Seed at every iteration, without one twice in an iteration: a draw moves its boxes
+    // to the head of the list, so that it costs what they number.
+    // ponytail: the files hold the cells in raster order, so a box read touches a page for each of its rows; files
+    // laid out by boxes if boxes in a random order outgrow the page cache.
+    std::mt19937        schedule(m_Seed);
+    std::vector<size_t> order(units.size());
+    std::iota(order.begin(), order.end(), 0);
+    const size_t perIteration = drawsBoxes ? std::min<size_t>(m_RegionsPerIteration, order.size()) : order.size();
+    // The steps each unit has taken: Adam corrects the moments of its cells by that count, not the iteration's.
+    std::vector<int64_t> stepsOf(units.size(), 0);
     m_MetricValuesPerIteration.clear();
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
       drawSubsets(channels);
+      for (size_t i = 0; drawsBoxes && i < perIteration; ++i)
+      {
+        std::swap(order[i], order[i + schedule() % (order.size() - i)]);
+      }
+      if (movingShare.defined())
+      {
+        // The units of this iteration are counted again at the field they are about to be stepped from; the
+        // others keep the count of their last step, the first iteration counting every unit. With every unit at
+        // every iteration the divisor is the dense run's.
+        torch::NoGradGuard noGrad;
+        for (size_t i = 0; i < (iteration == 0 ? units.size() : perIteration); ++i)
+        {
+          const size_t          u = iteration == 0 ? i : order[i];
+          const Impact::CellBox window = around(units[u]);
+          const int64_t         count = readingOf(units[u],
+                                          smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)),
+                                          window.cell0)
+                                  .count;
+          countedCells += static_cast<double>(count - survivors[u]);
+          survivors[u] = count;
+        }
+      }
       if (normalizes && !normalization.IsLatched(0))
       {
-        // Each layer's value at the starting field, without the graph: the dense run's mean, summed over the bricks.
+        // Each layer's value at the starting field, without the graph, summed over every unit: the dense run's
+        // mean, whatever the schedule draws. The one pass of the iterations over the grid, a unit at a time.
         torch::NoGradGuard  noGrad;
         std::vector<double> raw(losses.size(), 0.0);
-        for (size_t b = 0; b < bricks.size(); ++b)
+        for (const Impact::CellBox & unit : units)
         {
-          const Impact::CellBox window = touchedBy(bricks[b]);
-          brickLoss(
-            b, smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
+          const Impact::CellBox window = around(unit);
+          partLoss(
+            unit, smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window.cell0, &raw);
         }
         for (size_t l = 0; l < losses.size(); ++l)
         {
           normalization.Latch(l, raw[l]);
         }
       }
-      // Each brick back-propagates through the smoothing passes to the cells it touches; the control grid's gradient
-      // is their sum over the bricks, which touch one another's cells.
-      double lossValue = 0.0;
-      for (size_t b = 0; b < bricks.size(); ++b)
+      // The gradient of the units' cells. The bricks, which cover the grid, each back-propagate their own loss
+      // through the smoothing passes to the cells it reads, and those gradients add up on the cells bricks share. A
+      // drawn box has no such neighbours: it takes the loss of the cells around it, which holds every term of the
+      // dense loss that reads its cells, and keeps the gradient of its own cells, the whole grid's.
+      double  lossValue = 0.0;
+      int64_t covered = 0;
+      for (size_t i = 0; i < perIteration; ++i)
       {
-        const Impact::CellBox window = touchedBy(bricks[b]);
-        const torch::Tensor   control = Impact::NarrowTo(theta, window.cell0, window.cell1)
+        const Impact::CellBox & unit = units[order[i]];
+        const Impact::CellBox   part = drawsBoxes ? around(unit) : unit;
+        const Impact::CellBox   window = around(part);
+        const Impact::CellBox & kept = drawsBoxes ? unit : window;
+        const torch::Tensor     control = Impact::NarrowTo(theta, window.cell0, window.cell1)
                                         .to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true)
                                         .requires_grad_(true);
-        const torch::Tensor loss = brickLoss(b, smoothControl(control), window.cell0, nullptr);
+        const torch::Tensor loss = partLoss(part, smoothControl(control), window.cell0, nullptr);
         if (loss.requires_grad()) // a constant for a last cell out of the fixed mask: no similarity, no difference
         {
           loss.backward();
         }
         lossValue += loss.template item<double>();
+        covered += part.Count();
         if (control.grad().defined())
         {
-          Impact::NarrowTo(gradient, window.cell0, window.cell1).add_(control.grad().to(torch::kCPU));
+          Impact::NarrowTo(gradient, kept.cell0, kept.cell1)
+            .add_(Impact::CropTo(control.grad(), window, kept).to(gradient.device()));
         }
       }
-      adam.Advance();
-      for (const Impact::CellBox & brick : bricks)
+      for (size_t i = 0; i < perIteration; ++i)
       {
-        adam.StepCells(theta, gradient, brick.cell0, brick.cell1, device);
-        Impact::NarrowTo(gradient, brick.cell0, brick.cell1).zero_();
+        const Impact::CellBox & unit = units[order[i]];
+        adam.steps = ++stepsOf[order[i]];
+        adam.StepCells(theta, gradient, unit.cell0, unit.cell1, device);
+        Impact::NarrowTo(gradient, unit.cell0, unit.cell1).zero_();
       }
-      m_MetricValuesPerIteration.push_back(lossValue);
+      // The loss over the parts, scaled from the cells they hold to the grid: the dense loss when they tile it.
+      m_MetricValuesPerIteration.push_back(lossValue /
+                                           (static_cast<double>(covered) / static_cast<double>(cellCountTotal)));
     }
   }
   // ---- The control grid, smoothed, as the field on its own grid, written a box at a time from the cells its
   // smoothing reads: the host holds that image alone. The dense output is interpolated from it. ----
   {
     torch::NoGradGuard noGrad;
-    m_ControlGrid = Impact::AllocateCellGrid<Dim>(cells, m_FixedImage.GetPointer());
-    const auto smoothingReach = static_cast<int64_t>(m_ControlGridSmoothingIterations);
+    m_ControlGrid = Impact::AllocateCellGrid<Dim>(
+      cells,
+      m_FixedImage.GetPointer(),
+      m_ResidentFeatures ? nullptr : Impact::MapCellGridPixels<Dim>(cells, scratch).GetPointer());
+    const std::vector<int64_t> smoothingReach(Dim, static_cast<int64_t>(m_ControlGridSmoothingIterations));
     for (const Impact::CellBox & box : boxes)
     {
-      std::vector<int64_t> w0(Dim), w1(Dim), lo(Dim), hi(Dim);
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        w0[d] = std::max<int64_t>(0, box.cell0[d] - smoothingReach);
-        w1[d] = std::min<int64_t>(cells[d], box.cell1[d] + smoothingReach);
-        lo[d] = box.cell0[d] - w0[d];
-        hi[d] = box.cell1[d] - w0[d];
-      }
+      const Impact::CellBox window = Impact::CellsAround(box, smoothingReach, cells);
       Impact::WriteCellsToCellGrid<Dim>(
-        Impact::NarrowTo(smoothControl(Impact::NarrowTo(theta, w0, w1).to(device)), lo, hi, 2),
+        Impact::CropTo(smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)), window, box),
         box.cell0,
         cells,
         m_FixedImage.GetPointer(),
@@ -2673,9 +2760,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::PrintSelf(std::ostream & os, 
   os << indent << "NormalizeLosses: " << (m_NormalizeLosses ? "on" : "off") << std::endl;
   os << indent << "FixedModelsConfiguration count: " << m_FixedModelsConfiguration.size() << std::endl;
   os << indent << "RegionSize: " << m_RegionSize << std::endl;
+  os << indent << "RegionsPerIteration: " << m_RegionsPerIteration << std::endl;
   os << indent << "BrickBytes: " << m_BrickBytes << std::endl;
   os << indent << "RegionHalo: " << m_RegionHalo << std::endl;
   os << indent << "ResidentFeatureBudget: " << m_ResidentFeatureBudget << std::endl;
+  os << indent << "ResidentBytes: " << m_ResidentBytes << std::endl;
   os << indent << "ScratchDirectory: " << m_ScratchDirectory << std::endl;
 }
 

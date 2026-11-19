@@ -19,7 +19,8 @@
 // The region-sampled run of ImpactFineRegistration against its whole-image run, on the intensity similarity: it
 // reproduces the dense field, with the pooled maps resident and by bricks from mapped files that the run removes; a
 // streaming reader gives the same field as the image in memory and is read by regions; a transform set on the moving
-// side is applied outside the field.
+// side is applied outside the field; stepping the boxes drawn at each iteration is that run when every box is
+// drawn, and tends to it with a few as the iterations grow.
 
 #include "itkImpactFineRegistration.h"
 
@@ -167,7 +168,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     return EXIT_FAILURE;
   }
   const FieldType * regionField = regions->GetOutput();
-  auto              bricks = FineType::New();
+  FineType::Pointer bricks = FineType::New();
   bricks->SetFixedImage(fixed);
   bricks->SetMovingImage(moving);
   bricks->SetInitialDisplacementField(start);
@@ -187,11 +188,6 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "A budget of one byte should leave nothing resident." << std::endl;
     return EXIT_FAILURE;
   }
-  if (!std::filesystem::is_empty(scratch))
-  {
-    std::cerr << "The run left files in its scratch directory." << std::endl;
-    return EXIT_FAILURE;
-  }
   if (bricks->GetBytesRead() != regions->GetBytesRead())
   {
     std::cerr << "By bricks, the images should be read once, as with the maps resident: " << bricks->GetBytesRead()
@@ -204,6 +200,27 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   {
     std::cerr << "The field of every cell by bricks differs from the dense one by " << brickDifference << " mm."
               << std::endl;
+    return EXIT_FAILURE;
+  }
+  // The control grid of the run by bricks is a file mapped to memory, which the grid keeps: it outlives the filter,
+  // and the file goes with it.
+  {
+    FineType::DisplacementFieldTransformType::Pointer mapped = bricks->GetControlGridTransform();
+    bricks = nullptr;
+    const FieldType * residentGrid = regions->GetControlGridTransform()->GetDisplacementField();
+    const double      gridDifference =
+      MaxDifference(mapped->GetDisplacementField(), residentGrid, residentGrid->GetLargestPossibleRegion());
+    std::cout << "control grid by bricks, past its filter, vs resident: max |difference| = " << gridDifference << " mm"
+              << std::endl;
+    if (gridDifference > 1e-5)
+    {
+      std::cerr << "The control grid of the run by bricks is not the resident run's." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+  if (!std::filesystem::is_empty(scratch))
+  {
+    std::cerr << "The run left files in its scratch directory." << std::endl;
     return EXIT_FAILURE;
   }
   const double difference = MaxDifference(denseField, regionField, fixed->GetLargestPossibleRegion());
@@ -254,11 +271,14 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 3. The pair streamed from disk, by regions: the same field, read in pieces, produced for the region asked.
+  // 3. The pair and the starting field streamed from disk, by regions: the same field, read in pieces, produced for
+  // the region asked.
   const std::string fixedFile = temporary + "/itkImpactFineRegistrationRegionTest_fixed.mha";
   const std::string movingFile = temporary + "/itkImpactFineRegistrationRegionTest_moving.mha";
+  const std::string startFile = temporary + "/itkImpactFineRegistrationRegionTest_start.mha";
   ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(fixed, fixedFile));
   ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(moving, movingFile));
+  ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(start, startFile));
   using ReaderType = itk::ImageFileReader<ImageType>;
   auto fixedReader = ReaderType::New();
   fixedReader->SetFileName(fixedFile);
@@ -266,10 +286,13 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   auto movingReader = ReaderType::New();
   movingReader->SetFileName(movingFile);
   movingReader->UseStreamingOn();
+  auto startReader = itk::ImageFileReader<FieldType>::New();
+  startReader->SetFileName(startFile);
+  startReader->UseStreamingOn();
   auto streamed = FineType::New();
   streamed->SetFixedImage(fixedReader->GetOutput());
   streamed->SetMovingImage(movingReader->GetOutput());
-  streamed->SetInitialDisplacementField(start);
+  streamed->SetInitialDisplacementField(startReader->GetOutput());
   Configure(streamed, 6);
   streamed->SetRegionSize(16);
   streamed->UpdateOutputInformation();
@@ -296,9 +319,10 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     std::cerr << "The readers served the whole images where regions were requested." << std::endl;
     return EXIT_FAILURE;
   }
-  if (fixedReader->GetOutput()->GetBufferedRegion() == fixed->GetLargestPossibleRegion())
+  if (fixedReader->GetOutput()->GetBufferedRegion() == fixed->GetLargestPossibleRegion() ||
+      startReader->GetOutput()->GetBufferedRegion() == fixed->GetLargestPossibleRegion())
   {
-    std::cerr << "The fixed reader holds the whole image after the run." << std::endl;
+    std::cerr << "A reader holds its whole image after the run." << std::endl;
     return EXIT_FAILURE;
   }
   std::cout << "bytes read over the streamed run: " << streamed->GetBytesRead() << std::endl;
@@ -453,6 +477,169 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       std::cerr << "On odd sizes, " << label << " by regions differ from the whole-image run." << std::endl;
       return EXIT_FAILURE;
     }
+  }
+
+  // 7. The least boxes: a control grid of 9 x 7 x 5 cells by boxes of 2, whose last along each axis is one cell,
+  // narrower than the smoothing's kernel. With the maps resident and by bricks of one box (BrickBytes 1, the
+  // least): the whole-image run's field.
+  {
+    const ImageType::SizeType few = { { 18, 14, 10 } };
+    ImageType::Pointer        fewFixed = Texture(few, 0.0, 0.0, 0.0);
+    ImageType::Pointer        fewMoving = Texture(few, 1.5, -1.0, 0.5);
+    const FieldType::Pointer  fewStart = StartingField(fewFixed);
+    auto                      run = [&](unsigned int regionSize, bool mapped) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fewFixed);
+      fine->SetMovingImage(fewMoving);
+      fine->SetInitialDisplacementField(fewStart);
+      Configure(fine, 6);
+      fine->SetRegionSize(regionSize);
+      if (mapped)
+      {
+        fine->SetResidentFeatureBudget(1);
+        fine->SetBrickBytes(1);
+        fine->SetScratchDirectory(scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto   whole = run(0, false);
+    const double residentDifference =
+      MaxDifference(whole->GetOutput(), run(4, false)->GetOutput(), fewFixed->GetLargestPossibleRegion());
+    const double mappedDifference =
+      MaxDifference(whole->GetOutput(), run(4, true)->GetOutput(), fewFixed->GetLargestPossibleRegion());
+    std::cout << "boxes whose last is one cell, against whole: max |difference| = " << residentDifference
+              << " mm with the maps resident, " << mappedDifference << " mm by bricks of one box" << std::endl;
+    if (!(residentDifference < 1e-5) || !(mappedDifference < 1e-5))
+    {
+      std::cerr << "By boxes whose last is one cell, the field differs from the whole-image run's." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  // 8. RegionsPerIteration: an iteration steps the cells of the boxes it draws, with the whole grid's gradient.
+  {
+    auto drawing = [&](unsigned int regionsPerIteration, unsigned int iterations, double epsilon, bool mapped) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fixed);
+      fine->SetMovingImage(moving);
+      fine->SetInitialDisplacementField(start);
+      Configure(fine, iterations, epsilon);
+      fine->SetRegionSize(16);
+      fine->SetRegionsPerIteration(regionsPerIteration);
+      if (mapped)
+      {
+        fine->SetResidentFeatureBudget(1);
+        fine->SetScratchDirectory(scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    auto differenceOf = [&](const FineType * a, const FieldType * b) {
+      return MaxDifference(a->GetOutput(), b, fixed->GetLargestPossibleRegion());
+    };
+    // All 18 boxes at every iteration: the run that steps every cell, with the maps resident and in mapped files.
+    const auto everyResident = drawing(18, 6, 1.0, false);
+    ITK_TEST_SET_GET_VALUE(18u, everyResident->GetRegionsPerIteration());
+    const auto   everyMapped = drawing(1000, 6, 1.0, true);
+    const double residentDifference = differenceOf(everyResident, denseField);
+    const double mappedDifference = differenceOf(everyMapped, denseField);
+    std::cout << "every box drawn at every iteration, against the dense run: max |difference| = " << residentDifference
+              << " mm with the maps resident, " << mappedDifference << " mm from mapped files" << std::endl;
+    if (everyResident->GetMetricValuesPerIteration().size() != 6 || !everyResident->GetResidentFeatures() ||
+        everyMapped->GetResidentFeatures() || !(residentDifference < 1e-5) || !(mappedDifference < 1e-5))
+    {
+      std::cerr << "Drawing every box at every iteration is not the run that steps every cell." << std::endl;
+      return EXIT_FAILURE;
+    }
+    // Three boxes an iteration: one field for one seed, from mapped files as with the maps resident.
+    const auto   fewMapped = drawing(3, 36, 1.0, true);
+    const double againDifference = differenceOf(drawing(3, 36, 1.0, true), fewMapped->GetOutput());
+    const double routeDifference = differenceOf(drawing(3, 36, 1.0, false), fewMapped->GetOutput());
+    std::cout << "three boxes an iteration: max |difference| = " << againDifference << " mm between two runs, "
+              << routeDifference << " mm between mapped files and resident maps" << std::endl;
+    if (fewMapped->GetMetricValuesPerIteration().size() != 36 || againDifference != 0.0 || !(routeDifference < 1e-5))
+    {
+      std::cerr << "Three boxes an iteration do not give one field for one seed." << std::endl;
+      return EXIT_FAILURE;
+    }
+    // And the field tends to that of every cell at every iteration: at as many steps a cell on average (six
+    // iterations of 3 boxes for one of all 18), the two fields close in as the steps grow. Under an epsilon of the
+    // gradients' order, with which Adam's steps die out near the minimum both runs go to. Measured: 0.40, 0.17 and
+    // 0.044 mm at 15, 45 and 135 steps a cell, for fields that moved by 2.2 mm.
+    double previous = std::numeric_limits<double>::infinity();
+    for (const unsigned int steps : { 15u, 45u, 135u })
+    {
+      const double distance =
+        differenceOf(drawing(3, 6 * steps, 1e-4, false), drawing(0, steps, 1e-4, false)->GetOutput());
+      std::cout << "three boxes an iteration against every cell, " << steps
+                << " steps a cell: max |difference| = " << distance << " mm" << std::endl;
+      if (!(distance < previous / 1.5))
+      {
+        std::cerr << "The field of three boxes an iteration does not close in on that of every cell." << std::endl;
+        return EXIT_FAILURE;
+      }
+      previous = distance;
+    }
+  }
+
+  // 9. A moving mask, which cuts the boxes unevenly: the cells that count follow the field, and the loss is their
+  // mean over the grid. By bricks, and with every box drawn at every iteration, from resident maps and from mapped
+  // files: the field of the dense iterations on the resident maps.
+  {
+    using MaskType = FineType::MaskImageType;
+    auto movingMask = MaskType::New();
+    movingMask->SetRegions(moving->GetLargestPossibleRegion());
+    movingMask->Allocate();
+    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    {
+      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
+    }
+    auto masked = [&](unsigned int regionsPerIteration, bool mapped) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fixed);
+      fine->SetMovingImage(moving);
+      fine->SetMovingMask(movingMask);
+      fine->SetInitialDisplacementField(start);
+      Configure(fine, 6);
+      fine->SetRegionSize(16);
+      fine->SetRegionsPerIteration(regionsPerIteration);
+      if (mapped)
+      {
+        fine->SetResidentFeatureBudget(1);
+        fine->SetBrickBytes(1);
+        fine->SetScratchDirectory(scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto resident = masked(0, false);
+    auto       differenceOf = [&](unsigned int regionsPerIteration, bool mapped) {
+      return MaxDifference(
+        resident->GetOutput(), masked(regionsPerIteration, mapped)->GetOutput(), fixed->GetLargestPossibleRegion());
+    };
+    const double bricksDifference = differenceOf(0, true);
+    const double everyResident = differenceOf(18, false);
+    const double everyMapped = differenceOf(18, true);
+    const double unmasked = MaxDifference(resident->GetOutput(), denseField, fixed->GetLargestPossibleRegion());
+    std::cout << "with a moving mask, against the dense iterations on resident maps: max |difference| = "
+              << bricksDifference << " mm by bricks, " << everyResident << " and " << everyMapped
+              << " mm with every box drawn, resident and mapped; " << unmasked << " mm from the run without the mask"
+              << std::endl;
+    if (!(bricksDifference < 1e-5) || !(everyResident < 1e-5) || !(everyMapped < 1e-5) || !(unmasked > 1e-4))
+    {
+      std::cerr << "With a moving mask, the runs by units differ from the dense iterations on resident maps."
+                << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Every run from mapped files is gone, and its control grid with it: so are the files.
+  if (!std::filesystem::is_empty(scratch))
+  {
+    std::cerr << "The runs from mapped files left files in the scratch directory." << std::endl;
+    return EXIT_FAILURE;
   }
 
   std::cout << "Test finished." << std::endl;
