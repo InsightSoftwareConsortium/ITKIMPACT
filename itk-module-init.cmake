@@ -24,11 +24,13 @@
 #
 # torch is a hard dependency, so if the `torch` package is missing we pip-install the CPU
 # build (best effort) rather than fail outright — this lets the standard ITK CI (which does
-# not provision LibTorch) build the module out of the box. Turn it off with
-# -DIMPACT_AUTO_INSTALL_TORCH=OFF, or point -DTorch_DIR / -DCMAKE_PREFIX_PATH at a manual
-# (e.g. CUDA) LibTorch, which always takes precedence.
+# not provision LibTorch) build the module out of the box. It goes into the build tree
+# (ImpactTorch), never into the interpreter's own site-packages, so a system Python is left
+# as it was. Turn it off with -DIMPACT_AUTO_INSTALL_TORCH=OFF, or point -DTorch_DIR at a
+# manual LibTorch (e.g. CUDA, or the Debug distribution an MSVC Debug build needs), which
+# always takes precedence.
 option(IMPACT_AUTO_INSTALL_TORCH
-  "If the torch Python package is missing, pip-install the CPU build so find_package(Torch) succeeds." ON)
+  "If the torch Python package is missing, pip-install the CPU build into the build tree so find_package(Torch) succeeds." ON)
 
 if(NOT Torch_DIR AND NOT DEFINED Torch_ROOT)
   # Prefer the interpreter CMake was configured with (e.g. the cp3xx wheel-build python in
@@ -42,44 +44,40 @@ if(NOT Torch_DIR AND NOT DEFINED Torch_ROOT)
     find_program(IMPACT_Python_EXECUTABLE NAMES python3 python)
   endif()
   if(IMPACT_Python_EXECUTABLE)
+    set(IMPACT_Torch_code "import torch; print(torch.utils.cmake_prefix_path)")
     execute_process(
-      COMMAND "${IMPACT_Python_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
+      COMMAND "${IMPACT_Python_EXECUTABLE}" -c "${IMPACT_Torch_code}"
       OUTPUT_VARIABLE IMPACT_Torch_cmake_prefix
       OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE IMPACT_Torch_query
       ERROR_QUIET)
 
-    if(NOT IMPACT_Torch_query EQUAL 0 AND IMPACT_AUTO_INSTALL_TORCH)
-      message(STATUS "IMPACT: the torch Python package was not found; installing the CPU build via pip ...")
-      # An environment created without pip (e.g. `uv venv`) still ships ensurepip in the
-      # standard library, so bootstrap pip rather than failing on `-m pip`.
-      execute_process(
-        COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip --version
-        RESULT_VARIABLE IMPACT_pip_present OUTPUT_QUIET ERROR_QUIET)
-      if(NOT IMPACT_pip_present EQUAL 0)
+    # Fall back on the torch of the build tree, installed by an earlier configure or here.
+    if(NOT IMPACT_Torch_query EQUAL 0)
+      set(IMPACT_Torch_site "${CMAKE_BINARY_DIR}/ImpactTorch")
+      if(NOT EXISTS "${IMPACT_Torch_site}" AND IMPACT_AUTO_INSTALL_TORCH)
+        message(STATUS "IMPACT: the torch Python package was not found; installing the CPU build into ${IMPACT_Torch_site} ...")
+        # An environment created without pip (e.g. `uv venv`) still ships ensurepip in the
+        # standard library, so bootstrap pip rather than failing on `-m pip`.
         execute_process(
-          COMMAND "${IMPACT_Python_EXECUTABLE}" -m ensurepip --upgrade
-          RESULT_VARIABLE IMPACT_ensurepip OUTPUT_QUIET ERROR_QUIET)
+          COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip --version
+          RESULT_VARIABLE IMPACT_pip_present OUTPUT_QUIET ERROR_QUIET)
+        if(NOT IMPACT_pip_present EQUAL 0)
+          execute_process(
+            COMMAND "${IMPACT_Python_EXECUTABLE}" -m ensurepip --upgrade
+            RESULT_VARIABLE IMPACT_ensurepip OUTPUT_QUIET ERROR_QUIET)
+        endif()
+        # --target leaves the interpreter's site-packages alone, so PEP 668 does not refuse it.
+        execute_process(
+          COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip install --target "${IMPACT_Torch_site}" "torch==2.12.*"
+                  --index-url https://download.pytorch.org/whl/cpu)
       endif()
       execute_process(
-        COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip install "torch==2.12.*"
-                --index-url https://download.pytorch.org/whl/cpu
-        RESULT_VARIABLE IMPACT_Torch_pip)
-      if(NOT IMPACT_Torch_pip EQUAL 0)
-        # Some distributions ship an externally-managed Python (PEP 668); retry allowing it.
-        execute_process(
-          COMMAND "${IMPACT_Python_EXECUTABLE}" -m pip install --break-system-packages "torch==2.12.*"
-                  --index-url https://download.pytorch.org/whl/cpu
-          RESULT_VARIABLE IMPACT_Torch_pip)
-      endif()
-      if(IMPACT_Torch_pip EQUAL 0)
-        execute_process(
-          COMMAND "${IMPACT_Python_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
-          OUTPUT_VARIABLE IMPACT_Torch_cmake_prefix
-          OUTPUT_STRIP_TRAILING_WHITESPACE
-          RESULT_VARIABLE IMPACT_Torch_query
-          ERROR_QUIET)
-      endif()
+        COMMAND "${IMPACT_Python_EXECUTABLE}" -c "import sys; sys.path.insert(0, r'${IMPACT_Torch_site}'); ${IMPACT_Torch_code}"
+        OUTPUT_VARIABLE IMPACT_Torch_cmake_prefix
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE IMPACT_Torch_query
+        ERROR_QUIET)
     endif()
 
     if(IMPACT_Torch_query EQUAL 0 AND IMPACT_Torch_cmake_prefix)

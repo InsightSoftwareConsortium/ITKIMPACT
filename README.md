@@ -129,8 +129,9 @@ pip install -e /path/to/ITKIMPACT
 ```
 
 **LibTorch is handled for you.** `torch` is a build requirement, so pip provisions it in its
-build environment; a plain `cmake` invocation installs the CPU build itself if the package is
-missing. Pass `-DTorch_DIR=<prefix>/share/cmake/Torch` to use a specific one.
+build environment; a plain `cmake` invocation installs the CPU build into the build tree if the
+package is missing, never into your Python. Pass `-DTorch_DIR=<prefix>/share/cmake/Torch` to use
+a specific one, such as the Debug LibTorch distribution an MSVC Debug build needs.
 
 **ITK is not, and cannot be.** The `itk` wheels ship the built modules only — no CMake
 configuration and no wrapping infrastructure — so nothing can be fetched from PyPI to build
