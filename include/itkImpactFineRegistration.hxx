@@ -2157,21 +2157,49 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     channelCount += c;
   }
   const bool drawsBoxes = m_RegionsPerIteration > 0; // an iteration steps those boxes alone
-  // What the run holds on the device at its peak with everything resident, in floats a cell. With the boxes drawn:
-  // the two maps, the control grid, its gradient, Adam's two moments and the masks' cells. Stepping every cell,
-  // an iteration's graph over the whole grid besides: Dim * (13 + the smoothing passes) for the field and its
+  // What the run holds on the device at its peak with everything resident, in floats a cell. Stepping every cell
+  // at once: an iteration's graph over the whole grid, Dim * (13 + the smoothing passes) for the field and its
   // state, six a channel (the two maps, the features sampled, their difference and the gradients back), and a
-  // channel and four more when the cells that count are drawn (a mask, SamplingPercentage). Measured in 3D on the
-  // CPU and on CUDA, on 1 to 48 channels and 0 to 3 passes: a run held between 0.77 and 0.96 of that count.
+  // channel and four more when the cells that count are drawn (a mask, SamplingPercentage). Otherwise, the boxes
+  // drawn or every cell by bricks: the two maps, the control grid, its gradient, Adam's two moments and the masks'
+  // cells, and a brick or a box at a time beside them. Measured in 3D on the CPU and on CUDA, on 1 to 48 channels
+  // and 0 to 3 passes: a run held between 0.77 and 0.96 of that count.
   const auto    smoothingPasses = static_cast<int64_t>(m_ControlGridSmoothingIterations);
   const bool    drawsCells = m_FixedMask.IsNotNull() || m_MovingMask.IsNotNull() || m_SamplingPercentage < 1.0;
-  const int64_t residentFloats = drawsBoxes ? 2 * channelCount + 4 * static_cast<int64_t>(Dim) + 2
-                                            : static_cast<int64_t>(Dim) * (13 + smoothingPasses) + 6 * channelCount +
-                                                (drawsCells ? channelCount + 4 : 0);
-  m_ResidentBytes = static_cast<SizeValueType>(cellCountTotal * residentFloats * 4);
-  m_ResidentFeatures =
-    static_cast<double>(m_ResidentBytes) <=
-    (m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device));
+  const int64_t heldFloats = 2 * channelCount + 4 * static_cast<int64_t>(Dim) + 2;
+  const int64_t denseFloats =
+    static_cast<int64_t>(Dim) * (13 + smoothingPasses) + 6 * channelCount + (drawsCells ? channelCount + 4 : 0);
+  const double budget =
+    m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device);
+  const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
+  // A brick: as many boxes a side as BrickBytes holds on the device. At its peak a step holds there, in floats,
+  // Dim * (6 + the smoothing passes) for each cell the brick reads (the field along the graph) and four for each
+  // channel of each of its own cells (the two maps, the features sampled and their gradient): measured in 3D on
+  // 1 to 48 channels and 1 and 3 passes, a step held between 0.66 and 1.0 of that count. A drawn box is a unit
+  // by itself.
+  const double brickBytes = m_BrickBytes > 0 ? static_cast<double>(m_BrickBytes) : Impact::ResidentBudget(device) / 8.0;
+  auto         brickCells = [&](int64_t boxesASide, int64_t around) {
+    double count = 1.0;
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d] + 2 * around));
+    }
+    return count;
+  };
+  // A brick's loss is over its own cells and reads the field `reach` around them; a drawn box's loss is over the
+  // cells within `reach` of it (every term that reads its cells), which read the field twice that around it.
+  const int64_t partReach = drawsBoxes ? reach : 0;
+  auto          stepBytes = [&](int64_t boxesASide) {
+    return 4.0 * (static_cast<double>(Dim * (6 + m_ControlGridSmoothingIterations)) *
+                    brickCells(boxesASide, partReach + reach) +
+                  4.0 * static_cast<double>(channelCount) * brickCells(boxesASide, partReach));
+  };
+  // The dense iterations when their graph fits; else the maps and the state stay resident when they fit with the
+  // smallest step beside them (a box), and the iterations go by bricks (or drawn boxes) on them; else everything is in
+  // files.
+  const bool dense = !drawsBoxes && static_cast<double>(cellCountTotal * denseFloats * 4) <= budget;
+  m_ResidentBytes = static_cast<SizeValueType>(cellCountTotal * (dense ? denseFloats : heldFloats) * 4);
+  m_ResidentFeatures = static_cast<double>(m_ResidentBytes) + (dense ? 0.0 : stepBytes(1)) <= budget;
   auto atHome = [&](const std::vector<int64_t> & shape) {
     return m_ResidentFeatures ? torch::zeros(shape, onDevice) : scratch.Zeros(shape);
   };
@@ -2427,7 +2455,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       Impact::WriteCells(movingShare, box.cell0, pooled.share);
     }
   }
-  if (m_ResidentFeatures && !drawsBoxes)
+  if (dense)
   {
     // ---- The dense iterations on the pooled maps. ----
     theta.set_requires_grad(true);
@@ -2482,41 +2510,23 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   else
   {
     // ---- By units of the grid, brought to the device one at a time: the control grid, its gradient and Adam's
-    // moments are at home like the maps. RegionsPerIteration 0 steps every cell at every iteration, the whole-image
-    // run's schedule, by bricks of boxes; otherwise an iteration steps the cells of the boxes it draws. The loss of
-    // a set of cells is the dense loss restricted to them, weighed by their share of the counted cells, plus the
-    // regularizer's differences whose first cell lies among them. ----
+    // moments are at home like the maps, on the device when they are resident. RegionsPerIteration 0 steps every
+    // cell at every iteration, the whole-image run's schedule, by bricks of boxes; otherwise an iteration steps the
+    // cells of the boxes it draws. The loss of a set of cells is the dense loss restricted to them, weighed by their
+    // share of the counted cells, plus the regularizer's differences whose first cell lies among them. ----
     torch::Tensor    gradient = atHome(thetaShape);
     Impact::CellAdam adam{ atHome(thetaShape), atHome(thetaShape), m_LearningRate, m_Beta1, m_Beta2, adamEpsilon };
     // The cells within `reach` of a box: the regularizer's next cell and the smoothing's reach. They are the cells
     // the box's loss reads (smoothed alone, they give the smoothed field of the whole grid on the box's cells and
     // the regularizer's next one), and the cells whose loss reads the box's.
-    const int64_t reach = 1 + static_cast<int64_t>(m_ControlGridSmoothingIterations);
-    auto          around = [&](const Impact::CellBox & box) {
+    auto around = [&](const Impact::CellBox & box) {
       return Impact::CellsAround(box, std::vector<int64_t>(Dim, reach), cells);
     };
-    // A brick: as many boxes a side as BrickBytes holds on the device. At its peak a step holds there, in floats,
-    // Dim * (6 + the smoothing passes) for each cell the brick reads (the field along the graph) and four for each
-    // channel of each of its own cells (the two maps, the features sampled and their gradient): measured in 3D on
-    // 1 to 48 channels and 1 and 3 passes, a step held between 0.66 and 1.0 of that count. A drawn box is a unit
-    // by itself.
-    const double brickBytes =
-      m_BrickBytes > 0 ? static_cast<double>(m_BrickBytes) : Impact::ResidentBudget(device) / 8.0;
-    auto brickCells = [&](int64_t boxesASide, int64_t around) {
-      double count = 1.0;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        count *= static_cast<double>(std::min(cells[d], boxesASide * perBox[d] + 2 * around));
-      }
-      return count;
-    };
-    auto stepBytes = [&](int64_t boxesASide) {
-      return 4.0 * (static_cast<double>(Dim * (6 + m_ControlGridSmoothingIterations)) * brickCells(boxesASide, reach) +
-                    4.0 * static_cast<double>(channelCount) * brickCells(boxesASide, 0));
-    };
-    int64_t boxesASide = 1;
+    int64_t      boxesASide = 1;
+    const double brickRoom =
+      m_ResidentFeatures ? std::min(brickBytes, budget - static_cast<double>(m_ResidentBytes)) : brickBytes;
     while (!drawsBoxes && brickCells(boxesASide, 0) < static_cast<double>(cellCountTotal) &&
-           stepBytes(boxesASide + 1) <= brickBytes)
+           stepBytes(boxesASide + 1) <= brickRoom)
     {
       ++boxesASide;
     }

@@ -202,6 +202,48 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
               << std::endl;
     return EXIT_FAILURE;
   }
+  // With room for the maps and Adam's state but not for the graph of a whole iteration, every cell by bricks of one
+  // box on the resident maps: the same field again.
+  auto residentBricks = FineType::New();
+  residentBricks->SetFixedImage(fixed);
+  residentBricks->SetMovingImage(moving);
+  residentBricks->SetInitialDisplacementField(start);
+  Configure(residentBricks, 6);
+  residentBricks->SetRegionSize(16);
+  residentBricks->SetResidentFeatureBudget(regions->GetResidentBytes() - 1);
+  residentBricks->SetBrickBytes(1);
+  ITK_TRY_EXPECT_NO_EXCEPTION(residentBricks->Update());
+  if (!residentBricks->GetResidentFeatures() || residentBricks->GetResidentBytes() >= regions->GetResidentBytes())
+  {
+    std::cerr << "With room for the maps alone, they should stay resident and the iterations go by bricks."
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+  const double residentBrickDifference =
+    MaxDifference(denseField, residentBricks->GetOutput(), fixed->GetLargestPossibleRegion());
+  std::cout << "dense vs every cell by bricks on the resident maps: max |difference| = " << residentBrickDifference
+            << " mm" << std::endl;
+  if (residentBrickDifference > 1e-5)
+  {
+    std::cerr << "The field of every cell by bricks on the resident maps differs from the dense one by "
+              << residentBrickDifference << " mm." << std::endl;
+    return EXIT_FAILURE;
+  }
+  // With room for the maps and the state but not for a step beside them, they go to files: the budget bounds the
+  // run's peak, its steps included.
+  auto noStepRoom = FineType::New();
+  noStepRoom->SetFixedImage(fixed);
+  noStepRoom->SetMovingImage(moving);
+  noStepRoom->SetInitialDisplacementField(start);
+  Configure(noStepRoom, 6);
+  noStepRoom->SetRegionSize(16);
+  noStepRoom->SetResidentFeatureBudget(residentBricks->GetResidentBytes());
+  ITK_TRY_EXPECT_NO_EXCEPTION(noStepRoom->Update());
+  if (noStepRoom->GetResidentFeatures())
+  {
+    std::cerr << "With no room for a step beside them, the maps should go to files." << std::endl;
+    return EXIT_FAILURE;
+  }
   // The control grid of the run by bricks is a file mapped to memory, which the grid keeps: it outlives the filter,
   // and the file goes with it.
   {
@@ -550,6 +592,22 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         everyMapped->GetResidentFeatures() || !(residentDifference < 1e-5) || !(mappedDifference < 1e-5))
     {
       std::cerr << "Drawing every box at every iteration is not the run that steps every cell." << std::endl;
+      return EXIT_FAILURE;
+    }
+    // With room for the maps and the state but not for a drawn box's step beside them, they go to files.
+    auto noStepRoom = FineType::New();
+    noStepRoom->SetFixedImage(fixed);
+    noStepRoom->SetMovingImage(moving);
+    noStepRoom->SetInitialDisplacementField(start);
+    Configure(noStepRoom, 6, 1.0);
+    noStepRoom->SetRegionSize(16);
+    noStepRoom->SetRegionsPerIteration(18);
+    noStepRoom->SetResidentFeatureBudget(everyResident->GetResidentBytes());
+    noStepRoom->SetScratchDirectory(scratch);
+    noStepRoom->Update();
+    if (noStepRoom->GetResidentFeatures())
+    {
+      std::cerr << "With no room for a drawn box's step beside them, the maps should go to files." << std::endl;
       return EXIT_FAILURE;
     }
     // Three boxes an iteration: one field for one seed, from mapped files as with the maps resident.

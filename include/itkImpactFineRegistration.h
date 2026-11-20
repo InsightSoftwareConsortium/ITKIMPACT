@@ -292,7 +292,7 @@ public:
    * GetMetricValuesPerIteration() holds the loss over the drawn boxes, scaled to the grid. */
   itkSetMacro(RegionsPerIteration, unsigned int);
   itkGetConstMacro(RegionsPerIteration, unsigned int);
-  /** Most bytes a step of a brick may hold on the device when the pooled maps are not resident: a brick is as many
+  /** Most bytes a step of a brick may hold on the device when the iterations go by bricks: a brick is as many
    * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. 0 (the default):
    * an eighth of what ResidentFeatureBudget's default allows. The bricks set the memory, not the result. Not read
    * with RegionsPerIteration, whose boxes are stepped one at a time. */
@@ -312,14 +312,15 @@ public:
   using TransformType = Transform<double, ImageDimension, ImageDimension>;
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
-  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there:
-   * within it every iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped
-   * files and every iteration brings them to the device a brick at a time. 0 (the default): half the device memory
-   * free when the run starts, a quarter of the machine's on the CPU. What is held against it is GetResidentBytes(),
-   * all that grows with the image on that route: the maps, the control grid and Adam's state, and the graph of an
-   * iteration over the whole grid. GetResidentFeatures() tells which route a run took. The memory is read once,
-   * when the run starts: what another process takes of the device afterwards is not seen, and the resident route
-   * can then run out of it. */
+  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there.
+   * When the graph of an iteration over the whole grid fits it besides, every iteration compares them whole (the
+   * dense run on the pooled maps); when only the maps, the control grid and Adam's state fit, with a box's step
+   * beside them, every iteration steps the grid a brick at a time on them, the bricks within what the budget leaves;
+   * past it they stay in mapped files and every iteration brings them to the device a brick at a time. 0 (the
+   * default): half the device memory free when the run starts, a quarter of the machine's on the CPU. What is held
+   * against it is GetResidentBytes(), all that grows with the image on the route taken. GetResidentFeatures() tells
+   * whether the maps stayed resident. The memory is read once, when the run starts: what another process takes of
+   * the device afterwards is not seen, and the resident route can then run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);
