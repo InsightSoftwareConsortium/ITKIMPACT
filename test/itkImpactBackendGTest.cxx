@@ -3720,6 +3720,46 @@ TEST(ImpactTorchAdam, DownsampledFeatureLayers)
     EXPECT_LT(err[d], 0.6) << "downsampled-feature axis " << d << " displacement off (coarse features)";
 }
 
+// Jacobian mode pools the moving features over each loss cell's voxels, as it pools the fixed ones: an image
+// registered to itself on a control grid of half the resolution keeps its zero field, and the first value, at the
+// zero field, is Static mode's.
+TEST(ImpactTorchAdam, JacobianPoolsTheMovingFeaturesAsTheFixedOnes)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  const auto fixed = MakeTorchAdamPattern(20, 0, 0, 0, spacing, identity);
+  auto       run = [&](const ImageType * moving, const char * mode, unsigned int iterations) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false));
+    filter->SetDistance({ "L2", "L2" });
+    filter->SetMode(mode);
+    filter->SetGridShrinkFactor(2);
+    filter->NormalizeLossesOff();
+    filter->SetEpsilon(1.0); // a step in proportion to the gradient: float round-off moves nothing
+    filter->SetLearningRate(0.5);
+    filter->SetNumberOfIterations(iterations);
+    filter->Update();
+    return filter;
+  };
+  const auto                                                 itself = run(fixed, "Jacobian", 10);
+  double                                                     largest = 0.0;
+  itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(
+    itself->GetDisplacementField(), itself->GetDisplacementField()->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    for (unsigned int d = 0; d < 3; ++d)
+      largest = std::max(largest, static_cast<double>(std::abs(it.Get()[d])));
+  EXPECT_LT(largest, 1e-4) << "an image registered to itself moved by " << largest << " mm";
+  const auto   moving = MakeTorchAdamPattern(20, 1.5, -2.0, 1.0, spacing, identity);
+  const double jacobian = run(moving, "Jacobian", 1)->GetMetricValuesPerIteration().front();
+  const double frozen = run(moving, "Static", 1)->GetMetricValuesPerIteration().front();
+  EXPECT_NEAR(jacobian, frozen, 1e-5 * frozen);
+}
+
 // The low-resolution control grid (GridShrinkFactor>1) optimizes the field on a coarser grid
 // and trilinearly upsamples it each iteration; a known translation must still be recovered (a
 // constant field is representable at any control-grid resolution), validating the upsample +

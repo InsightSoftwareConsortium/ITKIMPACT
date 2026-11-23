@@ -557,8 +557,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // so it cannot give each point a random plane of its own as the metric does; turning the volume by a random rotation
   // spent 22 to 57 % of the network's work on corners brought in from outside the image (measured in FireANTs),
   // while one axis of the image costs one sweep and shows the network the anatomy in every orientation over the
-  // iterations. A full-dimension model may downsample every axis, so its features are compared whole and aligned by
-  // resampling, like the itkv4 metric.
+  // iterations. A full-dimension model may downsample every axis, so its features are compared whole, both sides
+  // pooled to the loss grid.
   const bool jacSliced = jacobianMode && !sampled && !m_FixedModelsConfiguration.empty() &&
                          m_FixedModelsConfiguration[0].GetDimension() < ImageDimension;
   // The moving mask as floats at full resolution, which the modes warping it there need.
@@ -923,8 +923,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       else
       {
         // Online mode: precompute the fixed features on the comparison grid. The moving features are
-        // re-extracted from the warped image every iteration in the Adam loop and brought to this same
-        // grid by resampling, so movingLayers / layerBaseGrid (the frozen-warp machinery) are unused here.
+        // re-extracted from the warped image every iteration in the Adam loop and pooled to this same
+        // grid, so movingLayers / layerBaseGrid (the frozen-warp machinery) are unused here.
         fixedLayersOnline.resize(fixedLayers.size());
         for (size_t l = 0; l < fixedLayers.size(); ++l)
         {
@@ -1075,9 +1075,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       // "Jacobian" (online) mode: warp the moving IMAGE by the current field and RE-EXTRACT features
       // through the network with autograd, descending on the true loss F(warp(I)) whose gradient carries
       // the network term d(feature)/d(displacement). A model whose features downsample every axis
-      // (full-dimension) is compared whole, its features matched to the fixed ones by RESAMPLING, like the
-      // itkv4 metric; a sliced model (features keep the swept axis) is taken in chunks of slices along the
-      // axis drawn for this iteration, to bound peak memory.
+      // (full-dimension) is compared whole, its features pooled to the loss grid as the fixed ones; a sliced
+      // model (features keep the swept axis) is taken in chunks of slices along the axis drawn for this
+      // iteration, to bound peak memory.
       if (sampledJacobian)
       {
         // elastix's Jacobian scheme on the dense field. The points of this iteration: that share of the fixed voxels,
@@ -1482,8 +1482,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       }
       else
       {
-        // Full-dimension model: warp the whole moving image, re-extract its features, and resample each
-        // layer to the fixed layer's loss-grid resolution before comparing (a single backward pass).
+        // Full-dimension model: warp the whole moving image, re-extract its features, and pool each layer to the
+        // loss grid as the fixed one is pooled, so that a cell compares the same voxels on both sides (a single
+        // backward pass).
         torch::Tensor              movingWarped = F::grid_sample(movingT, gridFromControl(theta), sampleOpts);
         std::vector<torch::Tensor> ml =
           Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingWarped, device, {}, true, fixedSpacing);
@@ -1495,17 +1496,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           {
             mll = Impact::PcaTransform(mll.squeeze(0), pcaBasis[l]).unsqueeze(0);
           }
-          const std::vector<int64_t> tgt(fixedLayersOnline[l].sizes().begin() + 2, fixedLayersOnline[l].sizes().end());
-          const std::vector<int64_t> cur(mll.sizes().begin() + 2, mll.sizes().end());
-          if (cur != tgt)
-          {
-            if constexpr (ImageDimension == 3)
-              mll =
-                F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kTrilinear).align_corners(true));
-            else
-              mll =
-                F::interpolate(mll, F::InterpolateFuncOptions().size(tgt).mode(torch::kBilinear).align_corners(true));
-          }
+          mll = poolLayerToLoss(mll);
           torch::Tensor counted;
           if (masked)
           {
