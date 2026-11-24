@@ -131,7 +131,7 @@ CoarseCutMask(const ImageType * image)
     size[a] = (image->GetLargestPossibleRegion().GetSize()[a] + 1) / 2;
   }
   mask->SetRegions(size);
-  mask->SetSpacing(2.0);
+  mask->SetSpacing(MaskType::SpacingType(2.0));
   ImageType::PointType origin = image->GetOrigin();
   for (unsigned int a = 0; a < 3; ++a)
   {
