@@ -3825,7 +3825,8 @@ TEST(ImpactTorchAdam, JacobianPoolsTheMovingFeaturesAsTheFixedOnes)
 
 // The dense Jacobian mode with a moving model whose layer is coarser than the fixed one's (an average pooling of two
 // voxels against the image's normalised intensities), on a control grid of the image's resolution: the moving layer is
-// pooled to the fixed one's grid, as the runs by regions pool both to the cells, and the two routes give one field.
+// pooled to the fixed one's grid, as the runs by regions pool a layer to the cells, and the field moves. (By regions,
+// a layer coarser than the cells is refused.)
 TEST(ImpactTorchAdam, JacobianComparesAMovingLayerOfAnotherStride)
 {
   ImageType::SpacingType spacing;
@@ -3839,7 +3840,7 @@ TEST(ImpactTorchAdam, JacobianComparesAMovingLayerOfAnotherStride)
     return std::vector<itk::ImpactModelConfiguration>{ itk::ImpactModelConfiguration(
       data + name, 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false) };
   };
-  auto run = [&](unsigned int regionSize) {
+  auto run = [&]() {
     auto filter = TorchAdamFilterType::New();
     filter->SetFixedImage(fixed);
     filter->SetMovingImage(moving);
@@ -3851,26 +3852,21 @@ TEST(ImpactTorchAdam, JacobianComparesAMovingLayerOfAnotherStride)
     filter->SetEpsilon(1.0); // a step in proportion to the gradient: float round-off moves nothing
     filter->SetLearningRate(0.5);
     filter->SetNumberOfIterations(4);
-    filter->SetRegionSize(regionSize);
-    filter->SetRegionHalo(2);
     filter->Update();
     return filter;
   };
-  TorchAdamFilterType::Pointer whole, byRegions;
-  ASSERT_NO_THROW(whole = run(0));
-  ASSERT_NO_THROW(byRegions = run(8));
-  double                                                     largest = 0.0, moved = 0.0;
+  TorchAdamFilterType::Pointer whole;
+  ASSERT_NO_THROW(whole = run());
+  double                                                     moved = 0.0;
   itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(whole->GetOutput(),
                                                                 whole->GetOutput()->GetLargestPossibleRegion());
   for (it.GoToBegin(); !it.IsAtEnd(); ++it)
     for (unsigned int d = 0; d < 3; ++d)
     {
-      largest = std::max(
-        largest, static_cast<double>(std::abs(it.Get()[d] - byRegions->GetOutput()->GetPixel(it.GetIndex())[d])));
+      ASSERT_TRUE(std::isfinite(it.Get()[d]));
       moved = std::max(moved, static_cast<double>(std::abs(it.Get()[d])));
     }
   EXPECT_GT(moved, 1e-3);
-  EXPECT_LT(largest, 1e-5) << "by regions, the field differs from the whole-image run's by " << largest << " mm";
 }
 
 // The low-resolution control grid (GridShrinkFactor>1) optimizes the field on a coarser grid
