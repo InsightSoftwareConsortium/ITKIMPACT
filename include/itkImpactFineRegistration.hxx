@@ -1731,6 +1731,78 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const std::vector<Impact::CellBox> boxes = Impact::TileCells(cells, perBox);
   // A model's receptive field is in its input's voxels, on every axis whatever their spacing.
   const std::vector<int64_t> halo(Dim, static_cast<int64_t>(m_RegionHalo));
+  // A model that resamples the image to its voxel size (ResampleToVoxelSize) sees it on a grid of its own,
+  // `featureSpatial` samples along each tensor axis, the corners aligned, and its layers are pooled to the cells over
+  // that grid's adaptive windows (`featureWindows`), as the whole-image run pools them; the models of the image's
+  // dimension all see one grid. Without a voxel size, the image's grid and the cells' windows.
+  std::vector<int64_t>             featureSpatial = spatial;
+  std::vector<Impact::PoolWindows> featureWindows = windows;
+  bool                             resamples = false;
+  if (featureMode && !sampledJacobian)
+  {
+    bool sized = false;
+    for (const auto * configs : { &m_FixedModelsConfiguration, &m_MovingModelsConfiguration })
+    {
+      for (const ImpactModelConfiguration & config : *configs)
+      {
+        if (config.GetDimension() != Dim)
+        {
+          continue;
+        }
+        std::vector<int64_t>       grid = spatial;
+        const std::vector<float> & voxel = config.GetVoxelSize();
+        for (unsigned int d = 0; voxel.size() == Dim && d < Dim; ++d)
+        {
+          grid[d] = voxel[Dim - 1 - d] > 0.0f
+                      ? std::max<int64_t>(1,
+                                          std::llround(static_cast<double>(spatial[d] - 1) * fixedSpacing[Dim - 1 - d] /
+                                                       voxel[Dim - 1 - d]) +
+                                            1)
+                      : spatial[d];
+        }
+        if (std::any_of(voxel.begin(), voxel.end(), [](float v) { return !(v > 0.0f); }))
+        {
+          grid = spatial; // a voxel size not set on every axis resamples nothing
+        }
+        if (sized && grid != featureSpatial)
+        {
+          itkExceptionMacro("ImpactFineRegistration: with RegionSize every model of the image's dimension sees the "
+                            "image on one grid; give them the same voxel size.");
+        }
+        featureSpatial = grid;
+        sized = true;
+      }
+    }
+    resamples = featureSpatial != spatial;
+    for (unsigned int d = 0; resamples && d < Dim; ++d)
+    {
+      if (featureSpatial[d] < cells[d])
+      {
+        itkExceptionMacro("ImpactFineRegistration: the voxel size gives the models a grid of "
+                          << featureSpatial[d] << " samples along an axis of " << cells[d]
+                          << " control cells; with RegionSize their layers must be no coarser than the cells.");
+      }
+      featureWindows[d] = Impact::PoolWindows{};
+      for (int64_t c = 0; c < cells[d]; ++c)
+      {
+        featureWindows[d].starts.push_back(c * featureSpatial[d] / cells[d]);
+        featureWindows[d].ends.push_back(((c + 1) * featureSpatial[d] + cells[d] - 1) / cells[d]);
+      }
+    }
+  }
+  // Along tensor axis d, the voxels [v0, v1) of the image the samples [s0, s1) of the models' grid are interpolated
+  // from: the same without a voxel size.
+  auto voxelsOf = [&](unsigned int d, int64_t s0, int64_t s1) -> std::pair<int64_t, int64_t> {
+    if (!resamples)
+    {
+      return { s0, s1 };
+    }
+    return {
+      static_cast<int64_t>(std::floor(Impact::ResizeSource(spatial[d], featureSpatial[d], s0, true))),
+      std::min(spatial[d],
+               static_cast<int64_t>(std::floor(Impact::ResizeSource(spatial[d], featureSpatial[d], s1 - 1, true))) + 2)
+    };
+  };
   // The cells' positions, {1, Dim, n...}, for the cells [c0, c1).
   auto cellPositions = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<torch::Tensor> axes;
@@ -2017,12 +2089,24 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                                        : Impact::RegionModelRun::Maps;
     // PCA is fitted by regions in Static mode (below).
     const std::vector<unsigned int> refusedPca = jacobian ? m_PCA : std::vector<unsigned int>{};
-    const Impact::RegionModels      models = Impact::CheckRegionModels(
-      m_FixedModelsConfiguration, m_FixedImage->GetSpacing(), Dim, refusedPca, "ImpactFineRegistration", run);
-    const size_t layerCount = models.layerCount;
+    // The maps' models may resample the image to their voxel size (`featureSpatial`, above).
+    const bool                 resampling = run == Impact::RegionModelRun::Maps;
+    const Impact::RegionModels models = Impact::CheckRegionModels(m_FixedModelsConfiguration,
+                                                                  m_FixedImage->GetSpacing(),
+                                                                  Dim,
+                                                                  refusedPca,
+                                                                  "ImpactFineRegistration",
+                                                                  run,
+                                                                  resampling);
+    const size_t               layerCount = models.layerCount;
     // The moving models of their own are held to the same: the moving image reaches them on the fixed grid.
-    const Impact::RegionModels movingModels = Impact::CheckRegionModels(
-      m_MovingModelsConfiguration, m_FixedImage->GetSpacing(), Dim, refusedPca, "ImpactFineRegistration", run);
+    const Impact::RegionModels movingModels = Impact::CheckRegionModels(m_MovingModelsConfiguration,
+                                                                        m_FixedImage->GetSpacing(),
+                                                                        Dim,
+                                                                        refusedPca,
+                                                                        "ImpactFineRegistration",
+                                                                        run,
+                                                                        resampling);
     takesMetadata = models.takesMetadata || movingModels.takesMetadata;
     for (size_t l = 0; l < layerCount; ++l)
     {
@@ -2102,10 +2186,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                      withGrad,
                                      axis);
   };
-  std::vector<int64_t> cellVoxels(Dim);
+  std::vector<int64_t> cellVoxels(Dim),
+    featureCellVoxels(Dim); // a cell's voxels, and its widest window on the models' grid
   for (unsigned int d = 0; d < Dim; ++d)
   {
     cellVoxels[d] = windows[d].ends[0] - windows[d].starts[0];
+    for (int64_t c = 0; c < cells[d]; ++c)
+    {
+      featureCellVoxels[d] = std::max(featureCellVoxels[d], featureWindows[d].ends[c] - featureWindows[d].starts[c]);
+    }
   }
   // Where the models' layers lie on the image, probed once, and once for each axis a swept model sweeps; the sampled
   // Jacobian mode reads no map.
@@ -2114,7 +2203,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     latticeSets.push_back(Impact::ProbeRegionLattices<Dim>(
       halo,
-      cellVoxels,
+      featureCellVoxels,
       device,
       !m_MovingModelsConfiguration.empty(),
       [&](const torch::Tensor & image, bool moving) { return layersOf(image, moving, false, axis); },
@@ -2142,6 +2231,52 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       return span;
     };
+  // The image a model runs on for the features of the cells [c0, c1), from `read` (a region of the fixed grid to its
+  // {1, 1, region...}): featureSpan's region, with `toEnd` to the image's end along an axis the cells end at; with a
+  // voxel size, the samples of the models' grid the cells' layers read, resampled as ResampleToVoxelSize resamples
+  // the whole image (ResizeRegion, the corners aligned) from the region of the image they lie in. `lowPad` is where
+  // the cells' samples start in it.
+  auto featureInput = [&](const std::vector<int64_t> & c0,
+                          const std::vector<int64_t> & c1,
+                          std::vector<int64_t> &       lowPad,
+                          int                          axis,
+                          auto &&                      read,
+                          bool                         toEnd = false) -> torch::Tensor {
+    if (!resamples)
+    {
+      RegionType span = featureSpan(c0, c1, lowPad, axis);
+      for (unsigned int d = 0; toEnd && d < Dim; ++d)
+      {
+        const unsigned int a = Dim - 1 - d;
+        if (c1[d] == cells[d])
+        {
+          span.SetSize(a,
+                       static_cast<SizeValueType>(fixedRegion.GetIndex()[a] +
+                                                  static_cast<IndexValueType>(fixedRegion.GetSize()[a]) -
+                                                  span.GetIndex()[a]));
+        }
+      }
+      return read(span);
+    }
+    const Impact::RegionLattices & on = latticesAlong(axis);
+    typename RegionType::IndexType first;
+    first.Fill(0);
+    const RegionType samples =
+      Impact::CellSpan<RegionType>(c0, c1, on.reach, featureWindows, featureSpatial, first, lowPad, on.align);
+    std::vector<int64_t> s0(Dim), s1(Dim), v0(Dim);
+    RegionType           span;
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      const unsigned int a = Dim - 1 - d;
+      s0[d] = samples.GetIndex()[a];
+      s1[d] = toEnd && c1[d] == cells[d] ? featureSpatial[d] : s0[d] + static_cast<int64_t>(samples.GetSize()[a]);
+      const auto [low, high] = voxelsOf(d, s0[d], s1[d]);
+      v0[d] = low;
+      span.SetIndex(a, fixedRegion.GetIndex()[a] + static_cast<IndexValueType>(low));
+      span.SetSize(a, static_cast<SizeValueType>(high - low));
+    }
+    return Impact::ResizeRegion<Dim>(read(span), v0, spatial, featureSpatial, s0, s1, "ImpactFineRegistration", true);
+  };
   auto pooledToCells = [&](std::vector<torch::Tensor> &              layers,
                            const std::vector<Impact::LayerLattice> & on,
                            const std::vector<int64_t> &              lowPad,
@@ -2150,7 +2285,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                            int64_t                                   keep = -1) {
     for (size_t l = 0; l < layers.size(); ++l)
     {
-      layers[l] = toCells(layers[l], on[l], lowPad, c0, c1, keep);
+      layers[l] = Impact::PoolLayerToCells<Dim>(
+        layers[l], on[l], lowPad, c0, c1, featureWindows, featureSpatial, "ImpactFineRegistration", keep);
     }
   };
   // PCA in Static mode: each layer's basis, and the mean each image's features are centred by before they are
@@ -2169,7 +2305,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // voxels along it kept.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1, int axis = -1) {
     std::vector<int64_t>       lowPad(Dim);
-    std::vector<torch::Tensor> layers = layersOf(readFixed(featureSpan(c0, c1, lowPad, axis)), false, false, axis);
+    std::vector<torch::Tensor> layers = layersOf(featureInput(c0, c1, lowPad, axis, readFixed), false, false, axis);
     pooledToCells(layers, latticesAlong(axis).fixed, lowPad, c0, c1, keepOf(axis));
     reduced(layers, fixedPcaMean);
     return layers;
@@ -2181,10 +2317,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                           const torch::Tensor &        smoothed,
                           const std::vector<int64_t> & origin,
                           int                          axis) {
-    std::vector<int64_t>       lowPad(Dim);
-    const RegionType           span = featureSpan(c0, c1, lowPad, axis);
-    std::vector<torch::Tensor> layers =
-      layersOf(warpedOn(readMovingImage, span, smoothed, origin), true, torch::GradMode::is_enabled(), axis);
+    std::vector<int64_t> lowPad(Dim);
+    const torch::Tensor  image = featureInput(
+      c0, c1, lowPad, axis, [&](const RegionType & span) { return warpedOn(readMovingImage, span, smoothed, origin); });
+    std::vector<torch::Tensor> layers = layersOf(image, true, torch::GradMode::is_enabled(), axis);
     pooledToCells(layers, latticesAlong(axis).moving, lowPad, c0, c1, keepOf(axis));
     return layers;
   };
@@ -2205,7 +2341,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto pooledMoving = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) -> PooledMoving {
     std::vector<int64_t> lowPad(Dim);
     PooledMoving         pooled;
-    pooled.layers = layersOf(movingOnFixed(featureSpan(c0, c1, lowPad, -1), false), true);
+    pooled.layers = layersOf(
+      featureInput(c0, c1, lowPad, -1, [&](const RegionType & span) { return movingOnFixed(span, false); }), true);
     pooledToCells(pooled.layers, latticesAlong(-1).moving, lowPad, c0, c1);
     reduced(pooled.layers, movingPcaMean);
     if (m_MovingMask.IsNotNull())
@@ -2318,27 +2455,16 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // grid, {C, n} per layer in double precision: the samples of their voxels, the voxels past the last cell along an
   // axis with the last box, so that the boxes share out every sample of the whole layer.
   auto ownLayers = [&](const Impact::CellBox & box, bool moving, auto && read) {
-    std::vector<int64_t> lowPad(Dim);
-    RegionType           span = featureSpan(box.cell0, box.cell1, lowPad, -1);
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      const unsigned int a = Dim - 1 - d;
-      if (box.cell1[d] == cells[d])
-      {
-        span.SetSize(a,
-                     static_cast<SizeValueType>(fixedRegion.GetIndex()[a] +
-                                                static_cast<IndexValueType>(fixedRegion.GetSize()[a]) -
-                                                span.GetIndex()[a]));
-      }
-    }
-    std::vector<torch::Tensor>                layers = layersOf(read(span), moving);
+    std::vector<int64_t>       lowPad(Dim);
+    std::vector<torch::Tensor> layers = layersOf(featureInput(box.cell0, box.cell1, lowPad, -1, read, true), moving);
     const std::vector<Impact::LayerLattice> & on = moving ? latticesAlong(-1).moving : latticesAlong(-1).fixed;
     for (size_t l = 0; l < layers.size(); ++l)
     {
       const int64_t channel = layers[l].size(1);
-      layers[l] = Impact::OwnLayerSamples<Dim>(layers[l], on[l], lowPad, box.cell0, box.cell1, windows, spatial)
-                    .reshape({ channel, -1 })
-                    .to(torch::kFloat64);
+      layers[l] =
+        Impact::OwnLayerSamples<Dim>(layers[l], on[l], lowPad, box.cell0, box.cell1, featureWindows, featureSpatial)
+          .reshape({ channel, -1 })
+          .to(torch::kFloat64);
     }
     return layers;
   };
@@ -2520,10 +2646,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     for (int64_t c = 0; c < cells[d]; ++c)
     {
-      const int64_t margin = std::max<int64_t>(0, windows[d].starts[c] - spanExtra[d]);
-      // The voxels past the last cell go with it, a swept axis's or a drawn point's.
-      const int64_t high = std::min(spatial[d], (c == cells[d] - 1 ? spatial[d] : windows[d].ends[c]) + spanExtra[d]);
-      fieldReach = std::max({ fieldReach, c - cellOf(margin - margin % spanAlign), cellOf(high - 1) + 1 - c });
+      // The samples of the models' grid a cell's features read (with a voxel size, the voxels those are resampled
+      // from); the voxels past the last cell go with it, a swept axis's or a drawn point's.
+      const int64_t margin = std::max<int64_t>(0, featureWindows[d].starts[c] - spanExtra[d]);
+      const int64_t high =
+        std::min(featureSpatial[d], (c == cells[d] - 1 ? featureSpatial[d] : featureWindows[d].ends[c]) + spanExtra[d]);
+      const auto [low, end] = voxelsOf(d, margin - margin % spanAlign, high);
+      fieldReach = std::max({ fieldReach, c - cellOf(low), cellOf(end - 1) + 1 - c });
     }
   }
   // What a unit's step reads around it: the field its cells and a spatial distance's halo read, in Static mode the
@@ -2585,9 +2714,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     double spanVoxels = 1.0;
     for (unsigned int d = 0; d < Dim; ++d)
     {
-      spanVoxels *= static_cast<double>(std::min(
-        spatial[d],
-        std::min(cells[d], boxesASide * perBox[d] + 2 * (partReach + lossHalo)) * cellVoxels[d] + 2 * spanExtra[d]));
+      spanVoxels *= static_cast<double>(
+        std::min(featureSpatial[d],
+                 std::min(cells[d], boxesASide * perBox[d] + 2 * (partReach + lossHalo)) * featureCellVoxels[d] +
+                   2 * spanExtra[d]));
     }
     return 4.0 * (static_cast<double>(Dim * (6 + m_ControlGridSmoothingIterations)) *
                     brickCells(boxesASide, partReach + reach) +

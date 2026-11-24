@@ -276,8 +276,11 @@ public:
    * image's resolution (MIND) or a power of two coarser, no coarser than the control cells (a region then starts on the
    * layer's lattice). PCA in Static mode: each layer's basis fitted on the fixed features of every voxel from their
    * sums gathered by one more pass over the boxes, each image's maps centred by its own features' mean and projected on
-   * it as they are pooled; in the Jacobian mode it is refused, as a model that resamples the image is, save on the
-   * patches of the sampled Jacobian mode. FeatureMapUpdateInterval pools the moving maps again, a box at a time, from
+   * it as they are pooled; in the Jacobian mode it is refused. A model that resamples the image to its voxel size runs
+   * on its own grid: a box's samples of it, those its cells' layers read, resampled from the image's region they lie in
+   * as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's windows
+   * as the whole-image run pools them; every model of the image's dimension on one grid, no coarser than the cells.
+   * FeatureMapUpdateInterval pools the moving maps again, a box at a time, from
    * the moving image the field warps (with PCA, after a pass that takes their new mean). The Jacobian mode keeps the
    * fixed features pooled to the cells, as Static mode, and at every iteration takes each unit (a brick, or a box
    * drawn) on its own: the field interpolated at the voxels of its cells and RegionHalo around them (cut at the image),

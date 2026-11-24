@@ -483,10 +483,22 @@ OwnLayerSamples(torch::Tensor                    layer,
   return layer;
 }
 
-/** What F::interpolate, linear along every axis (align_corners false), gives at the samples [o0, o1) of a whole map
- * of `inputSize` samples resized to `outputSize`, computed from `piece` ({1, C, piece...}), the samples of the whole
- * map from `first` on: torch's source index and weights, in single precision, so that the piece reads what the whole
- * map resized holds there. An axis the resizing leaves as it is is narrowed. */
+/** Where F::interpolate, linear, reads output sample `o` of an axis of `in` samples resized to `out`, with
+ * `alignCorners` as torch takes it: torch's source index, in single precision. */
+inline float
+ResizeSource(int64_t in, int64_t out, int64_t o, bool alignCorners)
+{
+  if (alignCorners)
+  {
+    return (out > 1 ? static_cast<float>(in - 1) / static_cast<float>(out - 1) : 0.0f) * static_cast<float>(o);
+  }
+  return std::max(static_cast<float>(in) / static_cast<float>(out) * (static_cast<float>(o) + 0.5f) - 0.5f, 0.0f);
+}
+
+/** What F::interpolate, linear along every axis (align_corners `alignCorners`), gives at the samples [o0, o1) of a
+ * whole map of `inputSize` samples resized to `outputSize`, computed from `piece` ({1, C, piece...}), the samples of
+ * the whole map from `first` on: torch's source index and weights, in single precision, so that the piece reads what
+ * the whole map resized holds there. An axis the resizing leaves as it is is narrowed. */
 template <unsigned int Dim>
 torch::Tensor
 ResizeRegion(torch::Tensor                piece,
@@ -495,7 +507,8 @@ ResizeRegion(torch::Tensor                piece,
              const std::vector<int64_t> & outputSize,
              const std::vector<int64_t> & o0,
              const std::vector<int64_t> & o1,
-             const char *                 who)
+             const char *                 who,
+             bool                         alignCorners = false)
 {
   for (unsigned int d = 0; d < Dim; ++d)
   {
@@ -506,12 +519,11 @@ ResizeRegion(torch::Tensor                piece,
       piece = piece.narrow(axis, o0[d] - first[d], o1[d] - o0[d]);
       continue;
     }
-    const float          scale = static_cast<float>(in) / static_cast<float>(outputSize[d]);
     std::vector<int64_t> below, above;
     std::vector<float>   share;
     for (int64_t o = o0[d]; o < o1[d]; ++o)
     {
-      const float   source = std::max(scale * (static_cast<float>(o) + 0.5f) - 0.5f, 0.0f);
+      const float   source = ResizeSource(in, outputSize[d], o, alignCorners);
       const int64_t lower = std::min(static_cast<int64_t>(std::floor(source)), in - 1);
       const int64_t upper = lower + (lower < in - 1 ? 1 : 0);
       if (lower < first[d] || upper - first[d] >= piece.size(axis))
@@ -574,10 +586,10 @@ enum class RegionModelRun
 };
 
 /** What the feature models of a region-sampled run must be: without PCA (`pca`, the components kept per layer), and
- * on maps run at the image's resolution (no voxel size of their own, whose lattice a region does not line up with),
- * of the image's dimension, one fewer swept; on patches, with a patch of their receptive field (a strictly positive
- * PatchSize), of the image's dimension or 2D in a volume. The kept layers over the models, and whether one reads the
- * image's statistics. */
+ * on maps run at the image's resolution (no voxel size of their own, whose lattice a region does not line up with,
+ * unless the caller `resamples` the regions itself), of the image's dimension, one fewer swept; on patches, with a
+ * patch of their receptive field (a strictly positive PatchSize), of the image's dimension or 2D in a volume. The kept
+ * layers over the models, and whether one reads the image's statistics. */
 struct RegionModels
 {
   size_t layerCount{ 0 };
@@ -591,7 +603,8 @@ CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
                   unsigned int                                  dim,
                   const std::vector<unsigned int> &             pca,
                   const char *                                  who,
-                  RegionModelRun                                run = RegionModelRun::Maps)
+                  RegionModelRun                                run = RegionModelRun::Maps,
+                  bool                                          resamples = false)
 {
   if (std::any_of(pca.begin(), pca.end(), [](unsigned int components) { return components > 0; }))
   {
@@ -624,7 +637,7 @@ CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
     else
     {
       const std::vector<float> & voxel = config.GetVoxelSize();
-      for (unsigned int a = 0; a < dim && voxel.size() == dim; ++a)
+      for (unsigned int a = 0; a < dim && voxel.size() == dim && !resamples; ++a)
       {
         if (voxel[a] > 0.0f && std::abs(voxel[a] - spacing[a]) > 1e-6 * spacing[a])
         {
