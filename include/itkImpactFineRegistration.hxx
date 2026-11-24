@@ -3480,8 +3480,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // The sampled Jacobian mode's draws of an iteration, as the whole-image run draws them (flat voxel numbers, ITK x
     // fastest), and grouped by the unit their voxel's cell lies in, the voxels past the last cell with it: unit u's are
     // [drawnStart[u], drawnStart[u + 1]) of `drawnByUnit`.
-    // ponytail: an iteration's draws are held whole, 24 bytes a point at most, as the whole-image run holds them; a
-    // generator per unit if they outgrow the host's memory, which gives up drawing what the whole-image run draws.
+    // ponytail: an iteration's draws are held whole, as the whole-image run holds them: 16 bytes a draw, 48 while they
+    // are grouped (measured); a generator per unit if they outgrow the host's memory, which gives up drawing what the
+    // whole-image run draws.
     torch::Tensor        draws, drawnByUnit;
     std::vector<int64_t> drawnStart;
     // The cell, along each tensor axis, of every voxel `flat` numbers ({n}, ITK x fastest): {n, Dim}, and the voxels'
@@ -3500,15 +3501,25 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       return of;
     };
     auto groupDraws = [&] {
-      torch::Tensor       indices;
-      const torch::Tensor of = cellsOfDraws(draws, indices);
-      torch::Tensor       unit = torch::zeros({ draws.size(0) }, torch::kLong);
-      for (unsigned int d = 0; d < Dim; ++d)
+      // Each draw's unit, from its cell along each axis as cellsOfDraws takes it, an axis at a time.
+      torch::Tensor unit = torch::zeros({ draws.size(0) }, torch::kLong);
+      int64_t       stride = 1, weight = 1;
+      for (unsigned int a = 0; a < Dim; ++a)
       {
-        unit = unit * unitsAlong[d] + of.select(1, d).div(perUnit[d], "trunc");
+        const unsigned int d = Dim - 1 - a;
+        unit.add_(draws.div(stride, "trunc")
+                    .remainder_(spatial[d])
+                    .div_(cellVoxels[d], "trunc")
+                    .clamp_max_(cells[d] - 1)
+                    .div_(perUnit[d], "trunc"),
+                  weight);
+        stride *= spatial[d];
+        weight *= unitsAlong[d];
       }
-      drawnByUnit = draws.index_select(0, std::get<1>(unit.sort(/*stable=*/true, /*dim=*/0, /*descending=*/false)));
       const torch::Tensor counts = torch::bincount(unit, {}, static_cast<int64_t>(units.size()));
+      const torch::Tensor order = torch::argsort(unit, /*stable=*/true, /*dim=*/0);
+      unit.reset();
+      drawnByUnit = draws.index_select(0, order);
       drawnStart.assign(1, 0);
       for (int64_t u = 0; u < counts.size(0); ++u)
       {
