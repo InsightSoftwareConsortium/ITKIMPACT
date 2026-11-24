@@ -170,6 +170,83 @@ MaxDifference(const FieldType * a, const FieldType * b, const FieldType::RegionT
   }
   return largest;
 }
+
+// A run by regions of 16 voxels with `halo` voxels around them, stepping every cell at every iteration or, with
+// `regionsPerIteration`, the boxes it draws; with `mapped`, nothing resident and by bricks of one box, from files
+// mapped in `scratch`.
+void
+ByRegions(FineType *          fine,
+          unsigned int        halo,
+          unsigned int        regionsPerIteration,
+          bool                mapped,
+          const std::string & scratch)
+{
+  fine->SetRegionSize(16);
+  fine->SetRegionHalo(halo);
+  fine->SetRegionsPerIteration(regionsPerIteration);
+  if (mapped)
+  {
+    fine->SetResidentFeatureBudget(1);
+    fine->SetBrickBytes(1);
+    fine->SetScratchDirectory(scratch);
+  }
+}
+
+// The model `model` of `dimension` axes, on the patch of `patch` voxels a side around each point (0: on maps), at the
+// voxel size `voxel` (0: the image's), its two layers compared by `distance` and weighed alike.
+void
+AddModel(FineType *                       fine,
+         const char *                     model,
+         unsigned int                     dimension = 3,
+         const std::vector<std::string> & distance = { "L2", "L2" },
+         unsigned int                     patch = 0,
+         float                            voxel = 0.f)
+{
+  fine->AddModelConfiguration(itk::ImpactModelConfiguration(model,
+                                                            dimension,
+                                                            1,
+                                                            std::vector<unsigned int>(dimension, patch),
+                                                            { voxel, voxel, voxel },
+                                                            std::vector<unsigned int>(dimension, 0),
+                                                            { true, true },
+                                                            false));
+  fine->SetDistance(distance);
+  fine->SetLayersWeight({ 1.f, 1.f });
+}
+
+// How far the runs by regions `run(true, mapped, regionsPerIteration)` are from `whole`: on the resident maps, by
+// bricks of one box from mapped files and, with `drawn`, with every box drawn at every iteration. Their fields, and
+// their losses at every iteration relative to the whole run's (but the drawn boxes', which record theirs scaled).
+struct Distances
+{
+  double field{ 0.0 };
+  double loss{ 0.0 };
+};
+template <typename TRun>
+Distances
+CompareRoutes(FineType * whole, TRun && run, bool drawn = true)
+{
+  Distances distances;
+  for (const auto & [mapped, regionsPerIteration] :
+       { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+  {
+    if (regionsPerIteration > 0 && !drawn)
+    {
+      continue;
+    }
+    const auto region = run(true, mapped, regionsPerIteration);
+    distances.field =
+      std::max(distances.field,
+               MaxDifference(whole->GetOutput(), region->GetOutput(), whole->GetOutput()->GetLargestPossibleRegion()));
+    for (size_t i = 0; regionsPerIteration == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+    {
+      const double value = whole->GetMetricValuesPerIteration()[i];
+      distances.loss =
+        std::max(distances.loss, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+    }
+  }
+  return distances;
+}
 } // namespace
 
 int
@@ -540,16 +617,12 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       fine->SetInitialDisplacementField(oddStart);
       if (withModel)
       {
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[2], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[2]);
       }
       Configure(fine, 6);
       if (byRegions)
       {
-        fine->SetRegionSize(16);
-        fine->SetRegionHalo(2);
+        ByRegions(fine, 2, 0, false, scratch);
       }
       fine->Update();
       return fine;
@@ -701,14 +774,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       fine->SetMovingMask(movingMask);
       fine->SetInitialDisplacementField(start);
       Configure(fine, 6);
-      fine->SetRegionSize(16);
-      fine->SetRegionsPerIteration(regionsPerIteration);
-      if (mapped)
-      {
-        fine->SetResidentFeatureBudget(1);
-        fine->SetBrickBytes(1);
-        fine->SetScratchDirectory(scratch);
-      }
+      ByRegions(fine, 0, regionsPerIteration, mapped, scratch);
       fine->Update();
       return fine;
     };
@@ -789,18 +855,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           }
           if (variant.model)
           {
-            const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
-            fine->AddModelConfiguration(
-              itk::ImpactModelConfiguration(variant.model,
-                                            variant.dimension,
-                                            1,
-                                            std::vector<unsigned int>(variant.dimension, patch),
-                                            { 0.f, 0.f, 0.f },
-                                            std::vector<unsigned int>(variant.dimension, 0),
-                                            { true, true },
-                                            false));
-            fine->SetDistance({ "L2", "L2" });
-            fine->SetLayersWeight({ 1.f, 1.f });
+            // On the patch of three voxels a side around each sampled point.
+            AddModel(fine, variant.model, variant.dimension, { "L2", "L2" }, variant.sampling < 1.0 ? 3 : 0);
           }
           if (variant.jacobian)
           {
@@ -810,32 +866,13 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           Configure(fine, 6);
           if (byRegions)
           {
-            fine->SetRegionSize(16);
-            fine->SetRegionHalo(1);
-            fine->SetRegionsPerIteration(regionsPerIteration);
-            if (mapped)
-            {
-              fine->SetResidentFeatureBudget(1);
-              fine->SetBrickBytes(1);
-              fine->SetScratchDirectory(scratch);
-            }
+            ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
           }
           fine->Update();
           return fine;
         };
-        const auto whole = run(false, false, 0);
-        double     difference = 0.0;
-        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-        {
-          if (route.second > 0 && (variant.dimension < 3 || variant.sampling < 1.0))
-          {
-            continue;
-          }
-          difference = std::max(difference,
-                                MaxDifference(whole->GetOutput(),
-                                              run(true, route.first, route.second)->GetOutput(),
-                                              fixed->GetLargestPossibleRegion()));
-        }
+        const auto   whole = run(false, false, 0);
+        const double difference = CompareRoutes(whole, run, variant.dimension == 3 && variant.sampling == 1.0).field;
         std::cout << "an empty band, " << variant.label << ", from " << (fromZero ? "a zero field" : "whole voxels")
                   << ", by regions against whole: max |difference| = " << difference << " mm" << std::endl;
         if (!(difference < 1e-5))
@@ -869,8 +906,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
                                      Variant{ "sampled", argv[3], 3, 0.2, false } })
     {
       auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
-        auto               fine = FineType::New();
-        const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+        auto fine = FineType::New();
         fine->SetFixedImage(fixed);
         fine->SetMovingImage(moving);
         fine->SetInitialDisplacementField(start);
@@ -878,30 +914,14 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
-                                                                  variant.dimension,
-                                                                  1,
-                                                                  std::vector<unsigned int>(variant.dimension, patch),
-                                                                  { 0.f, 0.f, 0.f },
-                                                                  std::vector<unsigned int>(variant.dimension, 0),
-                                                                  { true, true },
-                                                                  false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        // On the patch of three voxels a side around each sampled point.
+        AddModel(fine, variant.model, variant.dimension, { "L2", "L2" }, variant.sampling < 1.0 ? 3 : 0);
         fine->SetMode("Jacobian");
         fine->SetSamplingPercentage(variant.sampling);
         Configure(fine, 6);
         if (byRegions)
         {
-          fine->SetRegionSize(16);
-          fine->SetRegionHalo(1);
-          fine->SetRegionsPerIteration(regionsPerIteration);
-          if (mapped)
-          {
-            fine->SetResidentFeatureBudget(1);
-            fine->SetBrickBytes(1);
-            fine->SetScratchDirectory(scratch);
-          }
+          ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
         }
         fine->Update();
         return fine;
@@ -966,42 +986,20 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[3]);
         fine->SetFeatureMapUpdateInterval(interval);
         Configure(fine, 6);
         if (byRegions)
         {
-          fine->SetRegionSize(16);
-          fine->SetRegionHalo(1);
-          fine->SetRegionsPerIteration(regionsPerIteration);
-          if (mapped)
-          {
-            fine->SetResidentFeatureBudget(1);
-            fine->SetBrickBytes(1);
-            fine->SetScratchDirectory(scratch);
-          }
+          ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
         }
         fine->Update();
         return fine;
       };
-      const auto whole = run(false, false, 0);
-      double     fieldDifference = 0.0, lossDifference = 0.0;
-      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-      {
-        const auto region = run(true, route.first, route.second);
-        fieldDifference = std::max(
-          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-        {
-          const double value = whole->GetMetricValuesPerIteration()[i];
-          lossDifference =
-            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-        }
-      }
-      const double refreshed =
+      const auto      whole = run(false, false, 0);
+      const Distances distances = CompareRoutes(whole, run);
+      const double    fieldDifference = distances.field, lossDifference = distances.loss;
+      const double    refreshed =
         MaxDifference(whole->GetOutput(), run(false, false, 0, -1)->GetOutput(), fixed->GetLargestPossibleRegion());
       std::cout << "moving maps refreshed every two iterations" << (masked ? ", a moving mask" : "")
                 << ", by regions against whole (resident, by bricks of one box from mapped files, every box drawn): "
@@ -1054,16 +1052,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           {
             fine->SetMovingMask(movingMask);
           }
-          fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
-                                                                    variant.dimension,
-                                                                    1,
-                                                                    std::vector<unsigned int>(variant.dimension, 0),
-                                                                    { 0.f, 0.f, 0.f },
-                                                                    std::vector<unsigned int>(variant.dimension, 0),
-                                                                    { true, true },
-                                                                    false));
-          fine->SetDistance({ "LNCC", "L2" });
-          fine->SetLayersWeight({ 1.f, 1.f });
+          AddModel(fine, variant.model, variant.dimension, { "LNCC", "L2" });
           fine->SetLNCCKernel(kernel);
           if (variant.jacobian)
           {
@@ -1073,38 +1062,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           Configure(fine, 6);
           if (byRegions)
           {
-            fine->SetRegionSize(16);
-            fine->SetRegionHalo(1);
-            fine->SetRegionsPerIteration(regionsPerIteration);
-            if (mapped)
-            {
-              fine->SetResidentFeatureBudget(1);
-              fine->SetBrickBytes(1);
-              fine->SetScratchDirectory(scratch);
-            }
+            ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
           }
           fine->Update();
           return fine;
         };
-        const auto whole = run(false, false, 0);
-        double     fieldDifference = 0.0, lossDifference = 0.0;
-        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-        {
-          if (route.second > 0 && variant.dimension < 3)
-          {
-            continue;
-          }
-          const auto region = run(true, route.first, route.second);
-          fieldDifference = std::max(
-            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-          for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-          {
-            const double value = whole->GetMetricValuesPerIteration()[i];
-            lossDifference =
-              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-          }
-        }
-        const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+        const auto      whole = run(false, false, 0);
+        const Distances distances = CompareRoutes(whole, run, variant.dimension == 3);
+        const double    fieldDifference = distances.field, lossDifference = distances.loss;
+        const double    moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
         std::cout << "LNCC, " << variant.label << ", a window of " << kernel << (masked ? ", a moving mask" : "")
                   << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
                   << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
@@ -1141,8 +1107,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       for (const bool masked : { false, true })
       {
         auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
-          auto               fine = FineType::New();
-          const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+          auto fine = FineType::New();
           fine->SetFixedImage(fixed);
           fine->SetMovingImage(moving);
           fine->SetInitialDisplacementField(start);
@@ -1150,16 +1115,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           {
             fine->SetMovingMask(movingMask);
           }
-          fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
-                                                                    variant.dimension,
-                                                                    1,
-                                                                    std::vector<unsigned int>(variant.dimension, patch),
-                                                                    { 0.f, 0.f, 0.f },
-                                                                    std::vector<unsigned int>(variant.dimension, 0),
-                                                                    { true, true },
-                                                                    false));
-          fine->SetDistance({ "NCC", "OrganDice" });
-          fine->SetLayersWeight({ 1.f, 1.f });
+          // On the patch of three voxels a side around each sampled point.
+          AddModel(fine, variant.model, variant.dimension, { "NCC", "OrganDice" }, variant.sampling < 1.0 ? 3 : 0);
           fine->SetSamplingPercentage(variant.sampling);
           if (variant.jacobian)
           {
@@ -1169,38 +1126,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           Configure(fine, 6);
           if (byRegions)
           {
-            fine->SetRegionSize(16);
-            fine->SetRegionHalo(1);
-            fine->SetRegionsPerIteration(regionsPerIteration);
-            if (mapped)
-            {
-              fine->SetResidentFeatureBudget(1);
-              fine->SetBrickBytes(1);
-              fine->SetScratchDirectory(scratch);
-            }
+            ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
           }
           fine->Update();
           return fine;
         };
-        const auto whole = run(false, false, 0);
-        double     fieldDifference = 0.0, lossDifference = 0.0;
-        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-        {
-          if (route.second > 0 && (variant.dimension < 3 || variant.sampling < 1.0))
-          {
-            continue;
-          }
-          const auto region = run(true, route.first, route.second);
-          fieldDifference = std::max(
-            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-          for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-          {
-            const double value = whole->GetMetricValuesPerIteration()[i];
-            lossDifference =
-              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-          }
-        }
-        const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+        const auto      whole = run(false, false, 0);
+        const Distances distances = CompareRoutes(whole, run, variant.dimension == 3 && variant.sampling == 1.0);
+        const double    fieldDifference = distances.field, lossDifference = distances.loss;
+        const double    moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
         std::cout << "NCC and OrganDice, " << variant.label << (masked ? ", a moving mask" : "")
                   << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
                   << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
@@ -1248,10 +1182,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[3]);
         if (pca)
         {
           fine->SetPCA({ 1, 1 });
@@ -1260,35 +1191,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         Configure(fine, 6);
         if (byRegions)
         {
-          fine->SetRegionSize(16);
-          fine->SetRegionHalo(1);
-          fine->SetRegionsPerIteration(regionsPerIteration);
-          if (mapped)
-          {
-            fine->SetResidentFeatureBudget(1);
-            fine->SetBrickBytes(1);
-            fine->SetScratchDirectory(scratch);
-          }
+          ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
         }
         fine->Update();
         return fine;
       };
-      const auto whole = run(false, false, 0);
-      double     fieldDifference = 0.0, lossDifference = 0.0;
-      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-      {
-        const auto region = run(true, route.first, route.second);
-        fieldDifference =
-          std::max(fieldDifference,
-                   MaxDifference(whole->GetOutput(), region->GetOutput(), pairFixed->GetLargestPossibleRegion()));
-        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-        {
-          const double value = whole->GetMetricValuesPerIteration()[i];
-          lossDifference =
-            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-        }
-      }
-      const double reduces = MaxDifference(
+      const auto      whole = run(false, false, 0);
+      const Distances distances = CompareRoutes(whole, run);
+      const double    fieldDifference = distances.field, lossDifference = distances.loss;
+      const double    reduces = MaxDifference(
         whole->GetOutput(), run(false, false, 0, false)->GetOutput(), pairFixed->GetLargestPossibleRegion());
       std::cout << "PCA" << variant.label << ", by regions against whole: fields within " << fieldDifference
                 << " mm, losses within " << lossDifference << " of theirs; the components move the field by " << reduces
@@ -1323,10 +1234,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           {
             fine->SetMovingMask(movingMask);
           }
-          fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-            argv[3], 3, 1, { 0, 0, 0 }, { voxel, voxel, voxel }, { 0, 0, 0 }, { true, true }, false));
-          fine->SetDistance({ "L2", "L2" });
-          fine->SetLayersWeight({ 1.f, 1.f });
+          AddModel(fine, argv[3], 3, { "L2", "L2" }, 0, voxel);
           if (jacobian)
           {
             fine->SetMode("Jacobian");
@@ -1334,34 +1242,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           Configure(fine, 6);
           if (byRegions)
           {
-            fine->SetRegionSize(16);
-            fine->SetRegionHalo(1);
-            fine->SetRegionsPerIteration(regionsPerIteration);
-            if (mapped)
-            {
-              fine->SetResidentFeatureBudget(1);
-              fine->SetBrickBytes(1);
-              fine->SetScratchDirectory(scratch);
-            }
+            ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
           }
           fine->Update();
           return fine;
         };
-        const auto whole = run(false, false, 0);
-        double     fieldDifference = 0.0, lossDifference = 0.0;
-        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-        {
-          const auto region = run(true, route.first, route.second);
-          fieldDifference = std::max(
-            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-          for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-          {
-            const double value = whole->GetMetricValuesPerIteration()[i];
-            lossDifference =
-              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-          }
-        }
-        const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+        const auto      whole = run(false, false, 0);
+        const Distances distances = CompareRoutes(whole, run);
+        const double    fieldDifference = distances.field, lossDifference = distances.loss;
+        const double    moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
         std::cout << "a voxel size of " << voxel << (jacobian ? ", Jacobian mode" : ", Static mode")
                   << (masked ? ", a moving mask" : "") << ", by regions against whole: fields within "
                   << fieldDifference << " mm, losses within " << lossDifference << " of theirs, for a field moved by "
@@ -1417,10 +1306,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[4], 2, 1, { 0, 0 }, { variant.voxel, variant.voxel, variant.voxel }, { 0, 0 }, { true, true }, false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[4], 2, { "L2", "L2" }, 0, variant.voxel);
         if (variant.pca)
         {
           fine->SetPCA({ 1, 1 });
@@ -1428,34 +1314,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         Configure(fine, 6);
         if (byRegions)
         {
-          fine->SetRegionSize(16);
-          fine->SetRegionHalo(1);
-          fine->SetRegionsPerIteration(regionsPerIteration);
-          if (mapped)
-          {
-            fine->SetResidentFeatureBudget(1);
-            fine->SetBrickBytes(1);
-            fine->SetScratchDirectory(scratch);
-          }
+          ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
         }
         fine->Update();
         return fine;
       };
-      const auto whole = run(false, false, 0);
-      double     fieldDifference = 0.0, lossDifference = 0.0;
-      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-      {
-        const auto region = run(true, route.first, route.second);
-        fieldDifference = std::max(
-          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-        {
-          const double value = whole->GetMetricValuesPerIteration()[i];
-          lossDifference =
-            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-        }
-      }
-      const double moved = MaxDifference(whole->GetOutput(),
+      const auto      whole = run(false, false, 0);
+      const Distances distances = CompareRoutes(whole, run);
+      const double    fieldDifference = distances.field, lossDifference = distances.loss;
+      const double    moved = MaxDifference(whole->GetOutput(),
                                          variant.turned ? turnedStart.GetPointer() : start.GetPointer(),
                                          fixed->GetLargestPossibleRegion());
       std::cout << "a 2D model in Static mode" << variant.label << ", by regions against whole: fields within "
@@ -1493,9 +1360,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     {
       for (const bool masked : { false, true })
       {
-        auto run = [&](bool byRegions, bool mapped, bool pca = true) {
-          auto               fine = FineType::New();
-          const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+        auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration, bool pca = true) {
+          auto fine = FineType::New();
           fine->SetFixedImage(fixed);
           fine->SetMovingImage(moving);
           fine->SetInitialDisplacementField(start);
@@ -1503,16 +1369,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           {
             fine->SetMovingMask(movingMask);
           }
-          fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
-                                                                    variant.dimension,
-                                                                    1,
-                                                                    std::vector<unsigned int>(variant.dimension, patch),
-                                                                    { 0.f, 0.f, 0.f },
-                                                                    std::vector<unsigned int>(variant.dimension, 0),
-                                                                    { true, true },
-                                                                    false));
-          fine->SetDistance({ "L2", "L2" });
-          fine->SetLayersWeight({ 1.f, 1.f });
+          // On the patch of three voxels a side around each sampled point.
+          AddModel(fine, variant.model, variant.dimension, { "L2", "L2" }, variant.sampling < 1.0 ? 3 : 0);
           fine->SetMode("Jacobian");
           fine->SetSamplingPercentage(variant.sampling);
           if (pca)
@@ -1522,34 +1380,16 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           Configure(fine, 6);
           if (byRegions)
           {
-            fine->SetRegionSize(16);
-            fine->SetRegionHalo(1);
-            if (mapped)
-            {
-              fine->SetResidentFeatureBudget(1);
-              fine->SetBrickBytes(1);
-              fine->SetScratchDirectory(scratch);
-            }
+            ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
           }
           fine->Update();
           return fine;
         };
-        const auto whole = run(false, false);
-        double     fieldDifference = 0.0, lossDifference = 0.0;
-        for (const bool mapped : { false, true })
-        {
-          const auto region = run(true, mapped);
-          fieldDifference = std::max(
-            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-          for (size_t i = 0; i < whole->GetMetricValuesPerIteration().size(); ++i)
-          {
-            const double value = whole->GetMetricValuesPerIteration()[i];
-            lossDifference =
-              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-          }
-        }
-        const double reduces =
-          MaxDifference(whole->GetOutput(), run(false, false, false)->GetOutput(), fixed->GetLargestPossibleRegion());
+        const auto      whole = run(false, false, 0);
+        const Distances distances = CompareRoutes(whole, run, false);
+        const double    fieldDifference = distances.field, lossDifference = distances.loss;
+        const double    reduces = MaxDifference(
+          whole->GetOutput(), run(false, false, 0, false)->GetOutput(), fixed->GetLargestPossibleRegion());
         std::cout << "PCA, Jacobian mode, " << variant.label << (masked ? ", a moving mask" : "")
                   << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
                   << lossDifference << " of theirs; the components move the field by " << reduces << " mm" << std::endl;
@@ -1593,10 +1433,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[5], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[5]);
         if (variant.pca)
         {
           fine->SetPCA({ 1, 1 });
@@ -1605,34 +1442,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         Configure(fine, 6);
         if (byRegions)
         {
-          fine->SetRegionSize(16);
-          fine->SetRegionHalo(3);
-          fine->SetRegionsPerIteration(regionsPerIteration);
-          if (mapped)
-          {
-            fine->SetResidentFeatureBudget(1);
-            fine->SetBrickBytes(1);
-            fine->SetScratchDirectory(scratch);
-          }
+          ByRegions(fine, 3, regionsPerIteration, mapped, scratch);
         }
         fine->Update();
         return fine;
       };
-      const auto whole = run(false, false, 0);
-      double     fieldDifference = 0.0, lossDifference = 0.0;
-      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-      {
-        const auto region = run(true, route.first, route.second);
-        fieldDifference = std::max(
-          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-        {
-          const double value = whole->GetMetricValuesPerIteration()[i];
-          lossDifference =
-            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-        }
-      }
-      const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+      const auto      whole = run(false, false, 0);
+      const Distances distances = CompareRoutes(whole, run);
+      const double    fieldDifference = distances.field, lossDifference = distances.loss;
+      const double    moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
       std::cout << "a model with instance normalisations" << variant.label
                 << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
                 << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
@@ -1664,7 +1482,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
                                      Variant{ "NCC and OrganDice", { "NCC", "OrganDice" }, false },
                                      Variant{ "NCC and OrganDice, a moving mask", { "NCC", "OrganDice" }, true } })
     {
-      auto run = [&](bool mapped, unsigned int regionsPerIteration, double sampling) {
+      // Always by regions: the dense iterations on the resident maps are the reference.
+      auto run = [&](bool, bool mapped, unsigned int regionsPerIteration, double sampling = 0.3) {
         auto fine = FineType::New();
         fine->SetFixedImage(fixed);
         fine->SetMovingImage(moving);
@@ -1673,40 +1492,18 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-        fine->SetDistance(variant.distance);
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[3], 3, variant.distance);
         fine->SetSamplingPercentage(sampling);
         Configure(fine, 6);
-        fine->SetRegionSize(16);
-        fine->SetRegionHalo(1);
-        fine->SetRegionsPerIteration(regionsPerIteration);
-        if (mapped)
-        {
-          fine->SetResidentFeatureBudget(1);
-          fine->SetBrickBytes(1);
-          fine->SetScratchDirectory(scratch);
-        }
+        ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
         fine->Update();
         return fine;
       };
-      const auto dense = run(false, 0, 0.3);
-      double     fieldDifference = 0.0, lossDifference = 0.0;
-      for (const auto & route : { std::make_pair(true, 0u), std::make_pair(false, 18u) })
-      {
-        const auto region = run(route.first, route.second, 0.3);
-        fieldDifference = std::max(
-          fieldDifference, MaxDifference(dense->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-        for (size_t i = 0; route.second == 0 && i < dense->GetMetricValuesPerIteration().size(); ++i)
-        {
-          const double value = dense->GetMetricValuesPerIteration()[i];
-          lossDifference =
-            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-        }
-      }
-      const double draws =
-        MaxDifference(dense->GetOutput(), run(false, 0, 1.0)->GetOutput(), fixed->GetLargestPossibleRegion());
+      const auto      dense = run(true, false, 0);
+      const Distances distances = CompareRoutes(dense, run);
+      const double    fieldDifference = distances.field, lossDifference = distances.loss;
+      const double    draws =
+        MaxDifference(dense->GetOutput(), run(true, false, 0, 1.0)->GetOutput(), fixed->GetLargestPossibleRegion());
       std::cout << "a share of 0.3 of the cells, " << variant.label
                 << ", by bricks and with every box drawn against the dense iterations: fields within "
                 << fieldDifference << " mm, losses within " << lossDifference
@@ -1736,10 +1533,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         fine->SetInitialDisplacementField(start);
         fine->SetFixedMask(fixedMask);
         fine->SetMovingMask(movingMask);
-        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-        fine->SetDistance({ "L2", "L2" });
-        fine->SetLayersWeight({ 1.f, 1.f });
+        AddModel(fine, argv[3]);
         if (jacobian)
         {
           fine->SetMode("Jacobian");
@@ -1747,34 +1541,15 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         Configure(fine, 6);
         if (byRegions)
         {
-          fine->SetRegionSize(16);
-          fine->SetRegionHalo(1);
-          fine->SetRegionsPerIteration(regionsPerIteration);
-          if (mapped)
-          {
-            fine->SetResidentFeatureBudget(1);
-            fine->SetBrickBytes(1);
-            fine->SetScratchDirectory(scratch);
-          }
+          ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
         }
         fine->Update();
         return fine;
       };
-      const auto whole = run(false, false, 0);
-      double     fieldDifference = 0.0, lossDifference = 0.0;
-      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
-      {
-        const auto region = run(true, route.first, route.second);
-        fieldDifference = std::max(
-          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
-        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
-        {
-          const double value = whole->GetMetricValuesPerIteration()[i];
-          lossDifference =
-            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
-        }
-      }
-      const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+      const auto      whole = run(false, false, 0);
+      const Distances distances = CompareRoutes(whole, run);
+      const double    fieldDifference = distances.field, lossDifference = distances.loss;
+      const double    moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
       std::cout << "masks on grids of their own" << (jacobian ? ", Jacobian mode" : ", Static mode")
                 << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
                 << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
