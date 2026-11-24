@@ -259,18 +259,20 @@ public:
    * RegionSize voxels a side (rounded to whole cells of the control grid), with the region of the
    * moving image each reads, through the images' own pipelines (SetRequestedRegion then Update: an
    * itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them from its
-   * buffer), and keeps their features pooled to the control grid. The iterations read no image in Static mode. Where
-   * the pooled maps do not fit the device they stay in files of ScratchDirectory mapped to memory, with the control
-   * grid and the optimizer's state, and an iteration steps every cell, as the whole-image run does, by bricks of boxes
-   * brought to the device one at a time; one the fixed mask does not reach costs its share of the regularizer alone. A
+   * buffer), and keeps their features pooled to the control grid. The iterations read no image in Static mode, save to
+   * refresh the moving maps (FeatureMapUpdateInterval). Where the pooled maps do not fit the device they stay in files
+   * of ScratchDirectory mapped to memory, with the control grid and the optimizer's state, and an iteration steps every
+   * cell, as the whole-image run does, by bricks of boxes brought to the device one at a time; one the fixed mask does
+   * not reach costs its share of the regularizer alone. A
    * brick's loss is the dense loss restricted to its cells, weighed by its share of the cells that count (those the
    * masks keep, the moving one where the field reads it: they are counted over the grid before the bricks are stepped),
    * with the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
    * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
    * iteration costs and holds then follows those boxes, not the image.
    * Point-wise distances, feature layers at the image's resolution (MIND) or a power of two coarser, no coarser than
-   * the control cells (a region then starts on the layer's lattice); FeatureMapUpdateInterval, PCA and a model that
-   * resamples the image are refused, save on the patches of the sampled Jacobian mode.
+   * the control cells (a region then starts on the layer's lattice); PCA and a model that resamples the image are
+   * refused, save on the patches of the sampled Jacobian mode. FeatureMapUpdateInterval pools the moving maps again, a
+   * box at a time, from the moving image the field warps.
    * The Jacobian mode keeps the fixed features pooled to the cells, as Static mode, and at every iteration takes each
    * unit (a brick, or a box drawn) on its own: the field interpolated at the voxels of its cells and RegionHalo around
    * them (cut at the image), the moving image read by regions where they land and warped there, the network run on

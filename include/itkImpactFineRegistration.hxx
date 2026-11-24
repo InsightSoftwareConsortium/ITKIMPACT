@@ -1695,11 +1695,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     itkExceptionMacro("Both SetFixedImage() and SetMovingImage() are required.");
   }
   const bool featureMode = !m_FixedModelsConfiguration.empty();
-  if (m_FeatureMapUpdateInterval > 0)
-  {
-    itkExceptionMacro("ImpactFineRegistration: FeatureMapUpdateInterval re-extracts the features of the whole warped "
-                      "image; leave it at -1 with RegionSize.");
-  }
   if (!(m_SamplingPercentage > 0.0 && m_SamplingPercentage <= 1.0))
   {
     itkExceptionMacro("ImpactFineRegistration: SamplingPercentage must lie in (0, 1], got " << m_SamplingPercentage
@@ -1712,6 +1707,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const bool jacobian = featureMode && m_Mode == "Jacobian";
   const bool sampledJacobian = jacobian && m_SamplingPercentage < 1.0;
   const bool swept = jacobian && !sampledJacobian && m_FixedModelsConfiguration[0].GetDimension() < Dim;
+  // FeatureMapUpdateInterval: Static mode pools its moving maps again, every that many iterations, from the moving
+  // image the field warps, and reads them past that field.
+  const bool refreshes = featureMode && !jacobian && m_FeatureMapUpdateInterval > 0;
 
   const torch::Device device(m_Device);
   torch::manual_seed(m_Seed);
@@ -2201,8 +2199,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     pooledToCells(layers, latticesAlong(axis).fixed, lowPad, c0, c1, keepOf(axis));
     return layers;
   };
-  // The Jacobian mode's moving features, pooled likewise: re-extracted, with the graph, from the moving image warped by
-  // the smoothed control field `smoothed` of the cells from `origin` on.
+  // The moving features re-extracted from the moving image warped by the smoothed control field `smoothed` of the cells
+  // from `origin` on, pooled likewise, with the graph when it is recorded: the Jacobian mode's, and a refresh's.
   auto pooledWarped = [&](const std::vector<int64_t> & c0,
                           const std::vector<int64_t> & c1,
                           const torch::Tensor &        smoothed,
@@ -2210,7 +2208,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                           int                          axis) {
     std::vector<int64_t>       lowPad(Dim);
     const RegionType           span = featureSpan(c0, c1, lowPad, axis);
-    std::vector<torch::Tensor> layers = layersOf(warpedOn(readMovingImage, span, smoothed, origin), true, true, axis);
+    std::vector<torch::Tensor> layers =
+      layersOf(warpedOn(readMovingImage, span, smoothed, origin), true, torch::GradMode::is_enabled(), axis);
     pooledToCells(layers, latticesAlong(axis).moving, lowPad, c0, c1, keepOf(axis));
     return layers;
   };
@@ -2356,9 +2355,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     mapFloats += static_cast<double>(channelCount * spatial[d]) / static_cast<double>(cells[d]);
   }
-  const double  heldFloats = mapFloats + 4.0 * static_cast<double>(Dim) + 2.0;
-  const int64_t denseFloats =
-    static_cast<int64_t>(Dim) * (17 + smoothingPasses) + 6 * channelCount + (drawsCells ? channelCount + 4 : 0);
+  // A refresh's reference field, and its residual through the graph of a dense iteration.
+  const double  heldFloats = mapFloats + static_cast<double>((refreshes ? 5 : 4) * Dim) + 2.0;
+  const int64_t denseFloats = static_cast<int64_t>(Dim) * (17 + smoothingPasses + (refreshes ? 3 : 0)) +
+                              6 * channelCount + (drawsCells ? channelCount + 4 : 0);
   const double budget =
     m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device);
   // In the Jacobian mode a unit's features are computed on its voxels and `spanExtra` around them (the models' reach,
@@ -2387,7 +2387,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       spanExtra[d] = static_cast<int64_t>(std::ceil(radius / fixedSpacing[Dim - 1 - d])) + 1;
     }
   }
-  else if (jacobian)
+  else if (jacobian || refreshes)
   {
     for (const Impact::RegionLattices & on : latticeSets)
     {
@@ -2401,7 +2401,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // How many cells past a unit's own the field it is warped by is read: each voxel of its span reads its displacement
   // from the two cells around it. One at least, the regularizer's next cell.
   int64_t fieldReach = 1;
-  for (unsigned int d = 0; jacobian && d < Dim; ++d)
+  for (unsigned int d = 0; (jacobian || refreshes) && d < Dim; ++d)
   {
     const float scale = static_cast<float>(cells[d]) / static_cast<float>(spatial[d]);
     auto        cellOf = [&](int64_t voxel) {
@@ -2417,7 +2417,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       fieldReach = std::max({ fieldReach, c - cellOf(margin - margin % spanAlign), cellOf(high - 1) + 1 - c });
     }
   }
-  const int64_t reach = fieldReach + static_cast<int64_t>(m_ControlGridSmoothingIterations);
+  // What a unit's step reads around it: in Static mode, the regularizer's next cell, with the smoothing's reach.
+  const int64_t reach = (jacobian ? fieldReach : 1) + static_cast<int64_t>(m_ControlGridSmoothingIterations);
   // What a Jacobian step holds on the device for each voxel of its span: the warp (the position, the displacement and
   // the value, with their gradients) and the network's activations, forward and backward, measured on CUDA on the
   // probe region, else taken as four floats a channel at each layer's samples. On patches, the two images' reads; the
@@ -2646,6 +2647,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     theta = m_ResidentFeatures ? start.to(device) : start;
   }
+  // A refresh's reference: the field the moving maps were pooled at, zero until the first.
+  torch::Tensor thetaRef = refreshes ? atHome(thetaShape) : torch::Tensor();
   // Epsilon weighs against the gradient per control cell, as in the dense run.
   const double adamEpsilon = m_Epsilon / static_cast<double>(std::max(1u, m_GridShrinkFactor));
   auto         smoothControl = [&](const torch::Tensor & control) {
@@ -2797,6 +2800,33 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       Impact::WriteCells(movingShare, box.cell0, movingShareOf(box.cell0, box.cell1));
     }
   }
+  // FeatureMapUpdateInterval, after the step of every that many iterations but the last: the field becomes the
+  // reference the moving maps are read past, and they are pooled again from the moving image it warps, a box at a
+  // time, as the whole-image run re-extracts them.
+  auto refresh = [&](unsigned int iteration) {
+    if (!refreshes || (iteration + 1) % static_cast<unsigned int>(m_FeatureMapUpdateInterval) != 0 ||
+        iteration + 1 >= m_NumberOfIterations)
+    {
+      return;
+    }
+    torch::NoGradGuard noGrad;
+    thetaRef.copy_(theta.detach());
+    const std::vector<int64_t> around(Dim, fieldReach + static_cast<int64_t>(m_ControlGridSmoothingIterations));
+    for (const Impact::CellBox & box : boxes)
+    {
+      const Impact::CellBox            window = Impact::CellsAround(box, around, cells);
+      const std::vector<torch::Tensor> layers =
+        pooledWarped(box.cell0,
+                     box.cell1,
+                     smoothControl(Impact::NarrowTo(thetaRef, window.cell0, window.cell1).to(device)),
+                     window.cell0,
+                     -1);
+      for (size_t l = 0; l < layers.size(); ++l)
+      {
+        Impact::WriteCells(movingMaps[l], box.cell0, layers[l]);
+      }
+    }
+  };
   if (dense)
   {
     // ---- The dense iterations on the pooled maps. ----
@@ -2810,14 +2840,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
       drawSubsets(channels);
+      // The moving maps are read past a refresh's reference, the moving mask at the whole field.
       const torch::Tensor smoothed = smoothControl(theta);
-      const torch::Tensor displacement = smoothed * voxelsToCells; // in cells
+      const torch::Tensor displacement = (refreshes ? smoothControl(theta - thetaRef) : smoothed) * voxelsToCells;
       torch::Tensor       counted = fixedOn;
       if (movingShare.defined())
       {
         torch::NoGradGuard  noGrad;
         const torch::Tensor holds =
-          Impact::WarpMap<Dim>(movingShare, wholeStart, cells, base, displacement.detach()) >= 0.5;
+          Impact::WarpMap<Dim>(movingShare, wholeStart, cells, base, smoothed.detach() * voxelsToCells) >= 0.5;
         counted = counted.defined() ? counted.logical_and(holds) : holds;
       }
       const torch::Tensor rows = drawRows(counted, cellCountTotal);
@@ -2848,6 +2879,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         theta.grad().zero_();
       }
       m_MetricValuesPerIteration.push_back(loss.template item<double>());
+      refresh(iteration);
     }
   }
   else
@@ -2926,8 +2958,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       std::vector<int64_t>       m1;
       int64_t                    count;
     };
-    auto readingOf =
-      [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) -> Reading {
+    auto readingOf = [&](const Impact::CellBox &      box,
+                         const torch::Tensor &        smoothed,
+                         const std::vector<int64_t> & origin,
+                         const torch::Tensor &        residual = {}) -> Reading {
       if (swept)
       {
         const Impact::CellBox points = sweptPoints(box);
@@ -2964,46 +2998,49 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         return reading;
       }
-      // Where each cell reads the moving map, in cells: q = c + u (voxels -> cells), and the cells of
-      // the moving map the box reads: what q reaches, one around for the interpolation and one spare, within the
-      // lattice, at least two wide.
-      torch::Tensor own = smoothed;
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        own = own.narrow(2 + static_cast<int64_t>(d), box.cell0[d] - origin[d], box.cell1[d] - box.cell0[d]);
-      }
+      // Where each cell reads a map of the moving image by `field`: its displacement in cells (voxels -> cells), and
+      // the cells [m0, m1) of the map the box reads: what c + u reaches, one around for the interpolation and one
+      // spare, within the lattice, at least two wide. The moving maps are read past a refresh's reference
+      // (`residual`), the moving mask at the whole field.
       reading.index = Impact::BoxIndices(box.cell0, box.cell1, device);
-      reading.displacement = own * voxelsToCells;
-      const torch::Tensor q = cellPositions(box.cell0, box.cell1) + reading.displacement;
-      {
-        torch::NoGradGuard  noGrad;
-        const torch::Tensor reached = q.detach().flatten(2);
-        const torch::Tensor bounds =
-          torch::stack({ std::get<0>(reached.min(2)), std::get<0>(reached.max(2)) }, 0).to(torch::kCPU); // {2, 1, Dim}
+      auto readAt = [&](const torch::Tensor & field, std::vector<int64_t> & m0, std::vector<int64_t> & m1) {
+        torch::Tensor own = field;
         for (unsigned int d = 0; d < Dim; ++d)
         {
-          const auto low = static_cast<int64_t>(std::floor(bounds[0][0][d].template item<double>())) - 1;
-          const auto high = static_cast<int64_t>(std::ceil(bounds[1][0][d].template item<double>())) + 2;
-          reading.m0[d] = std::clamp<int64_t>(low, 0, cells[d] - 1);
-          reading.m1[d] = std::clamp<int64_t>(high, 1, cells[d]);
-          if (reading.m1[d] - reading.m0[d] < 2)
+          own = own.narrow(2 + static_cast<int64_t>(d), box.cell0[d] - origin[d], box.cell1[d] - box.cell0[d]);
+        }
+        const torch::Tensor displacement = own * voxelsToCells;
+        const torch::Tensor q = cellPositions(box.cell0, box.cell1) + displacement;
+        {
+          torch::NoGradGuard  noGrad;
+          const torch::Tensor reached = q.detach().flatten(2);
+          const torch::Tensor bounds = torch::stack({ std::get<0>(reached.min(2)), std::get<0>(reached.max(2)) }, 0)
+                                         .to(torch::kCPU); // {2, 1, Dim}
+          for (unsigned int d = 0; d < Dim; ++d)
           {
-            if (reading.m1[d] < cells[d])
-              ++reading.m1[d];
-            else if (reading.m0[d] > 0)
-              --reading.m0[d];
+            const auto low = static_cast<int64_t>(std::floor(bounds[0][0][d].template item<double>())) - 1;
+            const auto high = static_cast<int64_t>(std::ceil(bounds[1][0][d].template item<double>())) + 2;
+            m0[d] = std::clamp<int64_t>(low, 0, cells[d] - 1);
+            m1[d] = std::clamp<int64_t>(high, 1, cells[d]);
+            if (m1[d] - m0[d] < 2)
+            {
+              if (m1[d] < cells[d])
+                ++m1[d];
+              else if (m0[d] > 0)
+                --m0[d];
+            }
           }
         }
-      }
+        return displacement;
+      };
+      reading.displacement = readAt(residual.defined() ? residual : smoothed, reading.m0, reading.m1);
       if (movingShare.defined())
       {
-        torch::NoGradGuard  noGrad;
+        torch::NoGradGuard   noGrad;
+        std::vector<int64_t> s0 = reading.m0, s1 = reading.m1;
+        const torch::Tensor at = residual.defined() ? readAt(smoothed.detach(), s0, s1) : reading.displacement.detach();
         const torch::Tensor holds =
-          Impact::WarpMap<Dim>(Impact::NarrowTo(movingShare, reading.m0, reading.m1).to(device),
-                               reading.m0,
-                               cells,
-                               reading.index,
-                               reading.displacement.detach()) >= 0.5;
+          Impact::WarpMap<Dim>(Impact::NarrowTo(movingShare, s0, s1).to(device), s0, cells, reading.index, at) >= 0.5;
         reading.counted = reading.counted.defined() ? reading.counted.logical_and(holds) : holds;
         reading.count = reading.counted.sum().template item<int64_t>();
       }
@@ -3015,8 +3052,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     auto partLoss = [&](const Impact::CellBox &      box,
                         const torch::Tensor &        smoothed,
                         const std::vector<int64_t> & origin,
-                        std::vector<double> *        raw) -> torch::Tensor {
-      const Reading reading = readingOf(box, smoothed, origin);
+                        std::vector<double> *        raw,
+                        const torch::Tensor &        residual) -> torch::Tensor {
+      const Reading reading = readingOf(box, smoothed, origin, residual);
       if (reading.count == 0)
       {
         // Nothing of it counts: its edges alone, no map read.
@@ -3289,20 +3327,30 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) {
         return sampledJacobian ? keptPoints(box, smoothed, origin).size(0) : readingOf(box, smoothed, origin).count;
       };
-    // The loss of `part`, back-propagated to the cells its field reads; its value.
-    auto stepPart =
-      [&](const Impact::CellBox & part, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) {
-        if (sampledJacobian)
-        {
-          return sampledPart(part, smoothed, origin, nullptr);
-        }
-        const torch::Tensor loss = partLoss(part, smoothed, origin, nullptr);
-        if (loss.requires_grad()) // a constant for a last cell out of the fixed mask: no similarity, no difference
-        {
-          loss.backward();
-        }
-        return loss.template item<double>();
-      };
+    // The smoothed residual past a refresh's reference of the cells of `window` whose control cells are `control`:
+    // the field the moving maps are read at; undefined without FeatureMapUpdateInterval.
+    auto residualOf = [&](const Impact::CellBox & window, const torch::Tensor & control) {
+      return refreshes ? smoothControl(control - Impact::NarrowTo(thetaRef, window.cell0, window.cell1).to(device))
+                       : torch::Tensor();
+    };
+    // The loss of `part`, back-propagated to the control cells `control` of `window` it reads; its value. `raw`, when
+    // given, takes each layer's value instead, without the graph.
+    auto partValue = [&](const Impact::CellBox & part,
+                         const Impact::CellBox & window,
+                         const torch::Tensor &   control,
+                         std::vector<double> *   raw) {
+      const torch::Tensor smoothed = smoothControl(control);
+      if (sampledJacobian)
+      {
+        return sampledPart(part, smoothed, window.cell0, raw);
+      }
+      const torch::Tensor loss = partLoss(part, smoothed, window.cell0, raw, residualOf(window, control));
+      if (raw == nullptr && loss.requires_grad()) // a constant for a last cell out of the fixed mask
+      {
+        loss.backward();
+      }
+      return loss.template item<double>();
+    };
     const bool masked = m_FixedMask.IsNotNull() || m_MovingMask.IsNotNull();
     int64_t    voxels = 1;
     for (const int64_t extent : spatial)
@@ -3380,16 +3428,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             for (const Impact::CellBox & unit : units)
             {
               const Impact::CellBox window = around(unit);
-              const torch::Tensor   smoothed =
-                smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device));
-              if (sampledJacobian)
-              {
-                sampledPart(unit, smoothed, window.cell0, &raw);
-              }
-              else
-              {
-                partLoss(unit, smoothed, window.cell0, &raw);
-              }
+              partValue(unit, window, Impact::NarrowTo(theta, window.cell0, window.cell1).to(device), &raw);
             }
             for (size_t l = 0; l < losses.size(); ++l)
             {
@@ -3409,7 +3448,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             const torch::Tensor     control = Impact::NarrowTo(theta, window.cell0, window.cell1)
                                             .to(device, torch::kFloat32, /*non_blocking=*/false, /*copy=*/true)
                                             .requires_grad_(true);
-            lossValue += stepPart(part, smoothControl(control), window.cell0);
+            lossValue += partValue(part, window, control, nullptr);
             covered += part.Count();
             if (control.grad().defined())
             {
@@ -3446,6 +3485,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       // The loss over the parts, scaled from the cells they hold to the grid: the dense loss when they tile it.
       m_MetricValuesPerIteration.push_back(lossValue /
                                            (static_cast<double>(covered) / static_cast<double>(cellCountTotal)));
+      refresh(iteration);
     }
   }
   // ---- The control grid, smoothed, as the field on its own grid, written a box at a time from the cells its

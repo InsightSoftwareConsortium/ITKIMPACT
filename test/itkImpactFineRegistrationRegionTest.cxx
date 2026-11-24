@@ -883,6 +883,83 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 12. FeatureMapUpdateInterval: every two iterations the moving maps are pooled again from the moving image the field
+  // warps, and read past that field; the moving mask at the whole field. By regions, the dense iterations on the
+  // resident maps, by bricks of one box from mapped files and with every box drawn at every iteration, with and without
+  // a moving mask: the whole-image run's field, and its losses at every iteration (the boxes drawn record theirs,
+  // scaled), right after a refresh too, where every cell reads the maps exactly at a sample.
+  if (argc >= 5)
+  {
+    using MaskType = FineType::MaskImageType;
+    auto movingMask = MaskType::New();
+    movingMask->SetRegions(moving->GetLargestPossibleRegion());
+    movingMask->Allocate();
+    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    {
+      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
+    }
+    for (const bool masked : { false, true })
+    {
+      auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration, int interval = 2) {
+        auto fine = FineType::New();
+        fine->SetFixedImage(fixed);
+        fine->SetMovingImage(moving);
+        fine->SetInitialDisplacementField(start);
+        if (masked)
+        {
+          fine->SetMovingMask(movingMask);
+        }
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+        fine->SetFeatureMapUpdateInterval(interval);
+        Configure(fine, 6);
+        if (byRegions)
+        {
+          fine->SetRegionSize(16);
+          fine->SetRegionHalo(1);
+          fine->SetRegionsPerIteration(regionsPerIteration);
+          if (mapped)
+          {
+            fine->SetResidentFeatureBudget(1);
+            fine->SetBrickBytes(1);
+            fine->SetScratchDirectory(scratch);
+          }
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto whole = run(false, false, 0);
+      double     fieldDifference = 0.0, lossDifference = 0.0;
+      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+      {
+        const auto region = run(true, route.first, route.second);
+        fieldDifference = std::max(
+          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+        {
+          const double value = whole->GetMetricValuesPerIteration()[i];
+          lossDifference =
+            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+        }
+      }
+      const double refreshed =
+        MaxDifference(whole->GetOutput(), run(false, false, 0, -1)->GetOutput(), fixed->GetLargestPossibleRegion());
+      std::cout << "moving maps refreshed every two iterations" << (masked ? ", a moving mask" : "")
+                << ", by regions against whole (resident, by bricks of one box from mapped files, every box drawn): "
+                << "losses within " << lossDifference << " of theirs, fields within " << fieldDifference
+                << " mm; the refreshes move the field by " << refreshed << " mm" << std::endl;
+      if (!(lossDifference < 1e-5) || !(fieldDifference < 1e-5) || !(refreshed > 1e-4))
+      {
+        std::cerr << "With the moving maps refreshed, the runs by regions differ from the whole-image run."
+                  << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {
