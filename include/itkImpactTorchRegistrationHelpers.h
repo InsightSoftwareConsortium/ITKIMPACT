@@ -643,10 +643,53 @@ WarpCorner(const torch::Tensor &        flat,
 
 /** \class WarpMapFunction
  * \ingroup Impact
- * \brief WarpMap's interpolation, differentiable to the displacement alone: the map is a constant. */
+ * \brief WarpMap's interpolation, differentiable to the displacement alone: the map is a constant. The points go by
+ * slabs of SlabPoints at most (a slice at least) along the first axis they span: what the corners hold beside the
+ * displacement and the output, some 70 bytes a point forward and backward, is a slab's, where a whole-image warp
+ * has no budget. */
 class WarpMapFunction : public torch::autograd::Function<WarpMapFunction>
 {
 public:
+  static constexpr int64_t SlabPoints = int64_t{ 1 } << 20;
+
+  /** `slab(index, displacement, s0, n)` for the slabs [s0, s0 + n) of the points along their first axis: that of
+   * `displacement` ({1, Dim, n...}) after its components, the first of each of `index` (broadcasting to {1, n...}). */
+  template <typename TSlab>
+  static void
+  ForEachSlab(const std::vector<torch::Tensor> & index, const torch::Tensor & displacement, TSlab && slab)
+  {
+    const int64_t length = displacement.size(2);
+    const int64_t slice =
+      std::max<int64_t>(1, displacement.numel() / std::max<int64_t>(1, displacement.size(1) * length));
+    const int64_t step = std::max<int64_t>(1, SlabPoints / slice);
+    for (int64_t s0 = 0; s0 < length; s0 += step)
+    {
+      const int64_t              n = std::min(step, length - s0);
+      std::vector<torch::Tensor> part;
+      for (const torch::Tensor & samples : index)
+      {
+        part.push_back(samples.size(1) == 1 ? samples : samples.narrow(1, s0, n));
+      }
+      slab(part, displacement.narrow(2, s0, n), s0, n);
+    }
+  }
+
+  /** `slab` ({1, X, n...}) as the slab [s0, s0 + n) of `whole`, of `shape`: `slab` itself when it is all of it. */
+  static void
+  Place(torch::Tensor & whole, const std::vector<int64_t> & shape, const torch::Tensor & slab, int64_t s0, int64_t n)
+  {
+    if (n == shape[2])
+    {
+      whole = slab;
+      return;
+    }
+    if (!whole.defined())
+    {
+      whole = torch::empty(shape, slab.options());
+    }
+    whole.narrow(2, s0, n).copy_(slab);
+  }
+
   static torch::Tensor
   forward(torch::autograd::AutogradContext * context,
           const torch::Tensor &              map,
@@ -659,23 +702,31 @@ public:
     context->saved_data["index"] = index;
     context->saved_data["first"] = first;
     context->saved_data["extent"] = extent;
-    const WarpCorners          corners = MakeWarpCorners(map, first, extent, index, displacement);
-    const int64_t              channels = map.size(1);
-    const torch::Tensor        flat = map.reshape({ channels, -1 });
-    std::vector<int64_t>       shape(displacement.sizes().begin(), displacement.sizes().end());
-    std::vector<torch::Tensor> shares;
-    torch::Tensor              warped;
+    const int64_t        channels = map.size(1);
+    const torch::Tensor  flat = map.reshape({ channels, -1 });
+    std::vector<int64_t> shape(displacement.sizes().begin(), displacement.sizes().end());
     shape[1] = channels;
-    for (unsigned int corner = 0; corner < (1u << index.size()); ++corner)
-    {
-      torch::Tensor term = WarpCorner(flat, corners, corner, shares);
-      for (const torch::Tensor & share : shares)
-      {
-        term = term * share;
-      }
-      warped = warped.defined() ? warped.add_(term) : term;
-    }
-    return warped.reshape(shape);
+    torch::Tensor warped;
+    ForEachSlab(index,
+                displacement,
+                [&](const std::vector<torch::Tensor> & part, const torch::Tensor & moved, int64_t s0, int64_t n) {
+                  const WarpCorners          corners = MakeWarpCorners(map, first, extent, part, moved);
+                  std::vector<torch::Tensor> shares;
+                  torch::Tensor              slab;
+                  for (unsigned int corner = 0; corner < (1u << part.size()); ++corner)
+                  {
+                    torch::Tensor term = WarpCorner(flat, corners, corner, shares);
+                    for (const torch::Tensor & share : shares)
+                    {
+                      term = term * share;
+                    }
+                    slab = slab.defined() ? slab.add_(term) : term;
+                  }
+                  std::vector<int64_t> slabShape = shape;
+                  slabShape[2] = n;
+                  Place(warped, shape, slab.reshape(slabShape), s0, n);
+                });
+    return warped.defined() ? warped : torch::empty(shape, map.options());
   }
 
   static torch::autograd::variable_list
@@ -685,34 +736,40 @@ public:
     const torch::Tensor &                map = saved[0];
     const torch::Tensor &                displacement = saved[1];
     const std::vector<torch::Tensor>     index = context->saved_data["index"].toTensorVector();
-    const WarpCorners                    corners = MakeWarpCorners(map,
-                                                context->saved_data["first"].toIntVector(),
-                                                context->saved_data["extent"].toIntVector(),
-                                                index,
-                                                displacement);
+    const std::vector<int64_t>           first = context->saved_data["first"].toIntVector();
+    const std::vector<int64_t>           extent = context->saved_data["extent"].toIntVector();
     const int64_t                        channels = map.size(1);
     const torch::Tensor                  flat = map.reshape({ channels, -1 });
-    const torch::Tensor                  incoming = outputs[0].reshape({ channels, -1 });
     const size_t                         dim = index.size();
-    std::vector<torch::Tensor>           gradient(dim), shares;
-    for (unsigned int corner = 0; corner < (1u << dim); ++corner)
-    {
-      const torch::Tensor product = (WarpCorner(flat, corners, corner, shares) * incoming).sum(0);
-      for (size_t d = 0; d < dim; ++d) // the weight's derivative along d: the other axes' shares, signed by the side
-      {
-        torch::Tensor term = ((corner >> (dim - 1 - d)) & 1u) ? product : -product;
-        for (size_t other = 0; other < dim; ++other)
-        {
-          if (other != d)
-          {
-            term = term * shares[other];
-          }
-        }
-        gradient[d] = gradient[d].defined() ? gradient[d].add_(term) : term;
-      }
-    }
+    const std::vector<int64_t>           shape(displacement.sizes().begin(), displacement.sizes().end());
+    torch::Tensor                        gradient;
+    ForEachSlab(index,
+                displacement,
+                [&](const std::vector<torch::Tensor> & part, const torch::Tensor & moved, int64_t s0, int64_t n) {
+                  const WarpCorners          corners = MakeWarpCorners(map, first, extent, part, moved);
+                  const torch::Tensor        incoming = outputs[0].narrow(2, s0, n).reshape({ channels, -1 });
+                  std::vector<torch::Tensor> along(dim), shares;
+                  for (unsigned int corner = 0; corner < (1u << dim); ++corner)
+                  {
+                    const torch::Tensor product = (WarpCorner(flat, corners, corner, shares) * incoming).sum(0);
+                    for (size_t d = 0; d < dim;
+                         ++d) // the weight's derivative along d: the other axes' shares, signed by the side
+                    {
+                      torch::Tensor term = ((corner >> (dim - 1 - d)) & 1u) ? product : -product;
+                      for (size_t other = 0; other < dim; ++other)
+                      {
+                        if (other != d)
+                        {
+                          term = term * shares[other];
+                        }
+                      }
+                      along[d] = along[d].defined() ? along[d].add_(term) : term;
+                    }
+                  }
+                  Place(gradient, shape, torch::stack(along, 0).reshape(moved.sizes()), s0, n);
+                });
     return { torch::Tensor(),
-             torch::stack(gradient, 0).reshape(displacement.sizes()),
+             gradient.defined() ? gradient : torch::zeros_like(displacement),
              torch::Tensor(),
              torch::Tensor(),
              torch::Tensor() };

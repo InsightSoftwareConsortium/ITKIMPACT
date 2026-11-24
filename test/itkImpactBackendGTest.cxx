@@ -3961,6 +3961,32 @@ TEST(ImpactTorchAdam, WarpMapReadsAsGridSampleAndTakesTheSlopeAbove)
   EXPECT_LT((zero.grad().select(1, 0) - (next - centre)).abs().max().item<double>(), 1e-6);
 }
 
+// A warp of more points than a slab holds (WarpMapFunction::SlabPoints) goes by slabs of slices: to the bit, the values
+// and the gradient of the warps of each slab alone.
+TEST(ImpactTorchAdam, WarpMapGoesBySlabs)
+{
+  torch::manual_seed(6);
+  const std::vector<int64_t> extent{ 40, 160, 200 }; // slices of 32000 points: slabs of 32 slices
+  const torch::Tensor        map = torch::rand({ 1, 2, extent[0], extent[1], extent[2] });
+  const auto                 index = itk::Impact::BoxIndices({ 0, 0, 0 }, extent, torch::kCPU);
+  const torch::Tensor        offsets = torch::rand({ 1, 3, extent[0], extent[1], extent[2] }) * 4.0 - 2.0;
+  const torch::Tensor        weights = torch::rand({ 1, 2, extent[0], extent[1], extent[2] });
+  const torch::Tensor        whole = offsets.clone().requires_grad_(true);
+  const torch::Tensor        warped = itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, whole);
+  (warped * weights).sum().backward();
+  for (const int64_t s0 : { int64_t{ 0 }, int64_t{ 32 } })
+  {
+    const int64_t              n = std::min<int64_t>(32, extent[0] - s0);
+    std::vector<torch::Tensor> part = index;
+    part[0] = index[0].narrow(1, s0, n);
+    const torch::Tensor slab = offsets.narrow(2, s0, n).clone().requires_grad_(true);
+    const torch::Tensor alone = itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, part, slab);
+    (alone * weights.narrow(2, s0, n)).sum().backward();
+    EXPECT_TRUE(torch::equal(alone, warped.narrow(2, s0, n))) << "slab from " << s0;
+    EXPECT_TRUE(torch::equal(slab.grad(), whole.grad().narrow(2, s0, n))) << "slab from " << s0;
+  }
+}
+
 TEST(ImpactTorchAdam, DegenerateControlGridFinite)
 {
   ImageType::SpacingType spacing;
