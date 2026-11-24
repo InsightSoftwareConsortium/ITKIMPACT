@@ -20,7 +20,9 @@
 // pooled maps built by boxes and the cost volume built by boxes of the coarse grid give the dense run's field, with
 // masks and with a moving image on another grid too; with the maps in mapped files, every step of the solve taken by
 // those boxes, it gives the field of the maps resident; a streaming reader gives the same field as the image in
-// memory, is read by regions, and the dense field is produced for the region asked.
+// memory, is read by regions, and the dense field is produced for the region asked. Toy models by regions as whole:
+// layers at half the image's resolution, PCA, a model of one dimension fewer, a voxel size of the model's own and
+// instance normalisations.
 
 #include "itkImpactCoarseRegistration.h"
 
@@ -183,7 +185,9 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
   if (argc < 2)
   {
     std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
-              << " <temporary directory> [<model with half-resolution layers>]" << std::endl;
+              << " <temporary directory> [<model with half-resolution layers> <3D model> <2D model> <model with "
+                 "instance normalisations>]"
+              << std::endl;
     return EXIT_FAILURE;
   }
   const std::string temporary = argv[1];
@@ -509,6 +513,94 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
       if (CompareRuns(run(false), byRegions, label, 1e-3) != EXIT_SUCCESS ||
           CompareRoutes(byRegions, run(true), scratch, label) != EXIT_SUCCESS)
       {
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
+  // The models' features by regions as whole on the same pair: PCA (on layers at the image's resolution and at half
+  // of it), a 2D model swept along the axis closest to head-feet, a voxel size finer and coarser than the image's, a
+  // model with instance normalisations; with both masks, and with a 2D model resampling the image. Each against the
+  // whole-image run and, on the maps from mapped files, against its run on the resident ones. BalanceLosses measures
+  // each layer's spread over the candidates, which follows the pooled features where the grid's choices may not.
+  if (argc > 5)
+  {
+    const ImageType::SizeType odd = { { 49, 41, 33 } };
+    ImageType::Pointer        oddFixed = Texture(odd, 0.0, 0.0, 0.0);
+    ImageType::Pointer        oddMoving = Texture(odd, 1.5, -1.0, 0.5);
+    struct Variant
+    {
+      const char *              label;
+      const char *              model;
+      unsigned int              dimension;
+      float                     voxel;
+      std::vector<unsigned int> pca;
+      bool                      masked;
+    };
+    for (const Variant & variant :
+         { Variant{ "PCA", argv[3], 3, 0.f, { 2, 1 }, false },
+           Variant{ "PCA, masked", argv[3], 3, 0.f, { 2, 1 }, true },
+           Variant{ "PCA of half-resolution layers", argv[2], 3, 0.f, { 0, 2 }, false },
+           Variant{ "a 2D model", argv[4], 2, 0.f, {}, false },
+           Variant{ "a 2D model, masked", argv[4], 2, 0.f, {}, true },
+           Variant{ "a 2D model, PCA", argv[4], 2, 0.f, { 2, 1 }, false },
+           Variant{ "a 2D model, a voxel size of 1.5", argv[4], 2, 1.5f, {}, false },
+           Variant{ "a voxel size of 0.75", argv[3], 3, 0.75f, {}, false },
+           Variant{ "a voxel size of 1.5", argv[3], 3, 1.5f, {}, false },
+           Variant{ "a voxel size of 1.5, masked, PCA", argv[3], 3, 1.5f, { 2, 1 }, true },
+           Variant{ "instance normalisations", argv[5], 3, 0.f, {}, false },
+           Variant{ "instance normalisations, masked, PCA", argv[5], 3, 0.f, { 2, 1 }, true } })
+    {
+      auto run = [&](bool byRegions) {
+        auto coarse = CoarseType::New();
+        coarse->SetFixedImage(oddFixed);
+        coarse->SetMovingImage(oddMoving);
+        const std::vector<unsigned int> zeros(variant.dimension, 0u);
+        coarse->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
+                                                                    variant.dimension,
+                                                                    1,
+                                                                    zeros,
+                                                                    { variant.voxel, variant.voxel, variant.voxel },
+                                                                    zeros,
+                                                                    { true, true },
+                                                                    false));
+        coarse->SetDistance({ "L2", "L2" });
+        coarse->SetLayersWeight({ 1.f, 1.f });
+        coarse->SetPCA(variant.pca);
+        if (variant.masked)
+        {
+          coarse->SetFixedMask(HalfMask(oddFixed, 0, 30));
+          coarse->SetMovingMask(HalfMask(oddMoving, 1, 25));
+        }
+        coarse->SetBalanceLosses(true);
+        Configure(coarse);
+        if (byRegions)
+        {
+          coarse->SetRegionSize(16);
+          coarse->SetRegionHalo(3);
+          coarse->SetCostBoxBytes(CostBoxBytes);
+        }
+        return coarse;
+      };
+      const auto whole = run(false);
+      const auto byRegions = run(true);
+      if (CompareRuns(whole, byRegions, variant.label, 1e-3) != EXIT_SUCCESS ||
+          CompareRoutes(byRegions, run(true), scratch, variant.label) != EXIT_SUCCESS)
+      {
+        return EXIT_FAILURE;
+      }
+      const std::vector<double> & spreads = whole->GetLayerSpreads();
+      double                      spreadDifference = spreads.size() == 2 ? 0.0 : 1.0;
+      for (size_t l = 0; l < spreads.size() && l < byRegions->GetLayerSpreads().size(); ++l)
+      {
+        spreadDifference =
+          std::max(spreadDifference, std::abs(byRegions->GetLayerSpreads()[l] - spreads[l]) / std::abs(spreads[l]));
+      }
+      std::cout << variant.label << ": the layers' spreads within " << spreadDifference << " of theirs" << std::endl;
+      if (!(spreadDifference < 1e-5))
+      {
+        std::cerr << variant.label << ": the layers' spreads by regions differ from the whole-image run's."
+                  << std::endl;
         return EXIT_FAILURE;
       }
     }

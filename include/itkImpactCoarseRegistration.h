@@ -226,8 +226,16 @@ public:
    * alone; an image in memory serves them from its buffer); the caller keeps its readers alive. Request a region of
    * GetOutput() (or stream it to a writer) rather than the whole field, and take the field on the coarse grid from
    * GetCoarseGridTransform(). A feature layer a power of two coarser than the image, no coarser than the coarse
-   * cells, is computed by regions too, each region starting on its lattice. PCA fits its basis on the whole feature
-   * map and a model resampling the image to its own voxel size does not line up with the boxes: refused. */
+   * cells, is computed by regions too, each region starting on its lattice. A model of one dimension fewer runs on a
+   * box slice by slice along the axis closest to head-feet, as the whole-image run sweeps it. A model that resamples
+   * the image to its voxel size runs on its own grid: a box's samples of it resampled from the image's region they lie
+   * in as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's
+   * windows as the whole-image run pools them; every model on one grid, no coarser than the cells. A model that
+   * normalises by its input's statistics (its norm_count and norm_input methods) takes those of the whole image,
+   * gathered over the boxes by one pass a normalisation, so that a box is normalised as the image is. PCA fits each
+   * layer's basis on the fixed features of the whole layer (a swept model's: of the slices PcaSlices reads) from their
+   * sums gathered by one more pass over the boxes, and each image's features are centred by their own mean and
+   * projected on it before they are pooled. */
   /** @{ */
   /** Side of a box, in voxels; 0 (the default) reads the images whole. A model runs on a box with RegionHalo voxels
    * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */

@@ -108,7 +108,8 @@ public:
   SetMovingImage(const MovingImageType * image);
   itkGetConstObjectMacro(MovingImage, MovingImageType);
 
-  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid; absent, the whole image
+  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid or brought onto the fixed grid by
+   * nearest neighbour (by regions, region by region, the moving one through MovingTransform); absent, the whole image
    * counts, at no cost. As in the FireANTs engine, a voxel counts where the fixed mask and the moving mask warped by
    * the current field both hold (>= 0.5), on the grid each distance compares: every distance's terms are averaged
    * over those voxels only (NCC correlates them, LNCC averages its local terms there), in Static and Jacobian mode;
@@ -287,7 +288,8 @@ public:
    * mean). A model that resamples the image to its voxel size runs
    * on its own grid: a box's samples of it, those its cells' layers read, resampled from the image's region they lie in
    * as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's windows
-   * as the whole-image run pools them; every model of the image's dimension on one grid, no coarser than the cells.
+   * as the whole-image run pools them; every model on one grid, no coarser than the cells (in Static mode a model of
+   * one dimension fewer too; the swept Jacobian mode, which compares slices index by index, takes none).
    * In Static mode a model that normalises by its input's statistics (its norm_count and norm_input methods: TS's
    * instance normalisations, MIND's bound on its variance) takes those of the whole image, gathered over the boxes by
    * one pass a normalisation, so that a box is normalised as the image is; in the Jacobian mode every region keeps its

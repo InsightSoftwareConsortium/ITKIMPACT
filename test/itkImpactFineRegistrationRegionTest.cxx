@@ -119,6 +119,36 @@ CutMask(const ImageType * image)
   return mask;
 }
 
+// CutMask's region on a grid of its own, of voxels twice as wide, which a run brings onto the fixed grid.
+FineType::MaskImageType::Pointer
+CoarseCutMask(const ImageType * image)
+{
+  using MaskType = FineType::MaskImageType;
+  auto               mask = MaskType::New();
+  MaskType::SizeType size;
+  for (unsigned int a = 0; a < 3; ++a)
+  {
+    size[a] = (image->GetLargestPossibleRegion().GetSize()[a] + 1) / 2;
+  }
+  mask->SetRegions(size);
+  mask->SetSpacing(2.0);
+  ImageType::PointType origin = image->GetOrigin();
+  for (unsigned int a = 0; a < 3; ++a)
+  {
+    origin[a] += 0.5;
+  }
+  mask->SetOrigin(origin);
+  mask->Allocate();
+  itk::ImageRegionIteratorWithIndex<MaskType> it(mask, mask->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    MaskType::PointType point;
+    mask->TransformIndexToPhysicalPoint(it.GetIndex(), point);
+    it.Set(point[1] < 25.5 && point[0] + point[2] > 20.5 ? 1 : 0);
+  }
+  return mask;
+}
+
 double
 MaxDifference(const FieldType * a, const FieldType * b, const FieldType::RegionType & region)
 {
@@ -1347,9 +1377,9 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
 
   // 17. A model of one dimension fewer in Static mode: each box run slice by slice along the axis closest to head-feet,
   // its maps pooled to the cells along every axis. With and without a moving mask, with PCA (fitted and centred on the
-  // slices PcaSlices reads), and on images whose head-feet axis is their first, which the boxes then sweep. Whole
-  // against by regions on the resident maps, by bricks of one box from mapped files and with every box drawn at every
-  // iteration: the fields, and the losses at every iteration.
+  // slices PcaSlices reads), on images whose head-feet axis is their first, which the boxes then sweep, and with a
+  // voxel size of 1.5 the boxes are resampled to. Whole against by regions on the resident maps, by bricks of one box
+  // from mapped files and with every box drawn at every iteration: the fields, and the losses at every iteration.
   if (argc >= 5)
   {
     const auto               movingMask = CutMask(moving);
@@ -1370,11 +1400,13 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       bool         masked;
       bool         pca;
       bool         turned;
+      float        voxel;
     };
-    for (const Variant & variant : { Variant{ "", false, false, false },
-                                     Variant{ ", a moving mask", true, false, false },
-                                     Variant{ ", PCA", false, true, false },
-                                     Variant{ ", the head-feet axis first", false, false, true } })
+    for (const Variant & variant : { Variant{ "", false, false, false, 0.f },
+                                     Variant{ ", a moving mask", true, false, false, 0.f },
+                                     Variant{ ", PCA", false, true, false, 0.f },
+                                     Variant{ ", the head-feet axis first", false, false, true, 0.f },
+                                     Variant{ ", a voxel size of 1.5", false, false, false, 1.5f } })
     {
       auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
         auto fine = FineType::New();
@@ -1385,8 +1417,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         {
           fine->SetMovingMask(movingMask);
         }
-        fine->AddModelConfiguration(
-          itk::ImpactModelConfiguration(argv[4], 2, 1, { 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0 }, { true, true }, false));
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[4], 2, 1, { 0, 0 }, { variant.voxel, variant.voxel, variant.voxel }, { 0, 0 }, { true, true }, false));
         fine->SetDistance({ "L2", "L2" });
         fine->SetLayersWeight({ 1.f, 1.f });
         if (variant.pca)
@@ -1682,6 +1714,74 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(draws > 1e-4))
       {
         std::cerr << "With SamplingPercentage < 1, the runs by regions draw different cells." << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
+  // 21. Masks on grids of their own, voxels twice as wide, which each region brings onto the fixed grid by nearest
+  // neighbour, as the whole-image run brings them whole. In Static mode and in the Jacobian mode, a 3x3x3 convolution:
+  // whole against by regions on the resident maps, by bricks of one box from mapped files and with every box drawn at
+  // every iteration: the fields, and the losses at every iteration.
+  if (argc >= 4)
+  {
+    const auto fixedMask = CoarseCutMask(fixed);
+    const auto movingMask = CoarseCutMask(moving);
+    for (const bool jacobian : { false, true })
+    {
+      auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+        auto fine = FineType::New();
+        fine->SetFixedImage(fixed);
+        fine->SetMovingImage(moving);
+        fine->SetInitialDisplacementField(start);
+        fine->SetFixedMask(fixedMask);
+        fine->SetMovingMask(movingMask);
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+        if (jacobian)
+        {
+          fine->SetMode("Jacobian");
+        }
+        Configure(fine, 6);
+        if (byRegions)
+        {
+          fine->SetRegionSize(16);
+          fine->SetRegionHalo(1);
+          fine->SetRegionsPerIteration(regionsPerIteration);
+          if (mapped)
+          {
+            fine->SetResidentFeatureBudget(1);
+            fine->SetBrickBytes(1);
+            fine->SetScratchDirectory(scratch);
+          }
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto whole = run(false, false, 0);
+      double     fieldDifference = 0.0, lossDifference = 0.0;
+      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+      {
+        const auto region = run(true, route.first, route.second);
+        fieldDifference = std::max(
+          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+        {
+          const double value = whole->GetMetricValuesPerIteration()[i];
+          lossDifference =
+            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+        }
+      }
+      const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+      std::cout << "masks on grids of their own" << (jacobian ? ", Jacobian mode" : ", Static mode")
+                << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
+                << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
+      if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(moved > 1e-3))
+      {
+        std::cerr << "With masks on grids of their own, the runs by regions differ from the whole-image run."
+                  << std::endl;
         return EXIT_FAILURE;
       }
     }
