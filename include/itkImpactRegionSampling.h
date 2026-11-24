@@ -316,33 +316,40 @@ ImageLattice(size_t dim)
  * power of two: a layer of 64 / s samples keeps whole samples every s voxels, one of 64 / s + 1 a partial last one. */
 constexpr int64_t LatticeProbe = 65;
 
+/** The stride of the lattice of `samples` samples along an axis of the probe, and whether its last is `partial`; 0 for
+ * none. */
+inline int64_t
+ProbeStride(int64_t samples, bool & partial)
+{
+  auto          powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
+  const int64_t whole = LatticeProbe - 1;
+  partial = false;
+  if (samples == LatticeProbe)
+  {
+    return 1;
+  }
+  if (samples > 0 && whole % samples == 0 && powerOfTwo(whole / samples))
+  {
+    return whole / samples;
+  }
+  partial = samples > 1 && whole % (samples - 1) == 0 && powerOfTwo(whole / (samples - 1));
+  return partial ? whole / (samples - 1) : 0;
+}
+
 template <unsigned int Dim>
 std::vector<LayerLattice>
 LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
 {
-  auto                      powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
   std::vector<LayerLattice> lattices;
   for (const torch::Tensor & layer : layers)
   {
     LayerLattice lattice = ImageLattice(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
-      const int64_t samples = layer.size(2 + static_cast<int64_t>(d));
-      if (samples == LatticeProbe)
-      {
-        continue;
-      }
-      const int64_t whole = LatticeProbe - 1;
-      if (samples > 0 && whole % samples == 0 && powerOfTwo(whole / samples))
-      {
-        lattice.stride[d] = whole / samples;
-      }
-      else if (samples > 1 && whole % (samples - 1) == 0 && powerOfTwo(whole / (samples - 1)))
-      {
-        lattice.stride[d] = whole / (samples - 1);
-        lattice.partial[d] = true;
-      }
-      else
+      bool partial = false;
+      lattice.stride[d] = ProbeStride(layer.size(2 + static_cast<int64_t>(d)), partial);
+      lattice.partial[d] = partial;
+      if (lattice.stride[d] == 0)
       {
         itkGenericExceptionMacro(<< who << ": a feature layer of " << layer.sizes() << " for an image of "
                                  << LatticeProbe
@@ -403,7 +410,10 @@ ProbeRegionLattices(const std::vector<int64_t> & halo,
  * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. One coarser along any axis:
  * the whole layer is adaptive-average pooled to the cells along every axis, so each cell takes the samples that
  * pooling gives it. `lowPad` is where the cells start in the span, `spatial` the image; the span starts on the
- * layer's lattice and holds those samples (CellSpan's `align` and `extra`). */
+ * layer's lattice and holds those samples (CellSpan's `align` and `extra`). With `keep`, a tensor spatial axis along
+ * which a swept model keeps the image's voxels, the layer is pooled as the whole-image run pools a swept one: its
+ * samples along `keep` kept, those of the cells' voxels (and of the voxels past the last cell, with the last), and
+ * adaptive-average pooled to the cells along the others. */
 template <unsigned int Dim>
 torch::Tensor
 PoolLayerToCells(torch::Tensor                    layer,
@@ -413,52 +423,124 @@ PoolLayerToCells(torch::Tensor                    layer,
                  const std::vector<int64_t> &     c1,
                  const std::vector<PoolWindows> & windows,
                  const std::vector<int64_t> &     spatial,
-                 const char *                     who)
+                 const char *                     who,
+                 int64_t                          keep = -1)
 {
   std::vector<PoolWindows> relative(Dim);
-  const bool               atImage = lattice.stride == std::vector<int64_t>(Dim, 1);
+  const bool               atImage = keep < 0 && lattice.stride == std::vector<int64_t>(Dim, 1);
   for (unsigned int d = 0; d < Dim; ++d)
   {
     const int64_t axis = 2 + static_cast<int64_t>(d);
     const int64_t stride = lattice.stride[d];
     const int64_t low = windows[d].starts[c0[d]] - lowPad[d]; // the span's first voxel in the image
-    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
-    const int64_t length = lattice.Samples(d, spatial[d]); // the whole layer's samples
+    const int64_t length = lattice.Samples(d, spatial[d]);    // the whole layer's samples
+    const bool    kept = static_cast<int64_t>(d) == keep;
+    const int64_t cells = kept ? length : static_cast<int64_t>(windows[d].starts.size());
     if (low % stride != 0 || (stride > 1 && length < cells))
     {
       itkGenericExceptionMacro(<< who << ": a feature layer " << stride << " times coarser than the image, of "
                                << length << " samples for " << cells
                                << " cells, cannot be pooled to the cells by regions: it must be no coarser than they.");
     }
-    // Cell i's samples on the whole layer: [start(i), end(i)).
+    // Output i's samples on the whole layer: [start(i), end(i)); along `keep`, its samples are the voxels.
     auto start = [&](int64_t i) { return atImage ? windows[d].starts[i] : i * length / cells; };
     auto end = [&](int64_t i) { return atImage ? windows[d].ends[i] : ((i + 1) * length + cells - 1) / cells; };
-    const int64_t first = start(c0[d]) - low / stride;
-    const int64_t last = end(c1[d] - 1) - low / stride;
+    const int64_t i0 = kept ? windows[d].starts[c0[d]] : c0[d];
+    const int64_t i1 =
+      kept ? (c1[d] == static_cast<int64_t>(windows[d].starts.size()) ? length : windows[d].ends[c1[d] - 1]) : c1[d];
+    const int64_t first = start(i0) - low / stride;
+    const int64_t last = end(i1 - 1) - low / stride;
     if (first < 0 || last > layer.size(axis))
     {
       itkGenericExceptionMacro(<< who << ": the region read around the cells does not hold the samples of a layer of "
                                << layer.sizes() << " they pool; give RegionHalo more voxels.");
     }
     layer = layer.narrow(axis, first, last - first);
-    for (int64_t i = c0[d]; i < c1[d]; ++i)
+    for (int64_t i = i0; i < i1; ++i)
     {
-      relative[d].starts.push_back(start(i) - start(c0[d]));
-      relative[d].ends.push_back(end(i) - start(c0[d]));
+      relative[d].starts.push_back(start(i) - start(i0));
+      relative[d].ends.push_back(end(i) - start(i0));
     }
   }
   return PoolByWindows<Dim>(layer, relative);
 }
 
+/** Where F::interpolate, linear, reads output sample `o` of an axis of `in` samples resized to `out`, with
+ * `alignCorners` as torch takes it: torch's source index, in single precision. */
+inline float
+ResizeSource(int64_t in, int64_t out, int64_t o, bool alignCorners)
+{
+  if (alignCorners)
+  {
+    return (out > 1 ? static_cast<float>(in - 1) / static_cast<float>(out - 1) : 0.0f) * static_cast<float>(o);
+  }
+  return std::max(static_cast<float>(in) / static_cast<float>(out) * (static_cast<float>(o) + 0.5f) - 0.5f, 0.0f);
+}
+
+/** What F::interpolate, linear along every axis (align_corners `alignCorners`), gives at the samples [o0, o1) of a
+ * whole map of `inputSize` samples resized to `outputSize`, computed from `piece` ({1, C, piece...}), the samples of
+ * the whole map from `first` on: torch's source index and weights, in single precision, so that the piece reads what
+ * the whole map resized holds there. An axis the resizing leaves as it is is narrowed. */
+template <unsigned int Dim>
+torch::Tensor
+ResizeRegion(torch::Tensor                piece,
+             const std::vector<int64_t> & first,
+             const std::vector<int64_t> & inputSize,
+             const std::vector<int64_t> & outputSize,
+             const std::vector<int64_t> & o0,
+             const std::vector<int64_t> & o1,
+             const char *                 who,
+             bool                         alignCorners = false)
+{
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t axis = 2 + static_cast<int64_t>(d);
+    const int64_t in = inputSize[d];
+    if (in == outputSize[d])
+    {
+      piece = piece.narrow(axis, o0[d] - first[d], o1[d] - o0[d]);
+      continue;
+    }
+    std::vector<int64_t> below, above;
+    std::vector<float>   share;
+    for (int64_t o = o0[d]; o < o1[d]; ++o)
+    {
+      const float   source = ResizeSource(in, outputSize[d], o, alignCorners);
+      const int64_t lower = std::min(static_cast<int64_t>(std::floor(source)), in - 1);
+      const int64_t upper = lower + (lower < in - 1 ? 1 : 0);
+      if (lower < first[d] || upper - first[d] >= piece.size(axis))
+      {
+        itkGenericExceptionMacro(<< who << ": the samples " << lower << " to " << upper << " a resizing reads lie past "
+                                 << "the piece of " << piece.size(axis) << " from " << first[d] << " it is given.");
+      }
+      below.push_back(lower - first[d]);
+      above.push_back(upper - first[d]);
+      share.push_back(std::clamp(source - static_cast<float>(lower), 0.0f, 1.0f));
+    }
+    const auto           index = torch::TensorOptions().dtype(torch::kLong).device(piece.device());
+    std::vector<int64_t> shape(static_cast<size_t>(piece.dim()), 1);
+    shape[axis] = static_cast<int64_t>(share.size());
+    const torch::Tensor weight = torch::tensor(share, torch::kFloat32).to(piece.device()).view(shape);
+    piece = piece.index_select(axis, torch::tensor(below, index)) * (1.0 - weight) +
+            piece.index_select(axis, torch::tensor(above, index)) * weight;
+  }
+  return piece;
+}
+
 /** The share of a mask ({1, 1, span...}, floats) in each sample a layer of `lattice` has over that span, as the
  * whole-image run brings the whole mask to the whole layer (adaptive average pooling over the image's `spatial`
- * voxels); the mask itself for a layer at the image's resolution. `low` is the span's first voxel in the image. */
+ * voxels); the mask itself for a layer at the image's resolution. `low` is the span's first voxel in the image. The
+ * layer lies on a grid of `gridSpatial` samples, the image's or the one its model resamples the image to, and the
+ * region it was computed on holds `samples` of them from `first` on: the span itself on the image's grid. */
 template <unsigned int Dim>
 torch::Tensor
 SpanMaskShare(const torch::Tensor &        mask,
               const LayerLattice &         lattice,
               const std::vector<int64_t> & low,
-              const std::vector<int64_t> & spatial)
+              const std::vector<int64_t> & spatial,
+              const std::vector<int64_t> & first,
+              const std::vector<int64_t> & samples,
+              const std::vector<int64_t> & gridSpatial)
 {
   std::vector<PoolWindows> windows(Dim);
   bool                     same = true;
@@ -466,23 +548,36 @@ SpanMaskShare(const torch::Tensor &        mask,
   {
     const int64_t span = mask.size(2 + static_cast<int64_t>(d));
     const int64_t stride = lattice.stride[d];
-    const int64_t length = lattice.Samples(d, spatial[d]);
-    same = same && stride == 1;
-    for (int64_t j = low[d] / stride; j < low[d] / stride + lattice.Samples(d, span); ++j)
+    const int64_t length = lattice.Samples(d, gridSpatial[d]);
+    same = same && length == spatial[d] && first[d] == low[d] && samples[d] == span;
+    for (int64_t j = first[d] / stride; j < first[d] / stride + lattice.Samples(d, samples[d]); ++j)
     {
       // Sample j's voxels on the whole image, kept inside the span at its edges.
-      const int64_t first = stride == 1 ? j : j * spatial[d] / length;
-      const int64_t last = stride == 1 ? j + 1 : ((j + 1) * spatial[d] + length - 1) / length;
-      windows[d].starts.push_back(std::clamp<int64_t>(first - low[d], 0, span - 1));
-      windows[d].ends.push_back(std::clamp<int64_t>(last - low[d], windows[d].starts.back() + 1, span));
+      const int64_t start = j * spatial[d] / length;
+      const int64_t end = ((j + 1) * spatial[d] + length - 1) / length;
+      windows[d].starts.push_back(std::clamp<int64_t>(start - low[d], 0, span - 1));
+      windows[d].ends.push_back(std::clamp<int64_t>(end - low[d], windows[d].starts.back() + 1, span));
     }
   }
   return same ? mask : PoolByWindows<Dim>(mask, windows);
 }
 
-/** What the feature models of a region-sampled run must be: run at the image's resolution (no voxel size of
- * their own, whose lattice a region does not line up with), of the image's dimension and without PCA (`pca`, the
- * components kept per layer). The kept layers over the models, and whether one reads the image's statistics. */
+// How a region-sampled run runs its models: on regions of the image (Maps), on regions slice by slice along an axis of
+// the image (Swept, models of one dimension fewer), either way by each model's dimension (MapsOrSwept), or on the
+// patch around each point drawn (Patches, the sampled Jacobian mode).
+enum class RegionModelRun
+{
+  Maps,
+  Swept,
+  MapsOrSwept,
+  Patches
+};
+
+/** What the feature models of a region-sampled run must be: on maps run at the image's resolution (no voxel size of
+ * their own, whose lattice a region does not line up with, unless the caller `resamples` the regions itself), of the
+ * image's dimension, one fewer swept; on patches, with a patch of their receptive field (a strictly positive
+ * PatchSize), of the image's dimension or 2D in a volume. The kept layers over the models, and whether one reads the
+ * image's statistics. */
 struct RegionModels
 {
   size_t layerCount{ 0 };
@@ -494,33 +589,50 @@ RegionModels
 CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
                   const TSpacing &                              spacing,
                   unsigned int                                  dim,
-                  const std::vector<unsigned int> &             pca,
-                  const char *                                  who)
+                  const char *                                  who,
+                  RegionModelRun                                run,
+                  bool                                          resamples)
 {
-  if (std::any_of(pca.begin(), pca.end(), [](unsigned int components) { return components > 0; }))
-  {
-    itkGenericExceptionMacro(<< who
-                             << ": PCA fits its basis on the whole fixed feature map; set it to 0 with "
-                                "RegionSize.");
-  }
   RegionModels models;
   for (const ImpactModelConfiguration & config : configs)
   {
     models.layerCount += NumberOfKeptLayers(config);
-    const std::vector<float> & voxel = config.GetVoxelSize();
-    for (unsigned int a = 0; a < dim && voxel.size() == dim; ++a)
+    const unsigned int modelDimension = config.GetDimension();
+    if (run == RegionModelRun::Patches)
     {
-      if (voxel[a] > 0.0f && std::abs(voxel[a] - spacing[a]) > 1e-6 * spacing[a])
+      const std::vector<int64_t> & patchSize = config.GetPatchSize();
+      if (patchSize.size() < modelDimension || std::any_of(patchSize.begin(),
+                                                           patchSize.begin() + modelDimension,
+                                                           [](int64_t extent) { return extent <= 0; }))
       {
-        itkGenericExceptionMacro(<< who << ": " << config.GetModelPath()
-                                 << " resamples the image to its voxel size, whose lattice a region does not line up "
-                                    "with; give it the image's spacing, or no voxel size, with RegionSize.");
+        itkGenericExceptionMacro(<< who << ": SamplingPercentage in Jacobian mode runs each model on the patch of its "
+                                 << "receptive field around every drawn point; give " << config.GetModelPath()
+                                 << " a strictly positive PatchSize on each of its " << modelDimension << " axes.");
+      }
+      if (modelDimension != dim && (modelDimension != 2 || dim != 3))
+      {
+        itkGenericExceptionMacro(<< who << ": a " << modelDimension << "D model's patch cannot be cut in a " << dim
+                                 << "D image.");
       }
     }
-    if (config.GetDimension() != dim)
+    else
     {
-      itkGenericExceptionMacro(<< who << ": " << config.GetModelPath() << " is a " << config.GetDimension()
-                               << "D model; RegionSize runs models of the image's dimension.");
+      const std::vector<float> & voxel = config.GetVoxelSize();
+      for (unsigned int a = 0; a < dim && voxel.size() == dim && !resamples; ++a)
+      {
+        if (voxel[a] > 0.0f && std::abs(voxel[a] - spacing[a]) > 1e-6 * spacing[a])
+        {
+          itkGenericExceptionMacro(<< who << ": " << config.GetModelPath()
+                                   << " resamples the image to its voxel size, whose lattice a region does not line up "
+                                      "with; give it the image's spacing, or no voxel size, with RegionSize.");
+        }
+      }
+      const unsigned int expected = run == RegionModelRun::Swept ? dim - 1 : dim;
+      if (modelDimension != expected && (run != RegionModelRun::MapsOrSwept || modelDimension + 1 != dim))
+      {
+        itkGenericExceptionMacro(<< who << ": " << config.GetModelPath() << " is a " << modelDimension << "D model; "
+                                 << "RegionSize runs models of " << expected << " dimensions in this mode.");
+      }
     }
     models.takesMetadata = models.takesMetadata || config.GetImpl()->nArgs >= 4;
   }
@@ -565,40 +677,79 @@ MetadataByBlocks(const TDirection & direction, unsigned int dim, TReadBlocks && 
   return metadata;
 }
 
+/** An image region ({1, 1, span...}) as a model takes it: in its precision, its channels repeated. */
+template <unsigned int Dim>
+torch::Tensor
+ModelInput(const ImpactModelConfiguration & config, const torch::Tensor & image)
+{
+  torch::Tensor input = image.to(GetModelDtype(config));
+  if (config.GetNumberOfChannels() > 1)
+  {
+    std::vector<int64_t> repeats(Dim + 2, 1);
+    repeats[1] = static_cast<int64_t>(config.GetNumberOfChannels());
+    input = input.repeat(repeats);
+  }
+  return input;
+}
+
 /** The kept feature layers of an image region ({1, 1, span...}), each at its own resolution, each model run on the
  * region whole in one forward, `metadata` (when given) set on the configurations first; the region itself with no
- * model. `layerCount` is what the caller keeps, checked. */
+ * model. A model of one dimension fewer than the image runs on its slices along ITK axis `sweepAxis`, one forward a
+ * slice, its layers stacked along that axis, as ExtractFeatureLayers sweeps it. With `withGrad` the layers keep the
+ * graph back to `image`. `layerCount` is what the caller keeps, checked. `norms`, when given, holds for each model the
+ * statistics over the whole image of its normalisations (Forward), so that the region is normalised as the image. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
-RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
-             const torch::Tensor &                         image,
-             const torch::Device &                         device,
-             size_t                                        layerCount,
-             const ImpactImageMetadata *                   metadata,
-             const char *                                  who)
+RegionLayers(const std::vector<ImpactModelConfiguration> &   configs,
+             const torch::Tensor &                           image,
+             const torch::Device &                           device,
+             size_t                                          layerCount,
+             const ImpactImageMetadata *                     metadata,
+             const char *                                    who,
+             bool                                            withGrad,
+             int                                             sweepAxis,
+             const std::vector<std::vector<torch::Tensor>> * norms)
 {
   if (configs.empty())
   {
     return { image };
   }
   std::vector<torch::Tensor> layers;
-  torch::NoGradGuard         noGrad;
-  for (const ImpactModelConfiguration & config : configs)
+  torch::AutoGradMode        gradMode(withGrad);
+  for (size_t c = 0; c < configs.size(); ++c)
   {
+    const ImpactModelConfiguration & config = configs[c];
     if (metadata != nullptr)
     {
       config.GetImpl()->imageMetadata = *metadata;
     }
     ModelTo(config, device);
-    torch::Tensor input = image.to(GetModelDtype(config));
-    if (config.GetNumberOfChannels() > 1)
+    const torch::Tensor             input = ModelInput<Dim>(config, image);
+    std::vector<torch::jit::IValue> outputs;
+    if (config.GetDimension() < Dim)
     {
-      std::vector<int64_t> repeats(Dim + 2, 1);
-      repeats[1] = static_cast<int64_t>(config.GetNumberOfChannels());
-      input = input.repeat(repeats);
+      const int64_t                           sliceAxis = 2 + static_cast<int64_t>(Dim) - 1 - sweepAxis;
+      std::vector<std::vector<torch::Tensor>> slices; // [layer][slice]
+      for (int64_t s = 0; s < input.size(sliceAxis); ++s)
+      {
+        const std::vector<torch::jit::IValue> sliceOutputs = Forward(config, input.select(sliceAxis, s));
+        slices.resize(sliceOutputs.size());
+        for (size_t i = 0; i < sliceOutputs.size(); ++i)
+        {
+          slices[i].push_back(sliceOutputs[i].toTensor());
+        }
+      }
+      for (const std::vector<torch::Tensor> & layer : slices)
+      {
+        outputs.emplace_back(torch::stack(layer, sliceAxis));
+      }
     }
-    const std::vector<torch::jit::IValue> outputs = Forward(config, input);
-    const std::vector<bool> &             mask = config.GetLayersMask();
+    else
+    {
+      outputs = Forward(
+        config, input, config.GetImpl()->imageMetadata, norms != nullptr ? (*norms)[c] : std::vector<torch::Tensor>{});
+    }
+    const std::vector<bool> & mask = config.GetLayersMask();
     for (size_t i = 0; i < outputs.size(); ++i)
     {
       if (i < mask.size() && !mask[i])
@@ -921,6 +1072,361 @@ ResidentBudget(const torch::Device & device)
   return pages > 0 && pageSize > 0 ? static_cast<double>(pages) * static_cast<double>(pageSize) * 0.25
                                    : 4.0 * 1024.0 * 1024.0 * 1024.0;
 #endif
+}
+
+/** The grid the models of a region-sampled run see the image on: the image's own, or the one models that resample
+ * the image to their voxel size (ResampleToVoxelSize, the corners aligned) see it on, `spatial` samples along each
+ * tensor axis, their layers pooled to the cells over that grid's adaptive windows (`windows`), as the whole-image run
+ * pools them. */
+struct FeatureGrid
+{
+  std::vector<int64_t>     spatial;
+  std::vector<PoolWindows> windows;
+  bool                     resamples{ false };
+
+  /** Along tensor axis d, the voxels [v0, v1) of an image of `voxels` voxels the samples [s0, s1) are interpolated
+   * from (torch's source index); the same without resampling. */
+  std::pair<int64_t, int64_t>
+  Voxels(unsigned int d, int64_t s0, int64_t s1, int64_t voxels) const
+  {
+    if (!resamples)
+    {
+      return { s0, s1 };
+    }
+    return { static_cast<int64_t>(std::floor(ResizeSource(voxels, spatial[d], s0, true))),
+             std::min(voxels, static_cast<int64_t>(std::floor(ResizeSource(voxels, spatial[d], s1 - 1, true))) + 2) };
+  }
+};
+
+/** The grid of the models of `configSets` on an image of `spatial` voxels (tensor order) and `spacing` (ITK order)
+ * whose cells pool `windows`: the one every model with a voxel size on each axis resamples the image to, which must be
+ * one and no coarser than the cells; the image's without. */
+template <unsigned int Dim>
+FeatureGrid
+ModelFeatureGrid(const std::vector<const std::vector<ImpactModelConfiguration> *> & configSets,
+                 const std::vector<int64_t> &                                       spatial,
+                 const std::vector<double> &                                        spacing,
+                 const std::vector<PoolWindows> &                                   windows,
+                 const char *                                                       who)
+{
+  FeatureGrid grid{ spatial, windows, false };
+  bool        sized = false;
+  for (const auto * configs : configSets)
+  {
+    for (const ImpactModelConfiguration & config : *configs)
+    {
+      std::vector<int64_t>       size = spatial;
+      const std::vector<float> & voxel = config.GetVoxelSize();
+      if (voxel.size() == Dim && std::all_of(voxel.begin(), voxel.end(), [](float v) { return v > 0.0f; }))
+      {
+        for (unsigned int d = 0; d < Dim; ++d)
+        {
+          size[d] = std::max<int64_t>(
+            1, std::llround(static_cast<double>(spatial[d] - 1) * spacing[Dim - 1 - d] / voxel[Dim - 1 - d]) + 1);
+        }
+      }
+      if (sized && size != grid.spatial)
+      {
+        itkGenericExceptionMacro(<< who
+                                 << ": with RegionSize every model sees the image on one grid; give them the "
+                                    "same voxel size.");
+      }
+      grid.spatial = size;
+      sized = true;
+    }
+  }
+  grid.resamples = grid.spatial != spatial;
+  for (unsigned int d = 0; grid.resamples && d < Dim; ++d)
+  {
+    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
+    if (grid.spatial[d] < cells)
+    {
+      itkGenericExceptionMacro(<< who << ": the voxel size gives the models a grid of " << grid.spatial[d]
+                               << " samples along an axis of " << cells
+                               << " cells; with RegionSize their layers must be no coarser than the cells.");
+    }
+    grid.windows[d] = PoolWindows{};
+    for (int64_t c = 0; c < cells; ++c)
+    {
+      grid.windows[d].starts.push_back(c * grid.spatial[d] / cells);
+      grid.windows[d].ends.push_back(((c + 1) * grid.spatial[d] + cells - 1) / cells);
+    }
+  }
+  return grid;
+}
+
+/** Where the features of some cells are computed: the region `span` of the image's grid read, the samples [s0, s1) of
+ * the models' grid the models run on, interpolated from the span's voxels from `v0` on (the same samples without
+ * resampling), and `lowPad`, where the cells' samples start in them. */
+template <typename TRegion>
+struct FeatureRegion
+{
+  TRegion              span;
+  std::vector<int64_t> lowPad, v0, s0, s1;
+
+  /** Whether the samples are the whole grid of `spatial` samples. */
+  bool
+  SpansGrid(const std::vector<int64_t> & spatial) const
+  {
+    return s1 == spatial && std::all_of(s0.begin(), s0.end(), [](int64_t first) { return first == 0; });
+  }
+};
+
+/** The FeatureRegion of the cells [c0, c1) on `grid`, over an image of `spatial` voxels whose grid's first index is
+ * `index`: their samples with `reach` around, starting on a multiple of `align`, cut at the grid; along a tensor axis
+ * where `toEnd` holds and the cells end the grid, on to its end. */
+template <unsigned int Dim, typename TRegion>
+FeatureRegion<TRegion>
+FeatureRegionOf(const FeatureGrid &                 grid,
+                const std::vector<int64_t> &        spatial,
+                const typename TRegion::IndexType & index,
+                const std::vector<int64_t> &        c0,
+                const std::vector<int64_t> &        c1,
+                const std::vector<int64_t> &        reach,
+                int64_t                             align,
+                const std::vector<bool> &           toEnd)
+{
+  FeatureRegion<TRegion> region{
+    {}, std::vector<int64_t>(Dim), std::vector<int64_t>(Dim), std::vector<int64_t>(Dim), std::vector<int64_t>(Dim)
+  };
+  typename TRegion::IndexType first;
+  first.Fill(0);
+  const TRegion samples = CellSpan<TRegion>(c0, c1, reach, grid.windows, grid.spatial, first, region.lowPad, align);
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const unsigned int a = Dim - 1 - d;
+    region.s0[d] = samples.GetIndex()[a];
+    region.s1[d] = toEnd[d] && c1[d] == static_cast<int64_t>(grid.windows[d].starts.size())
+                     ? grid.spatial[d]
+                     : region.s0[d] + static_cast<int64_t>(samples.GetSize()[a]);
+    const auto [low, high] = grid.Voxels(d, region.s0[d], region.s1[d], spatial[d]);
+    region.v0[d] = low;
+    region.span.SetIndex(a, index[a] + static_cast<IndexValueType>(low));
+    region.span.SetSize(a, static_cast<SizeValueType>(high - low));
+  }
+  return region;
+}
+
+/** The image the models run on over `region`, from `piece`, the image's voxels of its span ({1, 1, span...}):
+ * resampled to their grid as ResampleToVoxelSize resamples the whole image (ResizeRegion, the corners aligned), or the
+ * piece itself. */
+template <unsigned int Dim, typename TRegion>
+torch::Tensor
+FeatureInput(const FeatureGrid &            grid,
+             const FeatureRegion<TRegion> & region,
+             const torch::Tensor &          piece,
+             const std::vector<int64_t> &   spatial,
+             const char *                   who)
+{
+  return grid.resamples ? ResizeRegion<Dim>(piece, region.v0, spatial, grid.spatial, region.s0, region.s1, who, true)
+                        : piece;
+}
+
+/** The statistics over the whole image of each model's normalisations by its input's own (NormCount), one pass over
+ * the boxes a normalisation: each box's input of it (NormInput, those gathered before handed over), on its own
+ * lattice, summed over the box's own samples in double precision, gives the mean and the biased variance of the whole
+ * image's, as the whole-image run normalises it. `boxInput(box, lowPad)` gives the image a box's features are
+ * computed on, on to the end of the models' grid (`windows`, `spatial`) along an axis the box ends it, and `lowPad`,
+ * where the box's cells start in it. A model of fewer dimensions than the image, run slice by slice, takes none. */
+template <unsigned int Dim, typename TBoxInput>
+std::vector<std::vector<torch::Tensor>>
+GatherNorms(const std::vector<ImpactModelConfiguration> & configs,
+            const ImpactImageMetadata &                   metadata,
+            const std::vector<CellBox> &                  boxes,
+            const std::vector<PoolWindows> &              windows,
+            const std::vector<int64_t> &                  spatial,
+            const torch::Device &                         device,
+            TBoxInput &&                                  boxInput)
+{
+  torch::NoGradGuard                      noGrad;
+  std::vector<std::vector<torch::Tensor>> norms(configs.size());
+  for (size_t c = 0; c < configs.size(); ++c)
+  {
+    ModelTo(configs[c], device);
+    const int64_t count = configs[c].GetDimension() == Dim ? NormCount(configs[c]) : 0;
+    for (int64_t k = 0; k < count; ++k)
+    {
+      // The stride of the normalisation's input along each axis, from a probe, as a layer's lattice: the sizes of a
+      // short box's input and of its own do not tell it. On no lattice (a valid convolution trims it), the probe's
+      // ratio, as a box's was taken.
+      std::vector<int64_t> probe(Dim + 2, LatticeProbe);
+      probe[0] = probe[1] = 1;
+      const torch::Tensor probed =
+        NormInput(configs[c],
+                  ModelInput<Dim>(configs[c], torch::zeros(probe, torch::TensorOptions().device(device))),
+                  metadata,
+                  norms[c]);
+      std::vector<int64_t> strides(Dim);
+      for (unsigned int d = 0; d < Dim; ++d)
+      {
+        bool          partial = false;
+        const int64_t samples = probed.size(2 + static_cast<int64_t>(d));
+        strides[d] = ProbeStride(samples, partial);
+        if (strides[d] == 0)
+        {
+          strides[d] = int64_t{ 1 } << std::max<int64_t>(
+                         0, std::llround(std::log2(static_cast<double>(LatticeProbe) / static_cast<double>(samples))));
+        }
+      }
+      torch::Tensor sums;
+      double        samples = 0.0;
+      for (const CellBox & box : boxes)
+      {
+        std::vector<int64_t> lowPad(Dim);
+        torch::Tensor        own =
+          NormInput(configs[c], ModelInput<Dim>(configs[c], boxInput(box, lowPad)), metadata, norms[c]);
+        for (unsigned int d = 0; d < Dim; ++d)
+        {
+          // The box's own samples, from its cells' first to the next box's, on the lattice of the input.
+          const int64_t axis = 2 + static_cast<int64_t>(d);
+          const int64_t stride = strides[d];
+          const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
+          const int64_t end = box.cell1[d] == cells ? spatial[d] : windows[d].starts[box.cell1[d]];
+          const int64_t first = (lowPad[d] + stride - 1) / stride;
+          const int64_t last =
+            std::min(own.size(axis), (lowPad[d] + end - windows[d].starts[box.cell0[d]] + stride - 1) / stride);
+          own = own.narrow(axis, first, last - first);
+        }
+        const torch::Tensor part = own.to(torch::kFloat64).transpose(0, 1).reshape({ own.size(1), -1 });
+        const torch::Tensor moments = torch::stack({ part.sum(1), (part * part).sum(1) });
+        sums = sums.defined() ? sums + moments : moments;
+        samples += static_cast<double>(part.size(1));
+      }
+      const torch::Tensor mean = sums[0] / samples;
+      norms[c].push_back(
+        torch::stack({ mean, (sums[1] / samples - mean * mean).clamp_min(0.0) }).to(GetModelDtype(configs[c])));
+    }
+  }
+  return norms;
+}
+
+/** The sums a PCA basis is fitted from: of the samples {C, n} added, in double precision and centred on the first
+ * ones' mean; the basis of `components` they give, as PcaFit fits it, and their mean. */
+struct PcaSums
+{
+  torch::Tensor shift, sum, products;
+  double        count{ 0.0 };
+
+  void
+  Add(const torch::Tensor & samples)
+  {
+    if (samples.size(1) == 0)
+    {
+      return;
+    }
+    const torch::Tensor own = samples.to(torch::kFloat64);
+    if (!shift.defined())
+    {
+      shift = own.mean(1, true);
+    }
+    const torch::Tensor centred = own - shift;
+    sum = sum.defined() ? sum + centred.sum(1, true) : centred.sum(1, true);
+    products = products.defined() ? products + centred.mm(centred.t()) : centred.mm(centred.t());
+    count += static_cast<double>(own.size(1));
+  }
+
+  torch::Tensor
+  Basis(int64_t components) const
+  {
+    const torch::Tensor mean = sum / count;
+    return PcaBasisOfCovariance(((products - count * mean.mm(mean.t())) / (count - 1.0)).to(torch::kFloat32),
+                                components);
+  }
+
+  torch::Tensor
+  Mean() const
+  {
+    return (shift + sum / count).to(torch::kFloat32);
+  }
+
+  /** The basis of `components` and the mean, into `basis` and `mean`, when samples were added: whether they were. */
+  bool
+  Fit(int64_t components, torch::Tensor & basis, torch::Tensor & mean) const
+  {
+    if (count > 0.0)
+    {
+      basis = Basis(components);
+      mean = Mean();
+    }
+    return count > 0.0;
+  }
+};
+
+/** The PcaSums of `layers` layers over `boxes`: `own(box)` gives a box's own samples of every layer ({C, n} each), of
+ * which those of the layers `takes(l, samples)` keeps are added. */
+template <typename TOwn, typename TTakes>
+std::vector<PcaSums>
+PcaSumsOverBoxes(const std::vector<CellBox> & boxes, size_t layers, TOwn && own, TTakes && takes)
+{
+  std::vector<PcaSums> sums(layers);
+  for (const CellBox & box : boxes)
+  {
+    const std::vector<torch::Tensor> samples = own(box);
+    for (size_t l = 0; l < samples.size(); ++l)
+    {
+      if (takes(l, samples[l]))
+      {
+        sums[l].Add(samples[l]);
+      }
+    }
+  }
+  return sums;
+}
+
+/** The widest of each axis's windows. */
+inline std::vector<int64_t>
+WidestWindows(const std::vector<PoolWindows> & windows)
+{
+  std::vector<int64_t> widest;
+  for (const PoolWindows & along : windows)
+  {
+    int64_t side = 0;
+    for (size_t c = 0; c < along.starts.size(); ++c)
+    {
+      side = std::max(side, along.ends[c] - along.starts[c]);
+    }
+    widest.push_back(side);
+  }
+  return widest;
+}
+
+/** The samples PCA reads of a layer ({1, C, samples...}) of a span among those that belong to the cells [c0, c1), {C,
+ * n}. Those are the samples of their voxels, the voxels past the last cell with the last, along every axis, at the
+ * layer's resolution, so that the boxes of a grid share out the whole layer's samples; `lowPad` is where the cells
+ * start in the span, which starts on the layer's lattice. PCA reads all of them, or, of a swept model's layer, which
+ * keeps the samples of the grid along tensor spatial axis `keep`, those of the slices PcaSlices reads of the whole
+ * layer. */
+template <unsigned int Dim>
+torch::Tensor
+PcaOwnSamples(const torch::Tensor &            layer,
+              const LayerLattice &             lattice,
+              const std::vector<int64_t> &     lowPad,
+              const std::vector<int64_t> &     c0,
+              const std::vector<int64_t> &     c1,
+              const std::vector<PoolWindows> & windows,
+              const std::vector<int64_t> &     spatial,
+              int64_t                          keep)
+{
+  const int64_t channels = layer.size(1);
+  torch::Tensor own = layer;
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t stride = lattice.stride[d];
+    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
+    const int64_t first = windows[d].starts[c0[d]] / stride;
+    const int64_t last = c1[d] == cells ? lattice.Samples(d, spatial[d]) : windows[d].starts[c1[d]] / stride;
+    own = own.narrow(2 + static_cast<int64_t>(d), lowPad[d] / stride, last - first);
+  }
+  if (keep >= 0)
+  {
+    std::vector<int64_t> shape(Dim + 1, 1);
+    shape[1 + keep] = spatial[keep];
+    const torch::Tensor slices = PcaSlices(torch::arange(spatial[keep]).view(shape), 1 + keep).flatten();
+    const int64_t       first = windows[keep].starts[c0[keep]];
+    const torch::Tensor local = slices.masked_select((slices >= first) & (slices < first + own.size(2 + keep))) - first;
+    own = own.index_select(2 + keep, local.to(own.device()));
+  }
+  return own.reshape({ channels, -1 });
 }
 
 } // namespace Impact

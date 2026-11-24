@@ -108,7 +108,8 @@ public:
   SetMovingImage(const MovingImageType * image);
   itkGetConstObjectMacro(MovingImage, MovingImageType);
 
-  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid; absent, the whole image
+  /** Optional masks (a voxel is in where the mask is not 0), each on its image's grid or brought onto the fixed grid by
+   * nearest neighbour (by regions, region by region, the moving one through MovingTransform); absent, the whole image
    * counts, at no cost. As in the FireANTs engine, a voxel counts where the fixed mask and the moving mask warped by
    * the current field both hold (>= 0.5), on the grid each distance compares: every distance's terms are averaged
    * over those voxels only (NCC correlates them, LNCC averages its local terms there), in Static and Jacobian mode;
@@ -240,7 +241,8 @@ public:
    *   the network term d(feature)/d(displacement) -- needed for a non-local backbone (SAM), whose
    *   warped feature map is not the feature of the warped image.
    * (The metric's "Jacobian" samples per-point patches; here, on the dense field, it re-extracts the
-   * whole warped image -- same principle, differentiating the similarity through the model.) */
+   * whole warped image -- same principle, differentiating the similarity through the model.) With RegionSize the
+   * Jacobian mode re-extracts the moving features a unit of the grid at a time, never the whole image. */
   itkSetMacro(Mode, std::string);
   itkGetConstReferenceMacro(Mode, std::string);
   /** "Jacobian" mode with a model of lower dimension than the image (a 2D model on a volume): number of
@@ -258,28 +260,60 @@ public:
    * RegionSize voxels a side (rounded to whole cells of the control grid), with the region of the
    * moving image each reads, through the images' own pipelines (SetRequestedRegion then Update: an
    * itk::ImageFileReader with UseStreamingOn reads those regions alone; an image in memory serves them from its
-   * buffer), and keeps their features pooled to the control grid. The iterations read no image. Where the pooled maps
-   * do not fit the device they stay in files of ScratchDirectory mapped to memory, with the control grid and the
-   * optimizer's state, and an iteration steps every cell, as the whole-image run does, by bricks of boxes brought to
-   * the device one at a time; one the fixed mask does not reach costs its share of the regularizer alone.
-   * A brick's loss is the dense loss restricted to its cells,
-   * weighed by its share of the cells that count (those the masks keep, the moving one where the field reads it:
-   * they are counted over the grid before the bricks are stepped), with
-   * the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
+   * buffer), and keeps their features pooled to the control grid. The iterations read no image in Static mode, save to
+   * refresh the moving maps (FeatureMapUpdateInterval). Where the pooled maps do not fit the device they stay in files
+   * of ScratchDirectory mapped to memory, with the control grid and the optimizer's state, and an iteration steps every
+   * cell, as the whole-image run does, by bricks of boxes brought to the device one at a time; one the fixed mask does
+   * not reach costs its share of the regularizer alone. A
+   * brick's loss is the dense loss restricted to its cells, weighed by its share of the cells that count (those the
+   * masks keep, the moving one where the field reads it: they are counted over the grid before the bricks are stepped),
+   * with the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
    * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
-   * iteration costs and holds then follows those boxes, not the image.
-   * Static mode, point-wise distances, feature layers at the image's resolution (MIND) or
-   * a power of two coarser, no coarser than the control cells (a region then starts on the layer's lattice); the
-   * Jacobian mode, FeatureMapUpdateInterval, PCA and a model that resamples the image are refused. The initial
-   * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
-   * as the whole-image run resizes its dense field, by regions through its own pipeline as the images are (a
-   * streaming reader, or the output of ImpactCoarseRegistration run by regions, is asked for the region around
-   * each box alone). The output is produced by region:
-   * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
+   * iteration costs and holds then follows those boxes, not the image. With SamplingPercentage < 1, Static mode reads
+   * at every iteration each cell with that chance, drawn by a hash of the cell's number on the grid, the iteration and
+   * Seed: every unit and every pass of an iteration draw the same cells, as many on average as the whole-image run
+   * draws, though not the same ones.
+   * Point-wise distances; LNCC, whose windows a unit takes on its cells and half the widest window around them,
+   * keeping the terms of its own; NCC and OrganDice, statistics over all the points, from their sums gathered over
+   * every unit at every iteration without the graph (with RegionsPerIteration too, a pass over the grid), of whose
+   * gradient each unit's step takes its part; feature layers at the
+   * image's resolution (MIND) or a power of two coarser, no coarser than the control cells (a region then starts on the
+   * layer's lattice). PCA in Static mode: each layer's basis fitted on the fixed features of every voxel from their
+   * sums gathered by one more pass over the boxes, each image's maps centred by its own features' mean and projected on
+   * it as they are pooled. In the Jacobian mode a swept model's basis is fitted so for each axis it sweeps, on the
+   * slices PcaSlices reads, and its moving features centred by their own slices' mean at every iteration (a pass
+   * without the graph); on patches the basis is fitted at every iteration on its points, both sides centred by their
+   * mean over them (a pass gathers their sums); the dense mode fits it as Static mode, its moving features centred by
+   * their mean over every voxel at every iteration (a pass without the graph, as the whole-image run detaches that
+   * mean). A model that resamples the image to its voxel size runs
+   * on its own grid: a box's samples of it, those its cells' layers read, resampled from the image's region they lie in
+   * as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's windows
+   * as the whole-image run pools them; every model on one grid, no coarser than the cells (in Static mode a model of
+   * one dimension fewer too; the swept Jacobian mode, which compares slices index by index, takes none).
+   * In Static mode a model that normalises by its input's statistics (its norm_count and norm_input methods: TS's
+   * instance normalisations, MIND's bound on its variance) takes those of the whole image, gathered over the boxes by
+   * one pass a normalisation, so that a box is normalised as the image is; in the Jacobian mode every region keeps its
+   * own. In Static mode a model of one dimension fewer runs on a box slice by slice along the axis closest to
+   * head-feet, as the whole-image run sweeps it, its maps pooled to the cells along every axis (with PCA, fitted and
+   * centred on the slices PcaSlices reads). FeatureMapUpdateInterval pools the moving maps again, a box at a time, from
+   * the moving image the field warps (with PCA, after a pass that takes their new mean). The Jacobian mode keeps the
+   * fixed features pooled to the cells, as Static mode, and at every iteration takes each unit (a brick, or a box
+   * drawn) on its own: the field interpolated at the voxels of its cells and RegionHalo around them (cut at the image),
+   * the moving image read by regions where they land and warped there, the network run on the warped region with its
+   * graph and its layers pooled to the unit's cells, as the whole-image run pools them. A model of one dimension fewer
+   * is run slice by slice along the axis drawn for the iteration, against fixed maps kept for each axis. With
+   * SamplingPercentage < 1 the points are drawn as the whole-image run draws them, and those of a unit each give a
+   * patch read from the two images by regions, run a batch at a time. Every way reproduces the whole-image run; a brick
+   * that runs out of device memory is replayed at half its side, down to a box. The initial displacement field may lie
+   * on any grid: it is read at the fixed image's voxels and resized to the control grid, as the whole-image run resizes
+   * its dense field, by regions through its own pipeline as the images are (a streaming reader, or the output of
+   * ImpactCoarseRegistration run by regions, is asked for the region around each box alone). The output is produced by
+   * region: request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
    * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. With the pooled
    * maps in mapped files, nothing the run holds in host memory or on the device grows with the image, save about
-   * a hundred bytes a box (the lists of the boxes and their counts of cells): the control grid of
-   * GetControlGridTransform() is a mapped file too. */
+   * a hundred bytes a box (the lists of the boxes and their counts of cells) and, in the sampled Jacobian mode, the
+   * points an iteration draws (24 bytes each, on the host): the control grid of GetControlGridTransform() is a mapped
+   * file too. */
   /** @{ */
   /** Side of a box, in voxels; 0 (the default) reads the images whole. A model runs on a box with RegionHalo voxels
    * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
@@ -292,10 +326,12 @@ public:
    * GetMetricValuesPerIteration() holds the loss over the drawn boxes, scaled to the grid. */
   itkSetMacro(RegionsPerIteration, unsigned int);
   itkGetConstMacro(RegionsPerIteration, unsigned int);
-  /** Most bytes a step of a brick may hold on the device when the pooled maps are not resident: a brick is as many
+  /** Most bytes a step of a brick may hold on the device when the iterations go by bricks: a brick is as many
    * boxes a side as fit it, one at least, so that a box of RegionSize is the least a step takes. 0 (the default):
    * an eighth of what ResidentFeatureBudget's default allows. The bricks set the memory, not the result. Not read
-   * with RegionsPerIteration, whose boxes are stepped one at a time. */
+   * with RegionsPerIteration, whose boxes are stepped one at a time. In the Jacobian mode a step holds besides the
+   * network's activations over the brick's voxels and their halo, forward and backward, measured on CUDA on a probe
+   * region of 65 voxels a side (four floats a channel of each layer elsewhere). */
   itkSetMacro(BrickBytes, SizeValueType);
   itkGetConstMacro(BrickBytes, SizeValueType);
   /** How far the region read around a box extends past it, in voxels on every axis whatever their spacing: half the
@@ -312,14 +348,15 @@ public:
   using TransformType = Transform<double, ImageDimension, ImageDimension>;
   itkSetConstObjectMacro(MovingTransform, TransformType);
   itkGetConstObjectMacro(MovingTransform, TransformType);
-  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there:
-   * within it every iteration compares them whole (the dense run on the pooled maps); past it they stay in mapped
-   * files and every iteration brings them to the device a brick at a time. 0 (the default): half the device memory
-   * free when the run starts, a quarter of the machine's on the CPU. What is held against it is GetResidentBytes(),
-   * all that grows with the image on that route: the maps, the control grid and Adam's state, and the graph of an
-   * iteration over the whole grid. GetResidentFeatures() tells which route a run took. The memory is read once,
-   * when the run starts: what another process takes of the device afterwards is not seen, and the resident route
-   * can then run out of it. */
+  /** Most bytes the run may hold on the device, at its peak, for the pooled feature maps to stay resident there.
+   * When the graph of an iteration over the whole grid fits it besides, every iteration compares them whole (the
+   * dense run on the pooled maps); when only the maps, the control grid and Adam's state fit, with a box's step
+   * beside them, every iteration steps the grid a brick at a time on them, the bricks within what the budget leaves;
+   * past it they stay in mapped files and every iteration brings them to the device a brick at a time. 0 (the
+   * default): half the device memory free when the run starts, a quarter of the machine's on the CPU. What is held
+   * against it is GetResidentBytes(), all that grows with the image on the route taken. GetResidentFeatures() tells
+   * whether the maps stayed resident. The memory is read once, when the run starts: what another process takes of
+   * the device afterwards is not seen, and the resident route can then run out of it. */
   itkSetMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatureBudget, SizeValueType);
   itkGetConstMacro(ResidentFeatures, bool);

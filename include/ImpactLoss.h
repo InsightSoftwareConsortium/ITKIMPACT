@@ -184,6 +184,16 @@ public:
     throw std::runtime_error("SimilarityFromMoments() is not implemented for this loss");
   }
 
+  /** For a global distance (IsPerPointMean false, not spatial), the loss from its sums over `N` points, {5, C}: those
+   * of f, m, f^2, m^2 and f*m along each channel (PointSums), which pieces of the points add up to. */
+  virtual torch::Tensor
+  ValueFromSums(const torch::Tensor & sums, double N) const
+  {
+    (void)sums;
+    (void)N;
+    throw std::runtime_error("ValueFromSums() is not implemented for this loss");
+  }
+
   /** The loss between two feature maps on one grid, {1, C, spatial...}, for a spatial distance; `kernel` is the
    * side of its window in voxels along each spatial axis, odd, in the maps' axis order. `mask` ({1, 1, spatial...},
    * bool), when given, keeps the voxels whose terms are averaged (0 when it keeps none); the windows still read every
@@ -238,6 +248,18 @@ public:
     return *this;
   }
 };
+
+/** The sums along each channel of two feature sets {N, C} that a global distance is a function of (ValueFromSums):
+ * {5, C}, those of f, m, f^2, m^2 and f*m. */
+inline torch::Tensor
+PointSums(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput)
+{
+  return torch::stack({ fixedOutput.sum(0),
+                        movingOutput.sum(0),
+                        (fixedOutput * fixedOutput).sum(0),
+                        (movingOutput * movingOutput).sum(0),
+                        (fixedOutput * movingOutput).sum(0) });
+}
 
 /** Each voxel's (or point's) feature vector along `channelDim` scaled as a model configuration's
  * FeatureNormalization says: `l2` to unit length, `standardized` to zero mean and unit (unbiased) standard deviation
@@ -597,11 +619,15 @@ public:
   }
 
   torch::Tensor
+  ValueFromSums(const torch::Tensor & sums, double) const override
+  {
+    return 1.0 - DiceOf(sums[4], sums[2] + sums[3]).mean();
+  }
+
+  torch::Tensor
   forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
-    return 1.0 -
-           DiceOf((fixedOutput * movingOutput).sum(0), (fixedOutput * fixedOutput + movingOutput * movingOutput).sum(0))
-             .mean();
+    return this->ValueFromSums(PointSums(fixedOutput, movingOutput), static_cast<double>(fixedOutput.size(0)));
   }
 
   double
@@ -830,11 +856,16 @@ private:
    * |covariance| <= sqrt(varFixed * varMoving) (Cauchy-Schwarz), flooring the denominator
    * makes such a channel contribute a correlation of 0 -- the neutral value -- instead of a
    * NaN which, through the mean over channels, would turn the whole metric value and its
-   * derivative into NaN and silently stall the registration. */
+   * derivative into NaN and silently stall the registration. A zero variance's square root
+   * is taken without its derivative, infinite there: the floor's zero times it was NaN. */
   static torch::Tensor
   Denominator(const torch::Tensor & varFixed, const torch::Tensor & varMoving)
   {
-    return (torch::sqrt(varFixed) * torch::sqrt(varMoving)).clamp_min(s_epsilon);
+    auto root = [](const torch::Tensor & variance) {
+      const torch::Tensor positive = variance > 0.0;
+      return torch::where(positive, torch::sqrt(torch::where(positive, variance, 1.0)), 0.0);
+    };
+    return (root(varFixed) * root(varMoving)).clamp_min(s_epsilon);
   }
 
 public:
@@ -944,19 +975,19 @@ public:
   }
 
   torch::Tensor
+  ValueFromSums(const torch::Tensor & sums, double N) const override
+  {
+    const torch::Tensor u = sums[4] - sums[0] * sums[1] / N;
+    const torch::Tensor v = Denominator(Variance(sums[2], sums[0], N), Variance(sums[3], sums[1], N));
+    return 1.0 - (u / v).mean();
+  }
+
+  torch::Tensor
   forwardValue(const torch::Tensor & fixedOutput, const torch::Tensor & movingOutput) const override
   {
     // Global NCC over the whole batch (N samples), mean over channels; matches GetValue's
     // closed form (the Adam optimizer passes all voxels as a single batch).
-    const double  N = fixedOutput.size(0);
-    torch::Tensor sff = (fixedOutput * fixedOutput).sum(0);
-    torch::Tensor smm = (movingOutput * movingOutput).sum(0);
-    torch::Tensor sfm = (fixedOutput * movingOutput).sum(0);
-    torch::Tensor sf = fixedOutput.sum(0);
-    torch::Tensor sm = movingOutput.sum(0);
-    torch::Tensor u = sfm - sf * sm / N;
-    torch::Tensor v = Denominator(Variance(sff, sf, N), Variance(smm, sm, N));
-    return 1.0 - (u / v).mean();
+    return this->ValueFromSums(PointSums(fixedOutput, movingOutput), static_cast<double>(fixedOutput.size(0)));
   }
 
   double

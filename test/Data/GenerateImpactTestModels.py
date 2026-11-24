@@ -26,7 +26,7 @@
 # It takes a [B, C, D, H, W] tensor and returns a list of feature maps (two
 # "layers"), mimicking a segmentation backbone with a couple of output levels.
 import torch
-from typing import List
+from typing import List, Optional, Tuple
 
 
 class ImpactToyModel(torch.nn.Module):
@@ -94,6 +94,69 @@ class ImpactToyModelMetadata(torch.nn.Module):
         return [normalized, sigma + 0 * x]
 
 
+class ImpactToyModelNorm(torch.nn.Module):
+    """Two instance normalisations, as a TS network's: a 3x3x3 convolution normalised then rectified (layer 0, at the
+    input's resolution) and a strided one normalised (layer 1, at half of it). Normalisation k takes norms[k] ([2, C]:
+    the mean and the biased variance) when given, its input's own statistics otherwise; norm_input gives the input of
+    normalisation number len(norms) and norm_count how many the first nb_layers layers go through."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv0 = torch.nn.Conv3d(1, 3, kernel_size=3, padding=1, bias=True)
+        self.conv1 = torch.nn.Conv3d(3, 2, kernel_size=3, stride=2, padding=1, bias=True)
+
+    def _normalized(self, x: torch.Tensor, norms: List[torch.Tensor], k: int) -> torch.Tensor:
+        if k < len(norms):
+            mean = norms[k][0].view(1, -1, 1, 1, 1)
+            variance = norms[k][1].view(1, -1, 1, 1, 1)
+        else:
+            mean = x.mean((2, 3, 4), keepdim=True)
+            variance = x.var((2, 3, 4), unbiased=False, keepdim=True)
+        return (x - mean) / torch.sqrt(variance + 1e-5)
+
+    def _run(self, x: torch.Tensor, norms: List[torch.Tensor], stop: int) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
+        a = self.conv0(x)
+        if stop == 0:
+            return [], a
+        a = torch.relu(self._normalized(a, norms, 0))
+        b = self.conv1(a)
+        if stop == 1:
+            return [a], b
+        return [a, self._normalized(b, norms, 1)], None
+
+    def forward(self,
+                x: torch.Tensor,
+                nb_layers: torch.Tensor = torch.tensor([2]),
+                stats: torch.Tensor = torch.tensor([]),
+                direction: torch.Tensor = torch.tensor([]),
+                norms: Optional[List[torch.Tensor]] = None) -> List[torch.Tensor]:
+        return self._run(x, [] if norms is None else norms, -1)[0]
+
+    @torch.jit.export
+    def norm_count(self, nb_layers: int) -> int:
+        return 1 if nb_layers == 1 else 2
+
+    @torch.jit.export
+    def norm_input(self,
+                   x: torch.Tensor,
+                   stats: torch.Tensor = torch.tensor([]),
+                   direction: torch.Tensor = torch.tensor([]),
+                   norms: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        given = [] if norms is None else norms
+        captured = self._run(x, given, len(given))[1]
+        assert captured is not None
+        return captured
+
+
+class ImpactToyModelNormQuarter(ImpactToyModelNorm):
+    """ImpactToyModelNorm with its second normalisation at a quarter of the input's resolution (a convolution of
+    stride 4): the input of a short region gives it a number of samples from which its stride cannot be told."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = torch.nn.Conv3d(3, 2, kernel_size=3, stride=4, padding=1, bias=True)
+
+
 def main() -> None:
     torch.manual_seed(20240601)
     model = ImpactToyModel().eval()
@@ -113,6 +176,16 @@ def main() -> None:
     metadata = ImpactToyModelMetadata().eval()
     torch.jit.script(metadata).save("ImpactToyModelMetadata.pt")
     print("wrote ImpactToyModelMetadata.pt")
+
+    torch.manual_seed(20240601)
+    norm = ImpactToyModelNorm().eval()
+    torch.jit.script(norm).save("ImpactToyModelNorm.pt")
+    print("wrote ImpactToyModelNorm.pt")
+
+    torch.manual_seed(20240601)
+    quarter = ImpactToyModelNormQuarter().eval()
+    torch.jit.script(quarter).save("ImpactToyModelNormQuarter.pt")
+    print("wrote ImpactToyModelNormQuarter.pt")
 
 
 

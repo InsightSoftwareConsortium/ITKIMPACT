@@ -40,6 +40,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
 #include <mutex>
 #include <string>
@@ -71,6 +73,73 @@ IsDeviceOutOfMemory(const std::exception & error)
   std::string what = error.what();
   std::transform(what.begin(), what.end(), what.begin(), [](unsigned char c) { return std::tolower(c); });
   return what.find("out of memory") != std::string::npos || what.find("alloc_failed") != std::string::npos;
+}
+
+#if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
+/** The most bytes allocated on each CUDA device before PeakDeviceBytes last reset the allocator's peak there. */
+inline std::array<std::atomic<int64_t>, C10_COMPILE_TIME_MAX_GPUS> &
+PeaksBeforeReset()
+{
+  static std::array<std::atomic<int64_t>, C10_COMPILE_TIME_MAX_GPUS> peaks{};
+  return peaks;
+}
+#endif
+
+/** The most bytes allocated on `device` since ResetDevicePeak, whatever PeakDeviceBytes resets in between to measure a
+ * run of its own; 0 but on a CUDA device of a build with the allocator's statistics. */
+inline int64_t
+DevicePeak(const torch::Device & device)
+{
+#if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
+  if (device.is_cuda())
+  {
+    const c10::DeviceIndex index = device.has_index() ? device.index() : c10::DeviceIndex{ 0 };
+    const auto             aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+    return std::max(PeaksBeforeReset()[index].load(),
+                    c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak);
+  }
+#endif
+  (void)device;
+  return 0;
+}
+
+inline void
+ResetDevicePeak(const torch::Device & device)
+{
+#if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
+  if (device.is_cuda())
+  {
+    const c10::DeviceIndex index = device.has_index() ? device.index() : c10::DeviceIndex{ 0 };
+    c10::cuda::CUDACachingAllocator::resetPeakStats(index);
+    PeaksBeforeReset()[index] = 0;
+  }
+#endif
+  (void)device;
+}
+
+/** The device bytes `run` allocates at its peak beyond those held when it starts, on a CUDA device; 0 without running
+ * it on another device, or in a build without the allocator's statistics. The allocator's peak it resets is kept for
+ * DevicePeak. */
+template <typename TRun>
+inline int64_t
+PeakDeviceBytes(const torch::Device & device, TRun && run)
+{
+#if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
+  if (device.is_cuda())
+  {
+    const c10::DeviceIndex index = device.has_index() ? device.index() : c10::DeviceIndex{ 0 };
+    c10::cuda::CUDAGuard   guard(index);
+    const auto             aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+    PeaksBeforeReset()[index] = DevicePeak(device);
+    c10::cuda::CUDACachingAllocator::resetPeakStats(index);
+    const int64_t held = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
+    run();
+    return c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - held;
+  }
+#endif
+  (void)device;
+  (void)run;
+  return 0;
 }
 
 /** The batch that fits in `usable` bytes, starting from the linear `estimate`: the batch is run once at that size
@@ -139,9 +208,7 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration,
   // grids) is not the patches', and counting it as theirs shrank the batch to a few patches.
   auto peakOf = [&](int64_t batch) {
     shape[0] = batch;
-    c10::cuda::CUDACachingAllocator::resetPeakStats(index);
-    const int64_t held = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
-    {
+    return PeakDeviceBytes(device, [&] {
       torch::Tensor patch =
         torch::rand(shape, torch::TensorOptions().dtype(GetModelDtype(configuration)).device(device))
           .set_requires_grad(true);
@@ -152,8 +219,7 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration,
         total = total.defined() ? total + term : term;
       }
       torch::autograd::grad({ total }, { patch });
-    }
-    return c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - held;
+    });
   };
   const int64_t peakOne = peakOf(1);
   const int64_t perPatch = std::max<int64_t>(peakOf(2) - peakOne, std::max<int64_t>(peakOne / 2, 1));

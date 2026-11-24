@@ -524,6 +524,280 @@ MapLoss(const Loss &                 loss,
 }
 /** @} */
 
+/** \name Warps of a map
+ * The fine stage's similarity reads the moving maps (and the moving image, and its mask) where the field moves each
+ * point. At a whole displacement, a zero one first of all, a point reads a map exactly at a sample, where linear
+ * interpolation has a kink: grid_sample takes the slope of one side or the other as the float rounding of its own
+ * affine map of the point's position falls, which differs from one grid, device or window to another. The warps below
+ * decide from the displacement alone, so that the whole-image run and its runs by regions take the same slope on every
+ * device. */
+/** @{ */
+/** The samples of a map of `extent` samples (along one tensor axis) a point moves by when the field moves it by one
+ * voxel: the fine stage scales a displacement as ConvexAdam does, by shrink * (cells - 1) / 2 voxels for half the
+ * extent of a grid of `cells` control cells (one when it has a single cell), which the map spans in extent / 2 samples.
+ */
+inline float
+SamplesPerVoxel(int64_t extent, int64_t cells, int64_t shrink)
+{
+  return static_cast<float>(static_cast<double>(extent) /
+                            (cells > 1 ? static_cast<double>(shrink) * static_cast<double>(cells - 1) : 2.0));
+}
+
+/** The samples [c0, c1) of a box along each tensor axis, as integers on `device` shaped {1, ..., n_d, ...} to
+ * broadcast over the box: WarpMap's `index` for the points of a box. */
+inline std::vector<torch::Tensor>
+BoxIndices(const std::vector<int64_t> & c0, const std::vector<int64_t> & c1, const torch::Device & device)
+{
+  std::vector<torch::Tensor> axes;
+  for (size_t d = 0; d < c0.size(); ++d)
+  {
+    std::vector<int64_t> shape(c0.size() + 1, 1);
+    shape[d + 1] = c1[d] - c0[d];
+    axes.push_back(torch::arange(c0[d], c1[d], torch::TensorOptions().dtype(torch::kLong).device(device)).view(shape));
+  }
+  return axes;
+}
+
+/** WarpMap's `index` and `displacement` for points at `positions` ({n, Dim}, samples of the map in tensor order) moved
+ * by `moved` ({n, Dim}, undefined for none): each point's sample is floor(position) and its displacement the rest plus
+ * `moved`, so that a point on a sample moved by a whole displacement takes the slope above, as a box's points do. */
+inline std::pair<std::vector<torch::Tensor>, torch::Tensor>
+PointWarp(const torch::Tensor & positions, const torch::Tensor & moved)
+{
+  const torch::Tensor        below = positions.floor();
+  const torch::Tensor        rest = positions - below;
+  std::vector<torch::Tensor> index;
+  for (int64_t d = 0; d < positions.size(1); ++d)
+  {
+    index.push_back(below.select(1, d).to(torch::kLong).unsqueeze(0));
+  }
+  return { index, (moved.defined() ? rest + moved : rest).t().unsqueeze(0) };
+}
+
+/** The whole part of a displacement `along` (in samples) that a warp reads from: a displacement less than 1e-4 of a
+ * sample below a whole one is taken as that whole one, so that two ways of computing the same field, which round it
+ * differently, take the same slope there. */
+inline torch::Tensor
+WarpBelow(const torch::Tensor & along)
+{
+  return torch::floor(along + 1e-4);
+}
+
+/** What WarpMap reads from, the corners around each point along each axis: the offset of the sample below in the
+ * window and whether it lies in the map, and the weight above. Computed again by the backward pass, which keeps
+ * nothing of the forward but its inputs. */
+struct WarpCorners
+{
+  std::vector<torch::Tensor> below;  // per axis, the sample below each point, in the window ({1, n...})
+  std::vector<torch::Tensor> inside; // per axis and side (2 d + upper), whether that sample lies in the map
+  std::vector<torch::Tensor> above;  // per axis, the weight of the sample above, d - WarpBelow(d)
+  std::vector<int64_t>       window;
+};
+
+inline WarpCorners
+MakeWarpCorners(const torch::Tensor &              map,
+                const std::vector<int64_t> &       first,
+                const std::vector<int64_t> &       extent,
+                const std::vector<torch::Tensor> & index,
+                const torch::Tensor &              displacement)
+{
+  WarpCorners  corners;
+  const size_t dim = index.size();
+  for (size_t d = 0; d < dim; ++d)
+  {
+    const torch::Tensor along = displacement.select(1, static_cast<int64_t>(d));
+    const torch::Tensor whole = WarpBelow(along);
+    const torch::Tensor sample = index[d] + whole.to(torch::kLong);
+    corners.window.push_back(map.size(2 + static_cast<int64_t>(d)));
+    corners.above.push_back(along - whole);
+    corners.below.push_back(sample - first[d]);
+    for (int64_t side = 0; side < 2; ++side)
+    {
+      corners.inside.push_back((sample + side >= 0).logical_and(sample + side < extent[d]));
+    }
+  }
+  return corners;
+}
+
+/** The value of each point at the corner `corner` (one bit an axis, the first axis the highest) of `map` ({C, window
+ * volume}), zero outside the map, {C, n}, and the corner's weight factors along each axis, {n} each. */
+inline torch::Tensor
+WarpCorner(const torch::Tensor &        flat,
+           const WarpCorners &          corners,
+           unsigned int                 corner,
+           std::vector<torch::Tensor> & shares)
+{
+  const size_t  dim = corners.below.size();
+  torch::Tensor offset, inside;
+  shares.resize(dim);
+  for (size_t d = 0; d < dim; ++d)
+  {
+    const int64_t       upper = (corner >> (dim - 1 - d)) & 1u;
+    const torch::Tensor local = (corners.below[d] + upper).clamp(0, corners.window[d] - 1);
+    offset = offset.defined() ? offset * corners.window[d] + local : local;
+    inside = inside.defined() ? inside.logical_and(corners.inside[2 * d + upper]) : corners.inside[2 * d + upper];
+    shares[d] = (upper ? corners.above[d] : 1.0 - corners.above[d]).flatten();
+  }
+  return flat.index_select(1, offset.flatten()) * inside.flatten().to(flat.dtype());
+}
+
+/** \class WarpMapFunction
+ * \ingroup Impact
+ * \brief WarpMap's interpolation, differentiable to the displacement alone: the map is a constant. The points go by
+ * slabs of SlabPoints at most (a slice at least) along the first axis they span: what the corners hold beside the
+ * displacement and the output, some 70 bytes a point forward and backward, is a slab's, where a whole-image warp
+ * has no budget. */
+class WarpMapFunction : public torch::autograd::Function<WarpMapFunction>
+{
+public:
+  static constexpr int64_t SlabPoints = int64_t{ 1 } << 20;
+
+  /** `slab(index, displacement, s0, n)` for the slabs [s0, s0 + n) of the points along their first axis: that of
+   * `displacement` ({1, Dim, n...}) after its components, the first of each of `index` (broadcasting to {1, n...}). */
+  template <typename TSlab>
+  static void
+  ForEachSlab(const std::vector<torch::Tensor> & index, const torch::Tensor & displacement, TSlab && slab)
+  {
+    const int64_t length = displacement.size(2);
+    const int64_t slice =
+      std::max<int64_t>(1, displacement.numel() / std::max<int64_t>(1, displacement.size(1) * length));
+    const int64_t step = std::max<int64_t>(1, SlabPoints / slice);
+    for (int64_t s0 = 0; s0 < length; s0 += step)
+    {
+      const int64_t              n = std::min(step, length - s0);
+      std::vector<torch::Tensor> part;
+      for (const torch::Tensor & samples : index)
+      {
+        part.push_back(samples.size(1) == 1 ? samples : samples.narrow(1, s0, n));
+      }
+      slab(part, displacement.narrow(2, s0, n), s0, n);
+    }
+  }
+
+  /** `slab` ({1, X, n...}) as the slab [s0, s0 + n) of `whole`, of `shape`: `slab` itself when it is all of it. */
+  static void
+  Place(torch::Tensor & whole, const std::vector<int64_t> & shape, const torch::Tensor & slab, int64_t s0, int64_t n)
+  {
+    if (n == shape[2])
+    {
+      whole = slab;
+      return;
+    }
+    if (!whole.defined())
+    {
+      whole = torch::empty(shape, slab.options());
+    }
+    whole.narrow(2, s0, n).copy_(slab);
+  }
+
+  static torch::Tensor
+  forward(torch::autograd::AutogradContext * context,
+          const torch::Tensor &              map,
+          const torch::Tensor &              displacement,
+          const std::vector<torch::Tensor> & index,
+          const std::vector<int64_t> &       first,
+          const std::vector<int64_t> &       extent)
+  {
+    context->save_for_backward({ map, displacement });
+    context->saved_data["index"] = index;
+    context->saved_data["first"] = first;
+    context->saved_data["extent"] = extent;
+    const int64_t        channels = map.size(1);
+    const torch::Tensor  flat = map.reshape({ channels, -1 });
+    std::vector<int64_t> shape(displacement.sizes().begin(), displacement.sizes().end());
+    shape[1] = channels;
+    torch::Tensor warped;
+    ForEachSlab(index,
+                displacement,
+                [&](const std::vector<torch::Tensor> & part, const torch::Tensor & moved, int64_t s0, int64_t n) {
+                  const WarpCorners          corners = MakeWarpCorners(map, first, extent, part, moved);
+                  std::vector<torch::Tensor> shares;
+                  torch::Tensor              slab;
+                  for (unsigned int corner = 0; corner < (1u << part.size()); ++corner)
+                  {
+                    torch::Tensor term = WarpCorner(flat, corners, corner, shares);
+                    for (const torch::Tensor & share : shares)
+                    {
+                      term = term * share;
+                    }
+                    slab = slab.defined() ? slab.add_(term) : term;
+                  }
+                  std::vector<int64_t> slabShape = shape;
+                  slabShape[2] = n;
+                  Place(warped, shape, slab.reshape(slabShape), s0, n);
+                });
+    return warped.defined() ? warped : torch::empty(shape, map.options());
+  }
+
+  static torch::autograd::variable_list
+  backward(torch::autograd::AutogradContext * context, torch::autograd::variable_list outputs)
+  {
+    const torch::autograd::variable_list saved = context->get_saved_variables();
+    const torch::Tensor &                map = saved[0];
+    const torch::Tensor &                displacement = saved[1];
+    const std::vector<torch::Tensor>     index = context->saved_data["index"].toTensorVector();
+    const std::vector<int64_t>           first = context->saved_data["first"].toIntVector();
+    const std::vector<int64_t>           extent = context->saved_data["extent"].toIntVector();
+    const int64_t                        channels = map.size(1);
+    const torch::Tensor                  flat = map.reshape({ channels, -1 });
+    const size_t                         dim = index.size();
+    const std::vector<int64_t>           shape(displacement.sizes().begin(), displacement.sizes().end());
+    torch::Tensor                        gradient;
+    ForEachSlab(index,
+                displacement,
+                [&](const std::vector<torch::Tensor> & part, const torch::Tensor & moved, int64_t s0, int64_t n) {
+                  const WarpCorners          corners = MakeWarpCorners(map, first, extent, part, moved);
+                  const torch::Tensor        incoming = outputs[0].narrow(2, s0, n).reshape({ channels, -1 });
+                  std::vector<torch::Tensor> along(dim), shares;
+                  for (unsigned int corner = 0; corner < (1u << dim); ++corner)
+                  {
+                    const torch::Tensor product = (WarpCorner(flat, corners, corner, shares) * incoming).sum(0);
+                    for (size_t d = 0; d < dim;
+                         ++d) // the weight's derivative along d: the other axes' shares, signed by the side
+                    {
+                      torch::Tensor term = ((corner >> (dim - 1 - d)) & 1u) ? product : -product;
+                      for (size_t other = 0; other < dim; ++other)
+                      {
+                        if (other != d)
+                        {
+                          term = term * shares[other];
+                        }
+                      }
+                      along[d] = along[d].defined() ? along[d].add_(term) : term;
+                    }
+                  }
+                  Place(gradient, shape, torch::stack(along, 0).reshape(moved.sizes()), s0, n);
+                });
+    return { torch::Tensor(),
+             gradient.defined() ? gradient : torch::zeros_like(displacement),
+             torch::Tensor(),
+             torch::Tensor(),
+             torch::Tensor() };
+  }
+};
+
+/** `map` ({1, C, window...}: the samples of a map of `extent` samples from `first` on, tensor order) read by linear
+ * interpolation, zeros past the map, at the samples `index` (per tensor axis, integers broadcasting to {1, n...})
+ * moved by `displacement` ({1, Dim, n...}, in the map's samples): {1, C, n...}, differentiable to the displacement (the
+ * map is a constant). Along each axis a point reads from its sample plus WarpBelow(d), with the weight the rest of d:
+ * at a whole displacement the slope is the one above it. The window holds every sample the points read. The backward
+ * pass reads the corners again, so that the graph holds no more than the displacement. */
+template <unsigned int Dim>
+torch::Tensor
+WarpMap(const torch::Tensor &              map,
+        const std::vector<int64_t> &       first,
+        const std::vector<int64_t> &       extent,
+        const std::vector<torch::Tensor> & index,
+        const torch::Tensor &              displacement)
+{
+  if (map.requires_grad())
+  {
+    itkGenericExceptionMacro("WarpMap reads a constant map; it is not differentiated to the map.");
+  }
+  return WarpMapFunction::apply(map.detach(), displacement, index, first, extent);
+}
+/** @} */
+
 /** Channel-first {1, Dim, z,y,x} -> channel-last {z,y,x, Dim} permutation (drops batch). */
 template <unsigned int Dim>
 inline std::vector<int64_t>

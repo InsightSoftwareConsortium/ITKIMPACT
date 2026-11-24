@@ -2833,6 +2833,69 @@ TEST(ImpactLoss, ForwardValueGradientFiniteDifference)
   }
 }
 
+// NCC on a channel constant over the points (one a ReLU zeroes, a map read past the image): a finite gradient, from
+// the points and from their sums (ValueFromSums, which the runs by regions differentiate).
+TEST(ImpactLoss, NCCGradientIsFiniteOnAConstantChannel)
+{
+  torch::manual_seed(11);
+  auto                loss = itk::Impact::LossFactory::Instance().Create("NCC");
+  const torch::Tensor fixed = torch::rand({ 32, 3 });
+  torch::Tensor       moving = torch::rand({ 32, 3 });
+  moving.select(1, 1).fill_(0.5);
+  const torch::Tensor leaf = moving.clone().requires_grad_(true);
+  loss->forwardValue(fixed, leaf).backward();
+  EXPECT_TRUE(torch::isfinite(leaf.grad()).all().item<bool>()) << leaf.grad();
+  const torch::Tensor sums = itk::Impact::PointSums(fixed, moving).requires_grad_(true);
+  const torch::Tensor seeds = torch::autograd::grad({ loss->ValueFromSums(sums, 32.0) }, { sums })[0];
+  EXPECT_TRUE(torch::isfinite(seeds).all().item<bool>()) << seeds;
+}
+
+// The statistics of a model's normalisations gathered over boxes (GatherNorms) are the whole image's: here the second
+// at a quarter of the resolution, the last box along x of one voxel, whose input of five voxels gives two samples of it
+// (a ratio of 2.5), from which its stride cannot be told.
+TEST(ImpactRegionSampling, GatherNormsAreTheWholeImages)
+{
+  torch::manual_seed(13);
+  const itk::ImpactModelConfiguration   config(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModelNormQuarter.pt",
+                                             3,
+                                             1,
+                                               { 0, 0, 0 },
+                                               { 0.f, 0.f, 0.f },
+                                               { 0, 0, 0 },
+                                               { true, true },
+                                             false);
+  const std::vector<int64_t>            spatial{ 8, 8, 21 }; // tensor order: x, the last, in boxes of 10, 10 and 1
+  const torch::Tensor                   image = torch::rand({ 1, 1, spatial[0], spatial[1], spatial[2] });
+  std::vector<itk::Impact::PoolWindows> windows;
+  for (const int64_t extent : spatial)
+  {
+    windows.push_back(itk::Impact::UniformPoolWindows(extent, 1));
+  }
+  // A box's input: its voxels and two around (the two convolutions' reach), from a multiple of four voxels (the
+  // stride's), on to the image's end along an axis the box ends it.
+  auto boxInput = [&](const itk::Impact::CellBox & box, std::vector<int64_t> & lowPad) {
+    torch::Tensor input = image;
+    for (unsigned int d = 0; d < 3; ++d)
+    {
+      const int64_t start = std::max<int64_t>(box.cell0[d] - 2, 0) / 4 * 4;
+      const int64_t stop = box.cell1[d] == spatial[d] ? spatial[d] : std::min(box.cell1[d] + 2, spatial[d]);
+      lowPad[d] = box.cell0[d] - start;
+      input = input.narrow(2 + d, start, stop - start);
+    }
+    return input;
+  };
+  const std::vector<torch::Tensor> gathered = itk::Impact::GatherNorms<3>(
+    { config }, {}, itk::Impact::TileCells(spatial, { 8, 8, 10 }), windows, spatial, torch::kCPU, boxInput)[0];
+  ASSERT_EQ(gathered.size(), 2u);
+  std::vector<torch::Tensor> whole;
+  for (size_t k = 0; k < gathered.size(); ++k)
+  {
+    const torch::Tensor input = itk::NormInput(config, image, {}, whole).to(torch::kFloat64);
+    whole.push_back(torch::stack({ input.mean({ 0, 2, 3, 4 }), input.var({ 0, 2, 3, 4 }, false) }).to(torch::kFloat32));
+    EXPECT_LT((gathered[k] - whole[k]).abs().max().item<double>(), 1e-5) << "normalisation " << k;
+  }
+}
+
 // --- ImpactFineRegistration: fast Torch-backed Adam dense registration ---------
 namespace
 {
@@ -3720,6 +3783,92 @@ TEST(ImpactTorchAdam, DownsampledFeatureLayers)
     EXPECT_LT(err[d], 0.6) << "downsampled-feature axis " << d << " displacement off (coarse features)";
 }
 
+// Jacobian mode pools the moving features over each loss cell's voxels, as it pools the fixed ones: an image
+// registered to itself on a control grid of half the resolution keeps its zero field, and the first value, at the
+// zero field, is Static mode's.
+TEST(ImpactTorchAdam, JacobianPoolsTheMovingFeaturesAsTheFixedOnes)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  const auto fixed = MakeTorchAdamPattern(20, 0, 0, 0, spacing, identity);
+  auto       run = [&](const ImageType * moving, const char * mode, unsigned int iterations) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 0, 0, 0 }, { true, true }, false));
+    filter->SetDistance({ "L2", "L2" });
+    filter->SetMode(mode);
+    filter->SetGridShrinkFactor(2);
+    filter->NormalizeLossesOff();
+    filter->SetEpsilon(1.0); // a step in proportion to the gradient: float round-off moves nothing
+    filter->SetLearningRate(0.5);
+    filter->SetNumberOfIterations(iterations);
+    filter->Update();
+    return filter;
+  };
+  const auto                                                 itself = run(fixed, "Jacobian", 10);
+  double                                                     largest = 0.0;
+  itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(
+    itself->GetDisplacementField(), itself->GetDisplacementField()->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    for (unsigned int d = 0; d < 3; ++d)
+      largest = std::max(largest, static_cast<double>(std::abs(it.Get()[d])));
+  EXPECT_LT(largest, 1e-4) << "an image registered to itself moved by " << largest << " mm";
+  const auto   moving = MakeTorchAdamPattern(20, 1.5, -2.0, 1.0, spacing, identity);
+  const double jacobian = run(moving, "Jacobian", 1)->GetMetricValuesPerIteration().front();
+  const double frozen = run(moving, "Static", 1)->GetMetricValuesPerIteration().front();
+  EXPECT_NEAR(jacobian, frozen, 1e-5 * frozen);
+}
+
+// The dense Jacobian mode with a moving model whose layer is coarser than the fixed one's (an average pooling of two
+// voxels against the image's normalised intensities), on a control grid of the image's resolution: the moving layer is
+// pooled to the fixed one's grid, as the runs by regions pool a layer to the cells, and the field moves. (By regions,
+// a layer coarser than the cells is refused.)
+TEST(ImpactTorchAdam, JacobianComparesAMovingLayerOfAnotherStride)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  const auto        fixed = MakeTorchAdamPattern(16, 0, 0, 0, spacing, identity);
+  const auto        moving = MakeTorchAdamPattern(16, 1.0, -0.5, 0.5, spacing, identity);
+  const std::string data = IMPACT_TEST_DATA_DIR;
+  auto              model = [&](const char * name) {
+    return std::vector<itk::ImpactModelConfiguration>{ itk::ImpactModelConfiguration(
+      data + name, 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false) };
+  };
+  auto run = [&]() {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->SetFixedModelsConfiguration(model("/ImpactToyModelMetadata.pt"));
+    filter->SetMovingModelsConfiguration(model("/ImpactToyModelDown.pt"));
+    filter->SetDistance({ "L2" });
+    filter->SetMode("Jacobian");
+    filter->SetGridShrinkFactor(1);
+    filter->SetEpsilon(1.0); // a step in proportion to the gradient: float round-off moves nothing
+    filter->SetLearningRate(0.5);
+    filter->SetNumberOfIterations(4);
+    filter->Update();
+    return filter;
+  };
+  TorchAdamFilterType::Pointer whole;
+  ASSERT_NO_THROW(whole = run());
+  double                                                     moved = 0.0;
+  itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(whole->GetOutput(),
+                                                                whole->GetOutput()->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    for (unsigned int d = 0; d < 3; ++d)
+    {
+      ASSERT_TRUE(std::isfinite(it.Get()[d]));
+      moved = std::max(moved, static_cast<double>(std::abs(it.Get()[d])));
+    }
+  EXPECT_GT(moved, 1e-3);
+}
+
 // The low-resolution control grid (GridShrinkFactor>1) optimizes the field on a coarser grid
 // and trilinearly upsamples it each iteration; a known translation must still be recovered (a
 // constant field is representable at any control-grid resolution), validating the upsample +
@@ -3755,6 +3904,80 @@ TEST(ImpactTorchAdam, LowResControlGrid)
   EXPECT_LT(hist.back(), 0.1 * hist.front()) << "loss should drop on the low-res control grid";
   for (unsigned int d = 0; d < 3; ++d)
     EXPECT_LT(err[d], 0.3) << "low-res axis " << d << " displacement off";
+}
+
+// The fine stage's warp of a map: off the samples, grid_sample's interpolation and its gradient to the displacement,
+// from any window of the map; at a whole displacement, the slope above.
+TEST(ImpactTorchAdam, WarpMapReadsAsGridSampleAndTakesTheSlopeAbove)
+{
+  namespace F = torch::nn::functional;
+  torch::manual_seed(5);
+  const std::vector<int64_t> extent{ 7, 6, 9 };
+  const torch::Tensor        map = torch::rand({ 1, 2, extent[0], extent[1], extent[2] });
+  const auto                 index = itk::Impact::BoxIndices({ 1, 1, 2 }, { 5, 4, 6 }, torch::kCPU);
+  // Displacements of a fraction a sample away from any whole one, some reading past the map.
+  const torch::Tensor offsets = torch::rand({ 1, 3, 4, 3, 4 }) * 0.8 + 0.1 + torch::randint(-2, 2, { 1, 3, 4, 3, 4 });
+  const torch::Tensor displacement = offsets.clone().requires_grad_(true);
+  const torch::Tensor warped = itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, displacement);
+  // grid_sample of the same positions, align_corners: index i at -1 + 2 i / (n - 1).
+  std::vector<torch::Tensor> positions;
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    positions.push_back((index[d].to(torch::kFloat32) + offsets.select(1, d)) * (2.0 / (extent[d] - 1)) - 1.0);
+  }
+  const torch::Tensor at = torch::stack({ positions[2], positions[1], positions[0] }, -1).detach().requires_grad_(true);
+  const torch::Tensor reference = F::grid_sample(
+    map, at, F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(true));
+  EXPECT_LT((warped - reference).abs().max().item<double>(), 1e-5);
+  const torch::Tensor weights = torch::rand(warped.sizes());
+  (warped * weights).sum().backward();
+  (reference * weights).sum().backward();
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    const torch::Tensor expected = at.grad().select(-1, 2 - d) * (2.0 / (extent[d] - 1));
+    EXPECT_LT((displacement.grad().select(1, d) - expected).abs().max().item<double>(), 1e-4) << "axis " << d;
+  }
+  // Read from a window of the map that holds the samples read: the same values, to the bit.
+  const torch::Tensor inner = torch::rand({ 1, 3, 4, 3, 4 }) * 0.8 + 0.1;
+  const torch::Tensor window = map.narrow(2, 1, 5).narrow(3, 1, 4).narrow(4, 2, 5);
+  EXPECT_EQ((itk::Impact::WarpMap<3>(window, { 1, 1, 2 }, extent, index, inner) -
+             itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, inner))
+              .abs()
+              .max()
+              .item<double>(),
+            0.0);
+  // At a zero displacement, the slope along each axis is the difference with the next sample.
+  const torch::Tensor zero = torch::zeros({ 1, 3, 4, 3, 4 }).requires_grad_(true);
+  itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, zero).select(1, 0).sum().backward();
+  const torch::Tensor centre = map.select(1, 0).narrow(1, 1, 4).narrow(2, 1, 3).narrow(3, 2, 4);
+  const torch::Tensor next = map.select(1, 0).narrow(1, 2, 4).narrow(2, 1, 3).narrow(3, 2, 4);
+  EXPECT_LT((zero.grad().select(1, 0) - (next - centre)).abs().max().item<double>(), 1e-6);
+}
+
+// A warp of more points than a slab holds (WarpMapFunction::SlabPoints) goes by slabs of slices: to the bit, the values
+// and the gradient of the warps of each slab alone.
+TEST(ImpactTorchAdam, WarpMapGoesBySlabs)
+{
+  torch::manual_seed(6);
+  const std::vector<int64_t> extent{ 40, 160, 200 }; // slices of 32000 points: slabs of 32 slices
+  const torch::Tensor        map = torch::rand({ 1, 2, extent[0], extent[1], extent[2] });
+  const auto                 index = itk::Impact::BoxIndices({ 0, 0, 0 }, extent, torch::kCPU);
+  const torch::Tensor        offsets = torch::rand({ 1, 3, extent[0], extent[1], extent[2] }) * 4.0 - 2.0;
+  const torch::Tensor        weights = torch::rand({ 1, 2, extent[0], extent[1], extent[2] });
+  const torch::Tensor        whole = offsets.clone().requires_grad_(true);
+  const torch::Tensor        warped = itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, whole);
+  (warped * weights).sum().backward();
+  for (const int64_t s0 : { int64_t{ 0 }, int64_t{ 32 } })
+  {
+    const int64_t              n = std::min<int64_t>(32, extent[0] - s0);
+    std::vector<torch::Tensor> part = index;
+    part[0] = index[0].narrow(1, s0, n);
+    const torch::Tensor slab = offsets.narrow(2, s0, n).clone().requires_grad_(true);
+    const torch::Tensor alone = itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, part, slab);
+    (alone * weights.narrow(2, s0, n)).sum().backward();
+    EXPECT_TRUE(torch::equal(alone, warped.narrow(2, s0, n))) << "slab from " << s0;
+    EXPECT_TRUE(torch::equal(slab.grad(), whole.grad().narrow(2, s0, n))) << "slab from " << s0;
+  }
 }
 
 // A GridShrinkFactor large enough to collapse a control-grid axis to size 1 must still produce

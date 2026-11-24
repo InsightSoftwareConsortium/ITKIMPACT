@@ -2,7 +2,8 @@
 
 Small, reproducible inputs are committed directly and used by the self-contained tests:
 
-- `ImpactToyModel.pt`, `ImpactToyModel2D.pt`, `ImpactToyModelDown.pt`, `ImpactToyModelMetadata.pt` —
+- `ImpactToyModel.pt`, `ImpactToyModel2D.pt`, `ImpactToyModelDown.pt`, `ImpactToyModelMetadata.pt`,
+  `ImpactToyModelNorm.pt`, `ImpactToyModelNormQuarter.pt` —
   tiny deterministic TorchScript models (regenerate with `GenerateImpactTestModels.py`).
 
 Every C++ unit test and GoogleTest synthesizes its images at run time, so no heavy binary

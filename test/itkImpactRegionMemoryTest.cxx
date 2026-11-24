@@ -21,7 +21,9 @@
 // bytes it held at once, on the host and on the device, must be the same to within a quarter of a byte a voxel
 // added. A single array of floats over the cells of the greater pair is three times what a run holds at most, and
 // would add three bytes a voxel; the lists of the boxes, which do grow, add a few hundredths. With the maps resident
-// on the device, what a run holds there is within what it counted to choose that route.
+// on the device, what a run holds there is within what it counted to choose that route. The fine stage in Jacobian
+// mode, which re-extracts the moving features of each brick at every iteration from the image the field warps, holds
+// no more either.
 //
 // The host's bytes are counted where they are allocated, which a resident set size cannot tell from the pages of
 // the mapped files the system keeps: operator new, replaced here, counts the C++ heap (the images, the vectors),
@@ -149,7 +151,8 @@ struct Peaks
 // How a pair of `side` voxels a side is run. By default both stages from mapped files, the fine stage started from
 // the coarse stage's field, which it asks by regions, and stepping every cell by bricks of one box. With
 // `brickBytes` its bricks hold that many bytes, with `regionsPerIteration` it steps that many boxes drawn at every
-// iteration. `resident` keeps the maps on the device, each stage on its own; `masked` gives both images a mask.
+// iteration. `resident` keeps the maps on the device, each stage on its own; `masked` gives both images a mask. With
+// `model`, the fine stage alone, in `mode` on that model, its two layers compared by `distance`.
 struct Settings
 {
   unsigned int       side{ 48 };
@@ -157,6 +160,9 @@ struct Settings
   bool               masked{ false };
   itk::SizeValueType brickBytes{ 0 };
   unsigned int       regionsPerIteration{ 0 };
+  std::string        model;
+  std::string        mode{ "Jacobian" };
+  std::string        distance{ "L2" };
 };
 
 // What a run held, what each stage counted it would hold resident, and whether it ran as asked: by regions, the
@@ -206,14 +212,15 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
     const double held = static_cast<double>(hostLive.load());
     hostPeak = hostLive.load();
 #if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
-    const auto             aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
-    const c10::DeviceIndex index = torchDevice.has_index() ? torchDevice.index() : c10::DeviceIndex{ 0 };
-    int64_t                heldOnDevice = 0;
+    int64_t heldOnDevice = 0;
     if (torchDevice.is_cuda())
     {
       torch::zeros({ 1 }, torchDevice); // the allocator counts a device once CUDA holds something on it
-      c10::cuda::CUDACachingAllocator::resetPeakStats(index);
-      heldOnDevice = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
+      itk::Impact::ResetDevicePeak(torchDevice);
+      const c10::DeviceIndex index = torchDevice.has_index() ? torchDevice.index() : c10::DeviceIndex{ 0 };
+      heldOnDevice = c10::cuda::CUDACachingAllocator::getDeviceStats(index)
+                       .allocated_bytes[static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE)]
+                       .current;
     }
 #endif
     run();
@@ -222,8 +229,8 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
 #if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
     if (torchDevice.is_cuda())
     {
-      peaks.device = static_cast<double>(
-        c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - heldOnDevice);
+      // The run's own peak, through the resets of the probes that measure it (PeakDeviceBytes).
+      peaks.device = static_cast<double>(itk::Impact::DevicePeak(torchDevice) - heldOnDevice);
     }
 #endif
     return peaks;
@@ -242,7 +249,7 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
   coarse->SetResidentFeatureBudget(budget);
   coarse->SetScratchDirectory(scratch);
   coarse->SetDevice(device);
-  const bool fineAlone = settings.brickBytes > 0 || settings.regionsPerIteration > 0;
+  const bool fineAlone = settings.brickBytes > 0 || settings.regionsPerIteration > 0 || !settings.model.empty();
   if (!fineAlone)
   {
     held.coarse = measured([&]() { coarse->GetCoarseGridTransform(); });
@@ -257,6 +264,14 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
   if (!fineAlone && !settings.resident)
   {
     fine->SetInitialDisplacementField(coarse->GetOutput());
+  }
+  if (!settings.model.empty())
+  {
+    fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+      settings.model, 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+    fine->SetDistance({ settings.distance, settings.distance });
+    fine->SetMode(settings.mode);
+    fine->SetRegionHalo(1);
   }
   fine->SetGridShrinkFactor(1);
   fine->SetControlGridSmoothingIterations(1);
@@ -279,18 +294,19 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
 int
 main(int argc, char * argv[])
 {
-  if (argc < 2)
+  if (argc < 3)
   {
-    std::cerr << "Usage: " << argv[0] << " <temporary directory> [<device>...]" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <temporary directory> <3x3x3 model> [<device>...]" << std::endl;
     return EXIT_FAILURE;
   }
   itk::MetaImageIOFactory::RegisterOneFactory(); // no test driver registers the factories of this program
   static HeapAllocator allocator;
   c10::SetAllocator(c10::DeviceType::CPU, &allocator);
   const std::string temporary = argv[1];
+  const std::string model = argv[2];
 
   // The devices named, or the CPU and the CUDA device when there is one.
-  std::vector<std::string> devices(argv + 2, argv + argc);
+  std::vector<std::string> devices(argv + 3, argv + argc);
   if (devices.empty())
   {
     devices.emplace_back("cpu");
@@ -347,6 +363,23 @@ main(int argc, char * argv[])
       status = EXIT_FAILURE;
     }
 
+    // The fine stage in Jacobian mode, by bricks of one box from mapped files.
+    auto jacobian = [&](unsigned int side) {
+      Settings settings;
+      settings.side = side;
+      settings.model = model;
+      return Run(device, temporary, settings);
+    };
+    const Held jacobianLesser = jacobian(lesser);
+    const Held jacobianGreater = jacobian(greater);
+    if (!jacobianLesser.asAsked || !jacobianGreater.asAsked ||
+        grows("fine (Jacobian mode)", "host", jacobianLesser.fine.host, jacobianGreater.fine.host) ||
+        grows("fine (Jacobian mode)", "device", jacobianLesser.fine.device, jacobianGreater.fine.device))
+    {
+      std::cerr << "What the Jacobian mode holds by regions grows with the image." << std::endl;
+      status = EXIT_FAILURE;
+    }
+
     // BrickBytes bounds what a step of the fine stage holds on the device: bricks of several boxes hold more than
     // those of one, within it.
     constexpr itk::SizeValueType brickBytes = 6000000; // two boxes a side
@@ -389,6 +422,38 @@ main(int argc, char * argv[])
     if (!drawn.asAsked || !within("fine stage, four boxes drawn an iteration", drawn.fine.device, drawn.fineCounted))
     {
       std::cerr << "With the maps resident the drawn boxes hold more than was counted, or less than half." << std::endl;
+      status = EXIT_FAILURE;
+    }
+
+    // LNCC, whose windows a step takes on its cells and a halo around them: in Static mode on the model, every cell
+    // at once on the resident maps, within what it counted; and by bricks from mapped files, within BrickBytes, where
+    // bricks of one box hold less (the model's run on its probe region, whose peak a step of a large brick passes).
+    Settings lncc;
+    lncc.side = greater;
+    lncc.model = model;
+    lncc.mode = "Static";
+    lncc.distance = "LNCC";
+    lncc.resident = true;
+    const Held lnccEvery = Run(device, temporary, lncc);
+    if (!lnccEvery.asAsked || !within("fine stage, LNCC", lnccEvery.fine.device, lnccEvery.fineCounted))
+    {
+      std::cerr << "With LNCC and the maps resident the fine stage holds more than it counted, or less than half."
+                << std::endl;
+      status = EXIT_FAILURE;
+    }
+    lncc.resident = false;
+    const Held                   lnccBox = Run(device, temporary, lncc);
+    constexpr itk::SizeValueType lnccBrickBytes = 60000000; // three boxes a side
+    lncc.brickBytes = lnccBrickBytes;
+    const Held lnccBricks = Run(device, temporary, lncc);
+    std::cout << device << ", fine stage, LNCC, bricks within " << lnccBrickBytes
+              << " bytes: " << lnccBricks.fine.device << " bytes at most on the device, " << lnccBox.fine.device
+              << " by bricks of one box" << std::endl;
+    if (!lnccBox.asAsked || !lnccBricks.asAsked ||
+        !(lnccBricks.fine.device > lnccBox.fine.device &&
+          lnccBricks.fine.device <= static_cast<double>(lnccBrickBytes)))
+    {
+      std::cerr << "With LNCC, BrickBytes does not bound what a brick's step holds on the device." << std::endl;
       status = EXIT_FAILURE;
     }
   }
