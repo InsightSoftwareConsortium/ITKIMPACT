@@ -3760,6 +3760,54 @@ TEST(ImpactTorchAdam, LowResControlGrid)
 // A GridShrinkFactor large enough to collapse a control-grid axis to size 1 must still produce
 // a finite field: the diffusion regularizer must skip the degenerate (no-forward-difference)
 // axis rather than averaging over zero elements (NaN).
+// The fine stage's warp of a map: off the samples, grid_sample's interpolation and its gradient to the displacement,
+// from any window of the map; at a whole displacement, the slope above.
+TEST(ImpactTorchAdam, WarpMapReadsAsGridSampleAndTakesTheSlopeAbove)
+{
+  namespace F = torch::nn::functional;
+  torch::manual_seed(5);
+  const std::vector<int64_t> extent{ 7, 6, 9 };
+  const torch::Tensor        map = torch::rand({ 1, 2, extent[0], extent[1], extent[2] });
+  const auto                 index = itk::Impact::BoxIndices({ 1, 1, 2 }, { 5, 4, 6 }, torch::kCPU);
+  // Displacements of a fraction a sample away from any whole one, some reading past the map.
+  const torch::Tensor offsets = torch::rand({ 1, 3, 4, 3, 4 }) * 0.8 + 0.1 + torch::randint(-2, 2, { 1, 3, 4, 3, 4 });
+  const torch::Tensor displacement = offsets.clone().requires_grad_(true);
+  const torch::Tensor warped = itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, displacement);
+  // grid_sample of the same positions, align_corners: index i at -1 + 2 i / (n - 1).
+  std::vector<torch::Tensor> positions;
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    positions.push_back((index[d].to(torch::kFloat32) + offsets.select(1, d)) * (2.0 / (extent[d] - 1)) - 1.0);
+  }
+  const torch::Tensor at = torch::stack({ positions[2], positions[1], positions[0] }, -1).detach().requires_grad_(true);
+  const torch::Tensor reference = F::grid_sample(
+    map, at, F::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(true));
+  EXPECT_LT((warped - reference).abs().max().item<double>(), 1e-5);
+  const torch::Tensor weights = torch::rand(warped.sizes());
+  (warped * weights).sum().backward();
+  (reference * weights).sum().backward();
+  for (unsigned int d = 0; d < 3; ++d)
+  {
+    const torch::Tensor expected = at.grad().select(-1, 2 - d) * (2.0 / (extent[d] - 1));
+    EXPECT_LT((displacement.grad().select(1, d) - expected).abs().max().item<double>(), 1e-4) << "axis " << d;
+  }
+  // Read from a window of the map that holds the samples read: the same values, to the bit.
+  const torch::Tensor inner = torch::rand({ 1, 3, 4, 3, 4 }) * 0.8 + 0.1;
+  const torch::Tensor window = map.narrow(2, 1, 5).narrow(3, 1, 4).narrow(4, 2, 5);
+  EXPECT_EQ((itk::Impact::WarpMap<3>(window, { 1, 1, 2 }, extent, index, inner) -
+             itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, inner))
+              .abs()
+              .max()
+              .item<double>(),
+            0.0);
+  // At a zero displacement, the slope along each axis is the difference with the next sample.
+  const torch::Tensor zero = torch::zeros({ 1, 3, 4, 3, 4 }).requires_grad_(true);
+  itk::Impact::WarpMap<3>(map, { 0, 0, 0 }, extent, index, zero).select(1, 0).sum().backward();
+  const torch::Tensor centre = map.select(1, 0).narrow(1, 1, 4).narrow(2, 1, 3).narrow(3, 2, 4);
+  const torch::Tensor next = map.select(1, 0).narrow(1, 2, 4).narrow(2, 1, 3).narrow(3, 2, 4);
+  EXPECT_LT((zero.grad().select(1, 0) - (next - centre)).abs().max().item<double>(), 1e-6);
+}
+
 TEST(ImpactTorchAdam, DegenerateControlGridFinite)
 {
   ImageType::SpacingType spacing;

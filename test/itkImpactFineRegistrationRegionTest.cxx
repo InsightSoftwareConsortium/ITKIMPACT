@@ -693,6 +693,86 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 10. A moving image with an empty band, from a zero field and from a field of whole voxels. Where a point reads a
+  // map exactly at a sample the interpolation has a kink, and the slope it takes there must not hang on the grid the
+  // map is read through: in the band, where nothing pulls the field back, the routes would part. The intensities and a
+  // 3x3x3 convolution (RegionHalo 1), whole against by regions: on the resident maps, by bricks of one box from mapped
+  // files, and with every box drawn at every iteration.
+  if (argc >= 4)
+  {
+    ImageType::Pointer banded = Texture(size, 1.5, -1.0, 0.5);
+    for (itk::ImageRegionIteratorWithIndex<ImageType> it(banded, banded->GetLargestPossibleRegion()); !it.IsAtEnd();
+         ++it)
+    {
+      if (it.GetIndex()[2] < 6)
+      {
+        it.Set(0.0f);
+      }
+    }
+    auto wholeVoxels = FieldType::New(); // a translation of whole voxels, (1, -1, 2)
+    wholeVoxels->SetRegions(fixed->GetLargestPossibleRegion());
+    wholeVoxels->Allocate();
+    FieldType::PixelType translation;
+    translation[0] = 1.0f;
+    translation[1] = -1.0f;
+    translation[2] = 2.0f;
+    wholeVoxels->FillBuffer(translation);
+    for (const bool withModel : { false, true })
+    {
+      for (const bool fromZero : { true, false })
+      {
+        auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+          auto fine = FineType::New();
+          fine->SetFixedImage(fixed);
+          fine->SetMovingImage(banded);
+          if (!fromZero)
+          {
+            fine->SetInitialDisplacementField(wholeVoxels);
+          }
+          if (withModel)
+          {
+            fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+              argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+            fine->SetDistance({ "L2", "L2" });
+            fine->SetLayersWeight({ 1.f, 1.f });
+          }
+          Configure(fine, 6);
+          if (byRegions)
+          {
+            fine->SetRegionSize(16);
+            fine->SetRegionHalo(1);
+            fine->SetRegionsPerIteration(regionsPerIteration);
+            if (mapped)
+            {
+              fine->SetResidentFeatureBudget(1);
+              fine->SetBrickBytes(1);
+              fine->SetScratchDirectory(scratch);
+            }
+          }
+          fine->Update();
+          return fine;
+        };
+        const auto whole = run(false, false, 0);
+        double     difference = 0.0;
+        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+        {
+          difference = std::max(difference,
+                                MaxDifference(whole->GetOutput(),
+                                              run(true, route.first, route.second)->GetOutput(),
+                                              fixed->GetLargestPossibleRegion()));
+        }
+        std::cout << "an empty band, " << (withModel ? "a 3x3x3 convolution" : "the intensities") << ", from "
+                  << (fromZero ? "a zero field" : "whole voxels")
+                  << ", by regions against whole: max |difference| = " << difference << " mm" << std::endl;
+        if (!(difference < 1e-5))
+        {
+          std::cerr << "With an empty band, the runs by regions differ from the whole-image run." << std::endl;
+          return EXIT_FAILURE;
+        }
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {
