@@ -641,15 +641,6 @@ WarpCorner(const torch::Tensor &        flat,
   return flat.index_select(1, offset.flatten()) * inside.flatten().to(flat.dtype());
 }
 
-/** Where WarpMap reads: the points' samples (per tensor axis, integers broadcasting over the points), the window's
- * first sample in the map and the map's extent. */
-struct WarpGrid
-{
-  std::vector<torch::Tensor> index;
-  std::vector<int64_t>       first;
-  std::vector<int64_t>       extent;
-};
-
 /** \class WarpMapFunction
  * \ingroup Impact
  * \brief WarpMap's interpolation, differentiable to the displacement alone: the map is a constant. */
@@ -660,19 +651,20 @@ public:
   forward(torch::autograd::AutogradContext * context,
           const torch::Tensor &              map,
           const torch::Tensor &              displacement,
-          const WarpGrid &                   grid)
+          const std::vector<torch::Tensor> & index,
+          const std::vector<int64_t> &       first,
+          const std::vector<int64_t> &       extent)
   {
     context->save_for_backward({ map, displacement });
-    context->saved_data["index"] = grid.index;
-    context->saved_data["first"] = grid.first;
-    context->saved_data["extent"] = grid.extent;
-    const std::vector<torch::Tensor> & index = grid.index;
-    const WarpCorners                  corners = MakeWarpCorners(map, grid.first, grid.extent, index, displacement);
-    const int64_t                      channels = map.size(1);
-    const torch::Tensor                flat = map.reshape({ channels, -1 });
-    std::vector<int64_t>               shape(displacement.sizes().begin(), displacement.sizes().end());
-    std::vector<torch::Tensor>         shares;
-    torch::Tensor                      warped;
+    context->saved_data["index"] = index;
+    context->saved_data["first"] = first;
+    context->saved_data["extent"] = extent;
+    const WarpCorners          corners = MakeWarpCorners(map, first, extent, index, displacement);
+    const int64_t              channels = map.size(1);
+    const torch::Tensor        flat = map.reshape({ channels, -1 });
+    std::vector<int64_t>       shape(displacement.sizes().begin(), displacement.sizes().end());
+    std::vector<torch::Tensor> shares;
+    torch::Tensor              warped;
     shape[1] = channels;
     for (unsigned int corner = 0; corner < (1u << index.size()); ++corner)
     {
@@ -719,7 +711,11 @@ public:
         gradient[d] = gradient[d].defined() ? gradient[d].add_(term) : term;
       }
     }
-    return { torch::Tensor(), torch::stack(gradient, 0).reshape(displacement.sizes()), torch::Tensor() };
+    return { torch::Tensor(),
+             torch::stack(gradient, 0).reshape(displacement.sizes()),
+             torch::Tensor(),
+             torch::Tensor(),
+             torch::Tensor() };
   }
 };
 
@@ -741,7 +737,7 @@ WarpMap(const torch::Tensor &              map,
   {
     itkGenericExceptionMacro("WarpMap reads a constant map; it is not differentiated to the map.");
   }
-  return WarpMapFunction::apply(map.detach(), displacement, WarpGrid{ index, first, extent });
+  return WarpMapFunction::apply(map.detach(), displacement, index, first, extent);
 }
 /** @} */
 
