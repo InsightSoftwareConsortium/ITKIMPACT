@@ -288,6 +288,51 @@ SubsetOfComponentsOnPatches(const ImageType *   fixed,
   }
   return EXIT_SUCCESS;
 }
+
+// The patches around a fifth of the voxels, every one of them read past the moving image by a field of 34 voxels along
+// its shortest axis: each batch reads zeros, whose features (the model's copies of its input, of no parameter) still
+// back-propagate, a zero gradient. Whole against by regions on the resident maps and by bricks of one box from mapped
+// files.
+int
+PatchesPastTheImage(const ImageType * fixed, const ImageType * moving, const char * model, const std::string & scratch)
+{
+  auto far = FieldType::New();
+  far->SetRegions(fixed->GetLargestPossibleRegion());
+  far->Allocate();
+  FieldType::PixelType shift;
+  shift.Fill(0.0f);
+  shift[2] = 34.0f;
+  far->FillBuffer(shift);
+  auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+    auto fine = FineType::New();
+    fine->SetFixedImage(fixed);
+    fine->SetMovingImage(moving);
+    fine->SetInitialDisplacementField(far);
+    fine->AddModelConfiguration(
+      itk::ImpactModelConfiguration(model, 3, 1, { 3, 3, 3 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { false, true }, false));
+    fine->SetDistance({ "L2" });
+    fine->SetMode("Jacobian");
+    fine->SetSamplingPercentage(0.2);
+    Configure(fine, 3);
+    if (byRegions)
+    {
+      ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
+    }
+    fine->Update();
+    return fine;
+  };
+  const auto      whole = run(false, false, 0);
+  const Distances distances = CompareRoutes(whole, run, false);
+  std::cout << "patches read past the moving image, by regions against whole: fields within " << distances.field
+            << " mm, losses within " << distances.loss << " of theirs" << std::endl;
+  if (!(distances.field < 1e-5) || !(distances.loss < 1e-5))
+  {
+    std::cerr << "With patches read past the moving image, the runs by regions differ from the whole-image run."
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}
 } // namespace
 
 int
@@ -1604,7 +1649,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   }
 
   // 22. Checks of their own, each printing what it compares.
-  if (argc >= 4 && SubsetOfComponentsOnPatches(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS)
+  if (argc >= 4 && (SubsetOfComponentsOnPatches(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS ||
+                    PatchesPastTheImage(fixed, moving, argv[3], scratch) != EXIT_SUCCESS))
   {
     return EXIT_FAILURE;
   }

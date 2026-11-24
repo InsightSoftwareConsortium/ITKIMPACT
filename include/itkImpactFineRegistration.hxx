@@ -1967,11 +1967,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // {1, n...}) moved by `displacement` ({1, Dim, n...}, in voxels), as Impact::WarpMap reads the whole image: the
   // region read is the box of the voxels they read, cut at the image. {1, 1, n...}, differentiable to the displacement.
   auto readWarped = [&](auto && read, const std::vector<torch::Tensor> & index, const torch::Tensor & displacement) {
-    std::vector<int64_t> shape(displacement.sizes().begin(), displacement.sizes().end());
-    shape[1] = 1;
+    // Points that read nothing of the image: zeros, as WarpMap gives past a map, on the graph of the displacement (with
+    // a zero gradient), which a backward of a batch of them runs through.
+    auto nothing = [&] { return displacement.narrow(1, 0, 1) * 0.0; };
     if (displacement.numel() == 0)
     {
-      return torch::zeros(shape, onDevice);
+      return nothing();
     }
     std::vector<torch::Tensor> ends;
     {
@@ -1992,7 +1993,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const int64_t hi = std::min(bounds[2 * d + 1].template item<int64_t>() + 2, spatial[d]);
       if (hi <= lo[d])
       {
-        return torch::zeros(shape, onDevice);
+        return nothing();
       }
       region.SetIndex(Dim - 1 - d, fixedRegion.GetIndex()[Dim - 1 - d] + static_cast<IndexValueType>(lo[d]));
       region.SetSize(Dim - 1 - d, static_cast<SizeValueType>(hi - lo[d]));
