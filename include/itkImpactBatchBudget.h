@@ -73,6 +73,29 @@ IsDeviceOutOfMemory(const std::exception & error)
   return what.find("out of memory") != std::string::npos || what.find("alloc_failed") != std::string::npos;
 }
 
+/** The device bytes `run` allocates at its peak beyond those held when it starts, on a CUDA device; 0 without running
+ * it on another device, or in a build without the allocator's statistics. */
+template <typename TRun>
+inline int64_t
+PeakDeviceBytes(const torch::Device & device, TRun && run)
+{
+#if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
+  if (device.is_cuda())
+  {
+    const c10::DeviceIndex index = device.has_index() ? device.index() : c10::DeviceIndex{ 0 };
+    c10::cuda::CUDAGuard   guard(index);
+    const auto             aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+    c10::cuda::CUDACachingAllocator::resetPeakStats(index);
+    const int64_t held = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
+    run();
+    return c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - held;
+  }
+#endif
+  (void)device;
+  (void)run;
+  return 0;
+}
+
 /** The batch that fits in `usable` bytes, starting from the linear `estimate`: the batch is run once at that size
  * (`peakOf` returns the bytes it takes, or throws on device out-of-memory), and while it takes more than `usable`, or
  * runs out, it is scaled down to what the measured peak says fits (3/4 of it after an out-of-memory). The cost measured
@@ -139,9 +162,7 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration,
   // grids) is not the patches', and counting it as theirs shrank the batch to a few patches.
   auto peakOf = [&](int64_t batch) {
     shape[0] = batch;
-    c10::cuda::CUDACachingAllocator::resetPeakStats(index);
-    const int64_t held = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
-    {
+    return PeakDeviceBytes(device, [&] {
       torch::Tensor patch =
         torch::rand(shape, torch::TensorOptions().dtype(GetModelDtype(configuration)).device(device))
           .set_requires_grad(true);
@@ -152,8 +173,7 @@ MeasureBatchBudget(const ImpactModelConfiguration & configuration,
         total = total.defined() ? total + term : term;
       }
       torch::autograd::grad({ total }, { patch });
-    }
-    return c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - held;
+    });
   };
   const int64_t peakOne = peakOf(1);
   const int64_t perPatch = std::max<int64_t>(peakOf(2) - peakOne, std::max<int64_t>(peakOne / 2, 1));

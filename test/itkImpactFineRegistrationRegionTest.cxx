@@ -20,7 +20,8 @@
 // reproduces the dense field, with the pooled maps resident and by bricks from mapped files that the run removes; a
 // streaming reader gives the same field as the image in memory and is read by regions; a transform set on the moving
 // side is applied outside the field; stepping the boxes drawn at each iteration is that run when every box is
-// drawn, and tends to it with a few as the iterations grow.
+// drawn, and tends to it with a few as the iterations grow. The Jacobian mode by regions reproduces its whole-image run
+// in its three ways: dense, swept, and sampled.
 
 #include "itkImpactFineRegistration.h"
 
@@ -132,7 +133,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   if (argc < 2)
   {
     std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
-              << " <temporary directory> [<model with half-resolution layers>]" << std::endl;
+              << " <temporary directory> [<model with half-resolution layers> <3x3x3 model> <its 2D counterpart>]"
+              << std::endl;
     return EXIT_FAILURE;
   }
   const std::string         temporary = argv[1];
@@ -767,6 +769,114 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         if (!(difference < 1e-5))
         {
           std::cerr << "With an empty band, the runs by regions differ from the whole-image run." << std::endl;
+          return EXIT_FAILURE;
+        }
+      }
+    }
+  }
+
+  // 11. The Jacobian mode by regions, a unit at a time, against the whole-image run, with models whose features at a
+  // voxel read three voxels a side: a 3x3x3 convolution and the intensities (RegionHalo 1); its 2D counterpart swept
+  // along an axis drawn at every iteration; and the 3D one on the patch around each of the points drawn, a fifth of
+  // the voxels at every iteration. Each by one brick, the fixed maps resident, and by bricks of one box from mapped
+  // files; the dense one also with a moving mask, and with every box drawn at every iteration.
+  if (argc >= 5)
+  {
+    using MaskType = FineType::MaskImageType;
+    auto movingMask = MaskType::New();
+    movingMask->SetRegions(moving->GetLargestPossibleRegion());
+    movingMask->Allocate();
+    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    {
+      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
+    }
+    struct Variant
+    {
+      const char * label;
+      const char * model;
+      unsigned int dimension;
+      double       sampling;
+      bool         masked;
+    };
+    for (const Variant & variant : { Variant{ "dense", argv[3], 3, 1.0, false },
+                                     Variant{ "dense, a moving mask", argv[3], 3, 1.0, true },
+                                     Variant{ "swept 2D", argv[4], 2, 1.0, false },
+                                     Variant{ "sampled", argv[3], 3, 0.2, false } })
+    {
+      auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+        auto               fine = FineType::New();
+        const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+        fine->SetFixedImage(fixed);
+        fine->SetMovingImage(moving);
+        fine->SetInitialDisplacementField(start);
+        if (variant.masked)
+        {
+          fine->SetMovingMask(movingMask);
+        }
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
+                                                                  variant.dimension,
+                                                                  1,
+                                                                  std::vector<unsigned int>(variant.dimension, patch),
+                                                                  { 0.f, 0.f, 0.f },
+                                                                  std::vector<unsigned int>(variant.dimension, 0),
+                                                                  { true, true },
+                                                                  false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+        fine->SetMode("Jacobian");
+        fine->SetSamplingPercentage(variant.sampling);
+        Configure(fine, 6);
+        if (byRegions)
+        {
+          fine->SetRegionSize(16);
+          fine->SetRegionHalo(1);
+          fine->SetRegionsPerIteration(regionsPerIteration);
+          if (mapped)
+          {
+            fine->SetResidentFeatureBudget(1);
+            fine->SetBrickBytes(1);
+            fine->SetScratchDirectory(scratch);
+          }
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto   whole = run(false, false, 0);
+      const auto   resident = run(true, false, 0);
+      const auto   mapped = run(true, true, 0);
+      const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+      const double residentDifference =
+        MaxDifference(whole->GetOutput(), resident->GetOutput(), fixed->GetLargestPossibleRegion());
+      const double mappedDifference =
+        MaxDifference(whole->GetOutput(), mapped->GetOutput(), fixed->GetLargestPossibleRegion());
+      double lossDifference = 0.0;
+      for (size_t i = 0; i < whole->GetMetricValuesPerIteration().size(); ++i)
+      {
+        lossDifference = std::max(
+          lossDifference, std::abs(whole->GetMetricValuesPerIteration()[i] - mapped->GetMetricValuesPerIteration()[i]));
+      }
+      std::cout << "Jacobian mode, " << variant.label
+                << ", by regions against whole: max |difference| = " << residentDifference << " mm by one brick, "
+                << mappedDifference << " mm by bricks of one box from mapped files, for a field moved by " << moved
+                << " mm; losses within " << lossDifference << std::endl;
+      if (!(residentDifference < 1e-5) || !(mappedDifference < 1e-5) || !(moved > 1e-3) || !(lossDifference < 1e-4) ||
+          !resident->GetResidentFeatures() || mapped->GetResidentFeatures())
+      {
+        std::cerr << "In Jacobian mode, " << variant.label << ", the runs by regions differ from the whole-image run."
+                  << std::endl;
+        return EXIT_FAILURE;
+      }
+      if (variant.dimension == 3 && variant.sampling == 1.0 && !variant.masked)
+      {
+        const double drawnDifference =
+          MaxDifference(whole->GetOutput(), run(true, false, 18)->GetOutput(), fixed->GetLargestPossibleRegion());
+        std::cout << "Jacobian mode, every box drawn at every iteration, against whole: max |difference| = "
+                  << drawnDifference << " mm" << std::endl;
+        if (!(drawnDifference < 1e-5))
+        {
+          std::cerr << "In Jacobian mode, drawing every box at every iteration is not the whole-image run."
+                    << std::endl;
           return EXIT_FAILURE;
         }
       }
