@@ -269,11 +269,13 @@ public:
    * with the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
    * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
    * iteration costs and holds then follows those boxes, not the image.
-   * Point-wise distances and LNCC, whose windows a unit takes on its cells and half the widest window around them,
-   * keeping the terms of its own; feature layers at the image's resolution (MIND) or a power of two coarser, no coarser
-   * than the control cells (a region then starts on the layer's lattice); PCA and a model that resamples the image are
-   * refused, save on the patches of the sampled Jacobian mode. FeatureMapUpdateInterval pools the moving maps again, a
-   * box at a time, from the moving image the field warps.
+   * Point-wise distances; LNCC, whose windows a unit takes on its cells and half the widest window around them,
+   * keeping the terms of its own; NCC and OrganDice, statistics over all the points, from their sums gathered over
+   * every unit at every iteration without the graph (with RegionsPerIteration too, a pass over the grid), of whose
+   * gradient each unit's step takes its part (in Static mode, with SamplingPercentage 1 only); feature layers at the
+   * image's resolution (MIND) or a power of two coarser, no coarser than the control cells (a region then starts on the
+   * layer's lattice); PCA and a model that resamples the image are refused, save on the patches of the sampled Jacobian
+   * mode. FeatureMapUpdateInterval pools the moving maps again, a box at a time, from the moving image the field warps.
    * The Jacobian mode keeps the fixed features pooled to the cells, as Static mode, and at every iteration takes each
    * unit (a brick, or a box drawn) on its own: the field interpolated at the voxels of its cells and RegionHalo around
    * them (cut at the image), the moving image read by regions where they land and warped there, the network run on

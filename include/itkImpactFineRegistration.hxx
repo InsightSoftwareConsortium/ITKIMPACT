@@ -2026,17 +2026,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       const std::string name = m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
       losses.push_back(Impact::LossFactory::Instance().Create(name));
+      if (!losses.back()->IsPerPointMean() && !losses.back()->IsSpatial() && m_SamplingPercentage < 1.0 && !jacobian)
+      {
+        itkExceptionMacro("ImpactFineRegistration: distance '"
+                          << name << "' is a statistic over all the points, which needs one draw of them an "
+                          << "iteration; with RegionSize, Static mode draws them box by box.");
+      }
       if (losses.back()->IsSpatial() && m_SamplingPercentage < 1.0)
       {
         itkExceptionMacro("ImpactFineRegistration: distance '"
                           << name << "' correlates windows of dense maps, which the points SamplingPercentage draws "
                           << "do not have.");
-      }
-      if (!losses.back()->IsPerPointMean() && !losses.back()->IsSpatial())
-      {
-        itkExceptionMacro("ImpactFineRegistration: distance '"
-                          << name
-                          << "' is a statistic over all the points, which the boxes of RegionSize do not have.");
       }
       layerWeights.push_back(l < m_LayersWeight.size() ? m_LayersWeight[l] : 1.0f);
     }
@@ -2218,8 +2218,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto                      normalized = [&](size_t l, const torch::Tensor & value) -> torch::Tensor {
     return normalizes ? value * normalization.Factor(l) : value;
   };
-  // Layer l's loss between the rows `rows` of two pooled maps {1, C, n...} (every row when undefined).
-  auto rowsLoss = [&](size_t l, const torch::Tensor & fixed, const torch::Tensor & moving, const torch::Tensor & rows) {
+  // The rows `rows` of two pooled maps {1, C, n...} (every row when undefined), {n, C} each.
+  auto rowsOf = [&](const torch::Tensor & fixed, const torch::Tensor & moving, const torch::Tensor & rows) {
     const int64_t channels = moving.size(1);
     torch::Tensor f = fixed.reshape({ channels, -1 }), m = moving.reshape({ channels, -1 });
     if (rows.defined())
@@ -2227,7 +2227,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       f = f.index_select(1, rows);
       m = m.index_select(1, rows);
     }
-    return losses[l]->forwardValue(f.t(), m.t());
+    return std::make_pair(f.t(), m.t());
+  };
+  // Layer l's loss between the rows `rows` of two pooled maps.
+  auto rowsLoss = [&](size_t l, const torch::Tensor & fixed, const torch::Tensor & moving, const torch::Tensor & rows) {
+    const auto [f, m] = rowsOf(fixed, moving, rows);
+    return losses[l]->forwardValue(f, m);
   };
   // The rows that count among `counted` (bool {1, 1, n...}; every row when undefined), a share of them drawn at
   // random with SamplingPercentage < 1.
@@ -3043,10 +3048,33 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
       return reading;
     };
+    // A global distance (NCC, OrganDice) is a function of its sums over the points that count (Impact::PointSums).
+    // An iteration first gathers them over every unit without the graph (`gathering`), then takes the gradient of each
+    // such layer's value with respect to them (`sumSeeds`); a unit's step back-propagates the seeds times its own sums,
+    // a term of no value whose gradient is the unit's part of the whole one.
+    auto isGlobal = [&](size_t l) { return !losses[l]->IsPerPointMean() && !losses[l]->IsSpatial(); };
+    bool globalLoss = false;
+    for (size_t l = 0; l < losses.size(); ++l)
+    {
+      globalLoss = globalLoss || isGlobal(l);
+    }
+    bool                       gathering = false;
+    double                     gatheredPoints = 0.0;
+    std::vector<torch::Tensor> gatheredSums(losses.size()), sumSeeds(losses.size()), globalValues(losses.size());
+    auto                       globalTerm = [&](size_t l, const torch::Tensor & sums) -> torch::Tensor {
+      if (gathering)
+      {
+        gatheredSums[l] = gatheredSums[l].defined() ? gatheredSums[l] + sums : sums;
+        return torch::zeros({}, onDevice);
+      }
+      return layerWeights[l] * normalized(l, (sumSeeds[l] * (sums - sums.detach())).sum());
+    };
     // The loss of the cells of `box` for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when
     // given, takes each layer's unweighted value times the box's share. The Jacobian mode compares the fixed maps with
     // the moving features re-extracted from the image the field warps. A spatial distance takes its terms on the block
-    // of the box and `lossHalo` cells around it, and averages those of the box's points that count.
+    // of the box and `lossHalo` cells around it, and averages those of the box's points that count. A global distance's
+    // layer gathers its sums, or takes its term of the gradient, and adds nothing to `raw`; gathering, the other
+    // layers and the regularizer are left out.
     auto partLoss = [&](const Impact::CellBox &      box,
                         const torch::Tensor &        smoothed,
                         const std::vector<int64_t> & origin,
@@ -3062,6 +3090,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const double          share = static_cast<double>(reading.count) / countedCells[countSet()];
       const Impact::CellBox block = Impact::CellsAround(box, std::vector<int64_t>(Dim, lossHalo), cells);
       const Impact::CellBox points = swept ? sweptPoints(box) : box;
+      if (gathering)
+      {
+        gatheredPoints += static_cast<double>(rows.defined() ? rows.numel() : points.Count());
+      }
       const Impact::CellBox blockPoints = swept ? sweptPoints(block) : block;
       // The box's points within a map of the block's.
       auto ownOf = [&](torch::Tensor map) {
@@ -3102,7 +3134,22 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         for (size_t l = 0; l < losses.size(); ++l)
         {
           const torch::Tensor & fixedMap = swept ? sweptMaps[sweptAxis][l] : fixedMaps[l];
-          torch::Tensor         value;
+          if (isGlobal(l))
+          {
+            if (raw == nullptr)
+            {
+              const auto [f, m] = rowsOf(pick(l, Impact::NarrowTo(fixedMap, points.cell0, points.cell1).to(device)),
+                                         jacobian ? pick(l, ownOf(warped[l])) : movingOn(l, reading),
+                                         rows);
+              total = total + globalTerm(l, Impact::PointSums(f, m));
+            }
+            continue;
+          }
+          if (gathering)
+          {
+            continue;
+          }
+          torch::Tensor value;
           if (losses[l]->IsSpatial())
           {
             const torch::Tensor fixedBlock =
@@ -3122,7 +3169,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           total = total + layerWeights[l] * normalized(l, value) * share;
         }
       }
-      return total + regularizer(smoothed, box.cell0, box.cell1, origin);
+      return gathering ? total : total + regularizer(smoothed, box.cell0, box.cell1, origin);
     };
     // The sampled Jacobian mode's draws of an iteration, as the whole-image run draws them (flat voxel numbers, ITK x
     // fastest), and grouped by the unit their voxel's cell lies in, the voxels past the last cell with it: unit u's are
@@ -3246,7 +3293,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const int64_t       n = kept.size(0);
       const double        total = countedCells[0];
       double              value = reg.template item<double>();
-      torch::Tensor       leaf; // the field the patches are warped by: the batches' backwards meet there
+      if (gathering)
+      {
+        gatheredPoints += static_cast<double>(n);
+      }
+      torch::Tensor leaf; // the field the patches are warped by: the batches' backwards meet there
       if (n > 0)
       {
         // Model i's patches of the points [begin, end), {b, 1, patch...}: in the fixed image, or in the moving image as
@@ -3292,7 +3343,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             }
           }
         }
-        if (raw == nullptr)
+        if (raw == nullptr && !gathering)
         {
           leaf = smoothed.detach().requires_grad_(true);
           leaf.mutable_grad() = torch::zeros_like(leaf);
@@ -3306,7 +3357,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             n,
             [&](int64_t begin, int64_t end) {
               const double weight = static_cast<double>(end - begin) / total;
-              if (raw != nullptr)
+              if (raw != nullptr || gathering)
               {
                 torch::NoGradGuard               noGrad;
                 const std::vector<torch::Tensor> layers =
@@ -3315,8 +3366,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                 {
                   const size_t        l = firstLayer[i] + k;
                   const torch::Tensor centre = fixedCentres[l].narrow(0, begin, end - begin);
-                  (*raw)[l] +=
-                    losses[l]->forwardValue(pick(l, centre), pick(l, layers[k])).template item<double>() * weight;
+                  if (gathering && isGlobal(l))
+                  {
+                    globalTerm(l, Impact::PointSums(pick(l, centre), pick(l, layers[k])));
+                  }
+                  else if (!gathering && !isGlobal(l))
+                  {
+                    (*raw)[l] +=
+                      losses[l]->forwardValue(pick(l, centre), pick(l, layers[k])).template item<double>() * weight;
+                  }
                 }
                 return;
               }
@@ -3326,13 +3384,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               torch::Tensor surrogate = torch::zeros({}, onDevice);
               for (size_t k = 0; k < layers.size(); ++k)
               {
-                const size_t l = firstLayer[i] + k;
-                surrogate = surrogate +
-                            layerWeights[l] *
-                              normalized(l,
-                                         losses[l]->forwardValue(pick(l, fixedCentres[l].narrow(0, begin, end - begin)),
-                                                                 pick(l, layers[k]))) *
-                              weight;
+                const size_t        l = firstLayer[i] + k;
+                const torch::Tensor centre = pick(l, fixedCentres[l].narrow(0, begin, end - begin));
+                surrogate =
+                  surrogate +
+                  (isGlobal(l)
+                     ? globalTerm(l, Impact::PointSums(centre, pick(l, layers[k])))
+                     : layerWeights[l] * normalized(l, losses[l]->forwardValue(centre, pick(l, layers[k]))) * weight);
               }
               surrogate.backward();
               value += surrogate.template item<double>();
@@ -3345,7 +3403,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             });
         }
       }
-      if (raw == nullptr)
+      if (raw == nullptr && !gathering)
       {
         const torch::Tensor loss = leaf.defined() ? reg + (smoothed * leaf.grad()).sum() : reg;
         if (loss.requires_grad()) // a constant for a last cell without a point
@@ -3452,6 +3510,34 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             itkExceptionMacro("ImpactFineRegistration: no drawn point has its model patch inside the image; the patch "
                               "(PatchSize x voxel size) is larger than the image, or SamplingPercentage too small.");
           }
+          if (globalLoss)
+          {
+            // A global distance's sums over every unit at the field of this iteration, whatever the schedule draws:
+            // its value, and its gradient with respect to them.
+            {
+              torch::NoGradGuard noGrad;
+              gathering = true;
+              gatheredPoints = 0.0;
+              std::fill(gatheredSums.begin(), gatheredSums.end(), torch::Tensor());
+              for (const Impact::CellBox & unit : units)
+              {
+                const Impact::CellBox window = around(unit);
+                partValue(unit, window, Impact::NarrowTo(theta, window.cell0, window.cell1).to(device), nullptr);
+              }
+              gathering = false;
+            }
+            for (size_t l = 0; l < losses.size(); ++l)
+            {
+              globalValues[l] = torch::zeros({}, onDevice); // no point counts: no term
+              if (isGlobal(l) && gatheredSums[l].defined())
+              {
+                const torch::Tensor sums = gatheredSums[l].detach().requires_grad_(true);
+                const torch::Tensor value = losses[l]->ValueFromSums(sums, gatheredPoints);
+                sumSeeds[l] = torch::autograd::grad({ value }, { sums })[0];
+                globalValues[l] = value.detach();
+              }
+            }
+          }
           if (normalizes && !normalization.IsLatched(0))
           {
             // Each layer's value at the starting field, without the graph, summed over every unit: the dense run's
@@ -3465,7 +3551,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             }
             for (size_t l = 0; l < losses.size(); ++l)
             {
-              normalization.Latch(l, raw[l]);
+              normalization.Latch(l, isGlobal(l) ? globalValues[l].template item<double>() : raw[l]);
             }
           }
           // The gradient of the units' cells. The bricks, which cover the grid, each back-propagate their own loss
@@ -3515,9 +3601,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         adam.StepCells(theta, gradient, unit.cell0, unit.cell1, device);
         Impact::NarrowTo(gradient, unit.cell0, unit.cell1).zero_();
       }
-      // The loss over the parts, scaled from the cells they hold to the grid: the dense loss when they tile it.
-      m_MetricValuesPerIteration.push_back(lossValue /
-                                           (static_cast<double>(covered) / static_cast<double>(cellCountTotal)));
+      // The loss over the parts, scaled from the cells they hold to the grid: the dense loss when they tile it. A
+      // global distance's value is the whole grid's.
+      const double scale = static_cast<double>(covered) / static_cast<double>(cellCountTotal);
+      for (size_t l = 0; l < losses.size(); ++l)
+      {
+        if (isGlobal(l))
+        {
+          lossValue += (layerWeights[l] * normalized(l, globalValues[l])).template item<double>() * scale;
+        }
+      }
+      m_MetricValuesPerIteration.push_back(lossValue / scale);
       refresh(iteration);
     }
   }

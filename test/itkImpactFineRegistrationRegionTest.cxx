@@ -1086,6 +1086,102 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 14. Statistics over all the points: the first layer by NCC, the second by OrganDice, from their sums gathered
+  // over the units at every iteration. In Static mode and in the Jacobian mode, dense, swept (FeatureChunkSize 0) and
+  // on the patches around a fifth of the voxels, with and without a moving mask. Whole against by regions on the
+  // resident maps, by bricks of one box from mapped files and, on the dense maps, with every box drawn at every
+  // iteration: the fields, and the losses at every iteration.
+  if (argc >= 5)
+  {
+    const auto movingMask = CutMask(moving);
+    struct Variant
+    {
+      const char * label;
+      const char * model;
+      unsigned int dimension;
+      bool         jacobian;
+      double       sampling;
+    };
+    for (const Variant & variant : { Variant{ "Static mode", argv[3], 3, false, 1.0 },
+                                     Variant{ "Jacobian mode, dense", argv[3], 3, true, 1.0 },
+                                     Variant{ "Jacobian mode, swept 2D", argv[4], 2, true, 1.0 },
+                                     Variant{ "Jacobian mode, sampled", argv[3], 3, true, 0.2 } })
+    {
+      for (const bool masked : { false, true })
+      {
+        auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+          auto               fine = FineType::New();
+          const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+          fine->SetFixedImage(fixed);
+          fine->SetMovingImage(moving);
+          fine->SetInitialDisplacementField(start);
+          if (masked)
+          {
+            fine->SetMovingMask(movingMask);
+          }
+          fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
+                                                                    variant.dimension,
+                                                                    1,
+                                                                    std::vector<unsigned int>(variant.dimension, patch),
+                                                                    { 0.f, 0.f, 0.f },
+                                                                    std::vector<unsigned int>(variant.dimension, 0),
+                                                                    { true, true },
+                                                                    false));
+          fine->SetDistance({ "NCC", "OrganDice" });
+          fine->SetLayersWeight({ 1.f, 1.f });
+          fine->SetSamplingPercentage(variant.sampling);
+          if (variant.jacobian)
+          {
+            fine->SetMode("Jacobian");
+            fine->SetFeatureChunkSize(0);
+          }
+          Configure(fine, 6);
+          if (byRegions)
+          {
+            fine->SetRegionSize(16);
+            fine->SetRegionHalo(1);
+            fine->SetRegionsPerIteration(regionsPerIteration);
+            if (mapped)
+            {
+              fine->SetResidentFeatureBudget(1);
+              fine->SetBrickBytes(1);
+              fine->SetScratchDirectory(scratch);
+            }
+          }
+          fine->Update();
+          return fine;
+        };
+        const auto whole = run(false, false, 0);
+        double     fieldDifference = 0.0, lossDifference = 0.0;
+        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+        {
+          if (route.second > 0 && (variant.dimension < 3 || variant.sampling < 1.0))
+          {
+            continue;
+          }
+          const auto region = run(true, route.first, route.second);
+          fieldDifference = std::max(
+            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+          for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+          {
+            const double value = whole->GetMetricValuesPerIteration()[i];
+            lossDifference =
+              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+          }
+        }
+        const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+        std::cout << "NCC and OrganDice, " << variant.label << (masked ? ", a moving mask" : "")
+                  << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
+                  << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
+        if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(moved > 1e-3))
+        {
+          std::cerr << "With NCC and OrganDice, the runs by regions differ from the whole-image run." << std::endl;
+          return EXIT_FAILURE;
+        }
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {
