@@ -1474,6 +1474,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             mll = Impact::PcaTransform(features, pcaBasis[l], Impact::PcaSampleMean(features).detach()).unsqueeze(0);
           }
           mll = poolLayerToLoss(mll);
+          // A moving model's layer of another stride than the fixed one's, adaptive-average pooled to its grid, as the
+          // runs by regions pool both to the cells.
+          const std::vector<int64_t> fixedGrid(fixedLayersOnline[l].sizes().begin() + 2,
+                                               fixedLayersOnline[l].sizes().end());
+          if (mll.sizes().slice(2) != c10::IntArrayRef(fixedGrid))
+          {
+            mll = Impact::MaskShare<ImageDimension>(mll, fixedGrid);
+          }
           torch::Tensor counted;
           if (masked)
           {

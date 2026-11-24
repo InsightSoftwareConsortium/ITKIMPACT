@@ -3777,6 +3777,56 @@ TEST(ImpactTorchAdam, JacobianPoolsTheMovingFeaturesAsTheFixedOnes)
   EXPECT_NEAR(jacobian, frozen, 1e-5 * frozen);
 }
 
+// The dense Jacobian mode with a moving model whose layer is coarser than the fixed one's (an average pooling of two
+// voxels against the image's normalised intensities), on a control grid of the image's resolution: the moving layer is
+// pooled to the fixed one's grid, as the runs by regions pool both to the cells, and the two routes give one field.
+TEST(ImpactTorchAdam, JacobianComparesAMovingLayerOfAnotherStride)
+{
+  ImageType::SpacingType spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  const auto        fixed = MakeTorchAdamPattern(16, 0, 0, 0, spacing, identity);
+  const auto        moving = MakeTorchAdamPattern(16, 1.0, -0.5, 0.5, spacing, identity);
+  const std::string data = IMPACT_TEST_DATA_DIR;
+  auto              model = [&](const char * name) {
+    return std::vector<itk::ImpactModelConfiguration>{ itk::ImpactModelConfiguration(
+      data + name, 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false) };
+  };
+  auto run = [&](unsigned int regionSize) {
+    auto filter = TorchAdamFilterType::New();
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->SetFixedModelsConfiguration(model("/ImpactToyModelMetadata.pt"));
+    filter->SetMovingModelsConfiguration(model("/ImpactToyModelDown.pt"));
+    filter->SetDistance({ "L2" });
+    filter->SetMode("Jacobian");
+    filter->SetGridShrinkFactor(1);
+    filter->SetEpsilon(1.0); // a step in proportion to the gradient: float round-off moves nothing
+    filter->SetLearningRate(0.5);
+    filter->SetNumberOfIterations(4);
+    filter->SetRegionSize(regionSize);
+    filter->SetRegionHalo(2);
+    filter->Update();
+    return filter;
+  };
+  TorchAdamFilterType::Pointer whole, byRegions;
+  ASSERT_NO_THROW(whole = run(0));
+  ASSERT_NO_THROW(byRegions = run(8));
+  double                                                     largest = 0.0, moved = 0.0;
+  itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> it(whole->GetOutput(),
+                                                                whole->GetOutput()->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+    for (unsigned int d = 0; d < 3; ++d)
+    {
+      largest = std::max(
+        largest, static_cast<double>(std::abs(it.Get()[d] - byRegions->GetOutput()->GetPixel(it.GetIndex())[d])));
+      moved = std::max(moved, static_cast<double>(std::abs(it.Get()[d])));
+    }
+  EXPECT_GT(moved, 1e-3);
+  EXPECT_LT(largest, 1e-5) << "by regions, the field differs from the whole-image run's by " << largest << " mm";
+}
+
 // The low-resolution control grid (GridShrinkFactor>1) optimizes the field on a coarser grid
 // and trilinearly upsamples it each iteration; a known translation must still be recovered (a
 // constant field is representable at any control-grid resolution), validating the upsample +
