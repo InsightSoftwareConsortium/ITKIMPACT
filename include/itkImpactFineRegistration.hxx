@@ -1212,7 +1212,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             }
           };
           gather(false);
-          drawSubsets(fixedCentres);
           // PCA, a 3D model's rule on the points: the basis fitted on the fixed features of this iteration's points,
           // each side centred by its own mean over them -- the moving one taken without the graph, so that every point
           // keeps a gradient of its own.
@@ -1228,6 +1227,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
               reduces = true;
             }
           }
+          drawSubsets(fixedCentres); // among the components a layer compares
           const bool latching = m_NormalizeLosses && !normalization.IsLatched(0);
           const bool perPoint =
             std::all_of(losses.begin(), losses.end(), [](const std::unique_ptr<Impact::Loss> & loss) {
@@ -2308,14 +2308,16 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     return pooled;
   };
-  // SubsetFeatures: per kept layer, that many of its channels drawn at random at every iteration (0 = all).
+  // SubsetFeatures: per kept layer, that many of the channels it compares (its components with PCA) drawn at random at
+  // every iteration (0 = all).
   std::vector<torch::Tensor> subsets(losses.size());
   auto                       drawSubsets = [&](const std::vector<int64_t> & channels) {
     for (size_t l = 0; l < losses.size(); ++l)
     {
       const int64_t kept = l < m_SubsetFeatures.size() ? static_cast<int64_t>(m_SubsetFeatures[l]) : 0;
-      subsets[l] = (kept > 0 && kept < channels[l])
-                                           ? torch::randperm(channels[l], generator, torch::kLong).narrow(0, 0, kept).to(device)
+      const int64_t compared = componentsOf(l, channels[l]) > 0 ? componentsOf(l, channels[l]) : channels[l];
+      subsets[l] = (kept > 0 && kept < compared)
+                                           ? torch::randperm(compared, generator, torch::kLong).narrow(0, 0, kept).to(device)
                                            : torch::Tensor();
     }
   };

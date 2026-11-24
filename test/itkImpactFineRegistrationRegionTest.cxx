@@ -247,6 +247,47 @@ CompareRoutes(FineType * whole, TRun && run, bool drawn = true)
   }
   return distances;
 }
+
+// SubsetFeatures with PCA on the patches around a fifth of the voxels: the channels drawn among the components of the
+// basis fitted at every iteration, two of the first layer's four. Whole against by regions on the resident maps and by
+// bricks of one box from mapped files: the fields, and the losses at every iteration.
+int
+SubsetOfComponentsOnPatches(const ImageType *   fixed,
+                            const ImageType *   moving,
+                            FieldType *         start,
+                            const char *        model,
+                            const std::string & scratch)
+{
+  auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+    auto fine = FineType::New();
+    fine->SetFixedImage(fixed);
+    fine->SetMovingImage(moving);
+    fine->SetInitialDisplacementField(start);
+    AddModel(fine, model, 3, { "L2", "L2" }, 3);
+    fine->SetMode("Jacobian");
+    fine->SetSamplingPercentage(0.2);
+    fine->SetPCA({ 2, 1 });
+    fine->SetSubsetFeatures({ 1, 0 });
+    Configure(fine, 6);
+    if (byRegions)
+    {
+      ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
+    }
+    fine->Update();
+    return fine;
+  };
+  const auto      whole = run(false, false, 0);
+  const Distances distances = CompareRoutes(whole, run, false);
+  std::cout << "a subset of the components on patches, by regions against whole: fields within " << distances.field
+            << " mm, losses within " << distances.loss << " of theirs" << std::endl;
+  if (!(distances.field < 1e-5) || !(distances.loss < 1e-5))
+  {
+    std::cerr << "With a subset of the components on patches, the runs by regions differ from the whole-image run."
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}
 } // namespace
 
 int
@@ -1560,6 +1601,12 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         return EXIT_FAILURE;
       }
     }
+  }
+
+  // 22. Checks of their own, each printing what it compares.
+  if (argc >= 4 && SubsetOfComponentsOnPatches(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS)
+  {
+    return EXIT_FAILURE;
   }
 
   // Every run from mapped files is gone, and its control grid with it: so are the files.
