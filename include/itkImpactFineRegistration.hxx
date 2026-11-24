@@ -2655,7 +2655,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     return norms;
   };
-  if (featureMode && !jacobian)
+  // A single box is the whole image: its own statistics are the image's, to the bit.
+  const bool gathersNorms = featureMode && !jacobian && boxes.size() > 1;
+  if (gathersNorms)
   {
     fixedNorms = gatherNorms(false, [&](const Impact::CellBox &, const RegionType & span) { return readFixed(span); });
     movingNorms =
@@ -3206,10 +3208,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                             window.cell0);
     };
     // The moving image the field now warps: its normalisations' statistics, and with PCA its features' mean.
-    movingNorms = gatherNorms(true, [&](const Impact::CellBox & box, const RegionType & span) {
-      const auto [smoothed, origin] = fieldAround(box);
-      return warpedOn(readMovingImage, span, smoothed, origin);
-    });
+    if (gathersNorms)
+    {
+      movingNorms = gatherNorms(true, [&](const Impact::CellBox & box, const RegionType & span) {
+        const auto [smoothed, origin] = fieldAround(box);
+        return warpedOn(readMovingImage, span, smoothed, origin);
+      });
+    }
     if (std::any_of(pcaBasis.begin(), pcaBasis.end(), [](const torch::Tensor & basis) { return basis.defined(); }))
     {
       movingPcaMean = meansOver(true, pcaBasis, [&](const Impact::CellBox & box, const RegionType & span) {
