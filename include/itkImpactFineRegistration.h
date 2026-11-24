@@ -276,7 +276,11 @@ public:
    * image's resolution (MIND) or a power of two coarser, no coarser than the control cells (a region then starts on the
    * layer's lattice). PCA in Static mode: each layer's basis fitted on the fixed features of every voxel from their
    * sums gathered by one more pass over the boxes, each image's maps centred by its own features' mean and projected on
-   * it as they are pooled; in the Jacobian mode it is refused. A model that resamples the image to its voxel size runs
+   * it as they are pooled. In the Jacobian mode a swept model's basis is fitted so for each axis it sweeps, on the
+   * slices PcaSlices reads, and its moving features centred by their own slices' mean at every iteration (a pass
+   * without the graph); on patches the basis is fitted at every iteration on its points, both sides centred by their
+   * mean over them (a pass gathers their sums); the dense Jacobian mode refuses PCA, whose moving mean the whole-image
+   * run takes with the graph. A model that resamples the image to its voxel size runs
    * on its own grid: a box's samples of it, those its cells' layers read, resampled from the image's region they lie in
    * as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's windows
    * as the whole-image run pools them; every model of the image's dimension on one grid, no coarser than the cells.

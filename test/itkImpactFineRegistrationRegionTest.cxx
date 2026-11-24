@@ -1437,6 +1437,96 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 18. PCA in the Jacobian mode: a swept model's basis fitted on the slices PcaSlices reads of each axis it sweeps,
+  // the moving features centred by their own slices' mean at every iteration; on the patches around a fifth of the
+  // voxels, the basis fitted on the points of every iteration and each side centred by its mean over them. One
+  // component of each layer, with and without a moving mask. Whole against by regions on the resident maps and by
+  // bricks of one box from mapped files: the fields, and the losses at every iteration; the components move the field
+  // off the run without.
+  if (argc >= 5)
+  {
+    const auto movingMask = CutMask(moving);
+    struct Variant
+    {
+      const char * label;
+      const char * model;
+      unsigned int dimension;
+      double       sampling;
+    };
+    for (const Variant & variant : { Variant{ "swept 2D", argv[4], 2, 1.0 }, Variant{ "sampled", argv[3], 3, 0.2 } })
+    {
+      for (const bool masked : { false, true })
+      {
+        auto run = [&](bool byRegions, bool mapped, bool pca = true) {
+          auto               fine = FineType::New();
+          const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+          fine->SetFixedImage(fixed);
+          fine->SetMovingImage(moving);
+          fine->SetInitialDisplacementField(start);
+          if (masked)
+          {
+            fine->SetMovingMask(movingMask);
+          }
+          fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
+                                                                    variant.dimension,
+                                                                    1,
+                                                                    std::vector<unsigned int>(variant.dimension, patch),
+                                                                    { 0.f, 0.f, 0.f },
+                                                                    std::vector<unsigned int>(variant.dimension, 0),
+                                                                    { true, true },
+                                                                    false));
+          fine->SetDistance({ "L2", "L2" });
+          fine->SetLayersWeight({ 1.f, 1.f });
+          fine->SetMode("Jacobian");
+          fine->SetSamplingPercentage(variant.sampling);
+          if (pca)
+          {
+            fine->SetPCA({ 1, 1 });
+          }
+          Configure(fine, 6);
+          if (byRegions)
+          {
+            fine->SetRegionSize(16);
+            fine->SetRegionHalo(1);
+            if (mapped)
+            {
+              fine->SetResidentFeatureBudget(1);
+              fine->SetBrickBytes(1);
+              fine->SetScratchDirectory(scratch);
+            }
+          }
+          fine->Update();
+          return fine;
+        };
+        const auto whole = run(false, false);
+        double     fieldDifference = 0.0, lossDifference = 0.0;
+        for (const bool mapped : { false, true })
+        {
+          const auto region = run(true, mapped);
+          fieldDifference = std::max(
+            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+          for (size_t i = 0; i < whole->GetMetricValuesPerIteration().size(); ++i)
+          {
+            const double value = whole->GetMetricValuesPerIteration()[i];
+            lossDifference =
+              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+          }
+        }
+        const double reduces =
+          MaxDifference(whole->GetOutput(), run(false, false, false)->GetOutput(), fixed->GetLargestPossibleRegion());
+        std::cout << "PCA, Jacobian mode, " << variant.label << (masked ? ", a moving mask" : "")
+                  << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
+                  << lossDifference << " of theirs; the components move the field by " << reduces << " mm" << std::endl;
+        if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(reduces > 1e-5))
+        {
+          std::cerr << "With PCA in the Jacobian mode, the runs by regions differ from the whole-image run."
+                    << std::endl;
+          return EXIT_FAILURE;
+        }
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {
