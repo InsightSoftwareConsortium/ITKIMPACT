@@ -316,33 +316,40 @@ ImageLattice(size_t dim)
  * power of two: a layer of 64 / s samples keeps whole samples every s voxels, one of 64 / s + 1 a partial last one. */
 constexpr int64_t LatticeProbe = 65;
 
+/** The stride of the lattice of `samples` samples along an axis of the probe, and whether its last is `partial`; 0 for
+ * none. */
+inline int64_t
+ProbeStride(int64_t samples, bool & partial)
+{
+  auto          powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
+  const int64_t whole = LatticeProbe - 1;
+  partial = false;
+  if (samples == LatticeProbe)
+  {
+    return 1;
+  }
+  if (samples > 0 && whole % samples == 0 && powerOfTwo(whole / samples))
+  {
+    return whole / samples;
+  }
+  partial = samples > 1 && whole % (samples - 1) == 0 && powerOfTwo(whole / (samples - 1));
+  return partial ? whole / (samples - 1) : 0;
+}
+
 template <unsigned int Dim>
 std::vector<LayerLattice>
 LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
 {
-  auto                      powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
   std::vector<LayerLattice> lattices;
   for (const torch::Tensor & layer : layers)
   {
     LayerLattice lattice = ImageLattice(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
-      const int64_t samples = layer.size(2 + static_cast<int64_t>(d));
-      if (samples == LatticeProbe)
-      {
-        continue;
-      }
-      const int64_t whole = LatticeProbe - 1;
-      if (samples > 0 && whole % samples == 0 && powerOfTwo(whole / samples))
-      {
-        lattice.stride[d] = whole / samples;
-      }
-      else if (samples > 1 && whole % (samples - 1) == 0 && powerOfTwo(whole / (samples - 1)))
-      {
-        lattice.stride[d] = whole / (samples - 1);
-        lattice.partial[d] = true;
-      }
-      else
+      bool partial = false;
+      lattice.stride[d] = ProbeStride(layer.size(2 + static_cast<int64_t>(d)), partial);
+      lattice.partial[d] = partial;
+      if (lattice.stride[d] == 0)
       {
         itkGenericExceptionMacro(<< who << ": a feature layer of " << layer.sizes() << " for an image of "
                                  << LatticeProbe
@@ -1239,16 +1246,28 @@ GatherNorms(const std::vector<ImpactModelConfiguration> & configs,
     const int64_t count = configs[c].GetDimension() == Dim ? NormCount(configs[c]) : 0;
     for (int64_t k = 0; k < count; ++k)
     {
-      // The lattice of the normalisation's input, from a probe as a layer's: the sizes of a short box's input and of
-      // its own do not tell its stride.
+      // The stride of the normalisation's input along each axis, from a probe, as a layer's lattice: the sizes of a
+      // short box's input and of its own do not tell it. On no lattice (a valid convolution trims it), the probe's
+      // ratio, as a box's was taken.
       std::vector<int64_t> probe(Dim + 2, LatticeProbe);
       probe[0] = probe[1] = 1;
-      const LayerLattice lattice = LayerLattices<Dim>(
-        { NormInput(configs[c],
-                    ModelInput<Dim>(configs[c], torch::zeros(probe, torch::TensorOptions().device(device))),
-                    metadata,
-                    norms[c]) },
-        "IMPACT")[0];
+      const torch::Tensor probed =
+        NormInput(configs[c],
+                  ModelInput<Dim>(configs[c], torch::zeros(probe, torch::TensorOptions().device(device))),
+                  metadata,
+                  norms[c]);
+      std::vector<int64_t> strides(Dim);
+      for (unsigned int d = 0; d < Dim; ++d)
+      {
+        bool          partial = false;
+        const int64_t samples = probed.size(2 + static_cast<int64_t>(d));
+        strides[d] = ProbeStride(samples, partial);
+        if (strides[d] == 0)
+        {
+          strides[d] = int64_t{ 1 } << std::max<int64_t>(
+                         0, std::llround(std::log2(static_cast<double>(LatticeProbe) / static_cast<double>(samples))));
+        }
+      }
       torch::Tensor sums;
       double        samples = 0.0;
       for (const CellBox & box : boxes)
@@ -1260,7 +1279,7 @@ GatherNorms(const std::vector<ImpactModelConfiguration> & configs,
         {
           // The box's own samples, from its cells' first to the next box's, on the lattice of the input.
           const int64_t axis = 2 + static_cast<int64_t>(d);
-          const int64_t stride = lattice.stride[d];
+          const int64_t stride = strides[d];
           const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
           const int64_t end = box.cell1[d] == cells ? spatial[d] : windows[d].starts[box.cell1[d]];
           const int64_t first = (lowPad[d] + stride - 1) / stride;
