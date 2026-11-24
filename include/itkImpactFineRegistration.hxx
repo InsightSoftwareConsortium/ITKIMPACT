@@ -1461,7 +1461,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           torch::Tensor mll = ml[l];
           if (l < pcaBasis.size() && pcaBasis[l].defined())
           {
-            mll = Impact::PcaTransform(mll.squeeze(0), pcaBasis[l]).unsqueeze(0);
+            // Centred by their own mean taken without the graph, as the swept and sampled modes and FireANTs take it.
+            const torch::Tensor features = mll.squeeze(0);
+            mll = Impact::PcaTransform(features, pcaBasis[l], Impact::PcaSampleMean(features).detach()).unsqueeze(0);
           }
           mll = poolLayerToLoss(mll);
           torch::Tensor counted;
@@ -2092,9 +2094,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const Impact::RegionModelRun run = sampledJacobian          ? Impact::RegionModelRun::Patches
                                        : swept || mapSweep >= 0 ? Impact::RegionModelRun::Swept
                                                                 : Impact::RegionModelRun::Maps;
-    // PCA is fitted by regions but in the dense Jacobian mode (below).
-    const std::vector<unsigned int> refusedPca =
-      jacobian && !swept && !sampledJacobian ? m_PCA : std::vector<unsigned int>{};
+    // PCA is fitted by regions (below).
+    const std::vector<unsigned int> refusedPca;
     // The maps' models may resample the image to their voxel size (`featureSpatial`, above).
     const bool                 resampling = run == Impact::RegionModelRun::Maps;
     const Impact::RegionModels models = Impact::CheckRegionModels(m_FixedModelsConfiguration,
@@ -2668,6 +2669,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     fitPca(pcaBasis, fixedPcaMean, -1);
     movingPcaMean = meansOver(
       true, pcaBasis, [&](const Impact::CellBox &, const RegionType & span) { return movingOnFixed(span, false); });
+  }
+  if (fitsPca && jacobian && !swept)
+  {
+    // The dense Jacobian mode: the fixed maps centred by their own features' mean, the moving ones by theirs at every
+    // iteration.
+    fitPca(pcaBasis, fixedPcaMean, -1);
   }
   for (unsigned int axis = 0; fitsPca && swept && axis < Dim; ++axis)
   {
@@ -3455,9 +3462,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     bool   gathering = false;
     double gatheredPoints = 0.0;
-    // A swept model's moving features, with PCA, are centred by their mean over the slices PcaSlices reads along the
-    // axis of the iteration, at its field (below).
-    std::vector<torch::Tensor> sweptMovingMean(losses.size());
+    // With PCA the moving features of the Jacobian mode are centred by their mean at the field of the iteration
+    // (below): over every voxel, a swept model's over the slices PcaSlices reads along the axis of the iteration.
+    std::vector<torch::Tensor> movingMeanNow(losses.size());
     // On patches, with PCA, the basis is fitted at every iteration on the fixed features of its points and each side is
     // centred by its own mean over them, as the whole-image run fits and centres them: their sums are gathered over
     // every unit first, without the graph (`gatheringPca`).
@@ -3514,9 +3521,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       std::vector<torch::Tensor> warped =
         jacobian ? pooledWarped(block.cell0, block.cell1, smoothed, origin, swept ? static_cast<int>(sweptAxis) : -1)
                  : std::vector<torch::Tensor>{};
-      if (swept)
+      if (jacobian)
       {
-        reduced(warped, sweptBasis[sweptAxis], sweptMovingMean);
+        reduced(warped, swept ? sweptBasis[sweptAxis] : pcaBasis, movingMeanNow);
       }
       const Reading blockReading = spatialLoss && !jacobian ? readingOf(block, smoothed, origin, residual) : Reading{};
       torch::Tensor kept; // the block's points a spatial distance averages: the box's that count
@@ -3982,14 +3989,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               }
             }
           }
-          if (swept && fitsPca)
+          if (jacobian && fitsPca)
           {
-            // The moving features' mean over the slices PcaSlices reads along the axis swept, at the field of this
-            // iteration, without the graph, as the whole-image run detaches it.
+            // The moving features' mean at the field of this iteration (a swept model's over the slices PcaSlices reads
+            // along the axis swept), without the graph, as the whole-image run detaches it.
             torch::NoGradGuard noGrad;
-            sweptMovingMean = meansOver(
+            movingMeanNow = meansOver(
               true,
-              sweptBasis[sweptAxis],
+              swept ? sweptBasis[sweptAxis] : pcaBasis,
               [&](const Impact::CellBox & box, const RegionType & span) {
                 const Impact::CellBox window = around(box);
                 return warpedOn(readMovingImage,
@@ -3997,7 +4004,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                 smoothControl(Impact::NarrowTo(theta, window.cell0, window.cell1).to(device)),
                                 window.cell0);
               },
-              static_cast<int>(sweptAxis));
+              swept ? static_cast<int>(sweptAxis) : -1);
           }
           if (globalLoss)
           {

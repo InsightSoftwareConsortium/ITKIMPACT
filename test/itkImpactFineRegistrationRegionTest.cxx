@@ -1438,9 +1438,10 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 18. PCA in the Jacobian mode: a swept model's basis fitted on the slices PcaSlices reads of each axis it sweeps,
-  // the moving features centred by their own slices' mean at every iteration; on the patches around a fifth of the
-  // voxels, the basis fitted on the points of every iteration and each side centred by its mean over them. One
+  // 18. PCA in the Jacobian mode: the dense mode's fitted as Static mode's, the moving features centred by their mean
+  // over every voxel at every iteration; a swept model's basis fitted on the slices PcaSlices reads of each axis it
+  // sweeps, the moving features centred by their own slices' mean at every iteration; on the patches around a fifth of
+  // the voxels, the basis fitted on the points of every iteration and each side centred by its mean over them. One
   // component of each layer, with and without a moving mask. Whole against by regions on the resident maps and by
   // bricks of one box from mapped files: the fields, and the losses at every iteration; the components move the field
   // off the run without.
@@ -1454,7 +1455,9 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
       unsigned int dimension;
       double       sampling;
     };
-    for (const Variant & variant : { Variant{ "swept 2D", argv[4], 2, 1.0 }, Variant{ "sampled", argv[3], 3, 0.2 } })
+    for (const Variant & variant : { Variant{ "dense", argv[3], 3, 1.0 },
+                                     Variant{ "swept 2D", argv[4], 2, 1.0 },
+                                     Variant{ "sampled", argv[3], 3, 0.2 } })
     {
       for (const bool masked : { false, true })
       {
