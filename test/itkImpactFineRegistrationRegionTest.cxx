@@ -1614,6 +1614,79 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 20. SamplingPercentage < 1 in Static mode by regions: each cell drawn with that chance at every iteration by a hash
+  // of its number and the iteration, so that every unit and every pass draw the same cells. A point-wise distance, and
+  // NCC with OrganDice (statistics over the points drawn), with and without a moving mask: the dense iterations on the
+  // resident maps, the bricks of one box from mapped files and every box drawn at every iteration take the same field,
+  // and the same losses; the draws move it off the run on every cell.
+  if (argc >= 4)
+  {
+    const auto movingMask = CutMask(moving);
+    struct Variant
+    {
+      const char *             label;
+      std::vector<std::string> distance;
+      bool                     masked;
+    };
+    for (const Variant & variant : { Variant{ "L2", { "L2", "L2" }, false },
+                                     Variant{ "NCC and OrganDice", { "NCC", "OrganDice" }, false },
+                                     Variant{ "NCC and OrganDice, a moving mask", { "NCC", "OrganDice" }, true } })
+    {
+      auto run = [&](bool mapped, unsigned int regionsPerIteration, double sampling) {
+        auto fine = FineType::New();
+        fine->SetFixedImage(fixed);
+        fine->SetMovingImage(moving);
+        fine->SetInitialDisplacementField(start);
+        if (variant.masked)
+        {
+          fine->SetMovingMask(movingMask);
+        }
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+        fine->SetDistance(variant.distance);
+        fine->SetLayersWeight({ 1.f, 1.f });
+        fine->SetSamplingPercentage(sampling);
+        Configure(fine, 6);
+        fine->SetRegionSize(16);
+        fine->SetRegionHalo(1);
+        fine->SetRegionsPerIteration(regionsPerIteration);
+        if (mapped)
+        {
+          fine->SetResidentFeatureBudget(1);
+          fine->SetBrickBytes(1);
+          fine->SetScratchDirectory(scratch);
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto dense = run(false, 0, 0.3);
+      double     fieldDifference = 0.0, lossDifference = 0.0;
+      for (const auto & route : { std::make_pair(true, 0u), std::make_pair(false, 18u) })
+      {
+        const auto region = run(route.first, route.second, 0.3);
+        fieldDifference = std::max(
+          fieldDifference, MaxDifference(dense->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+        for (size_t i = 0; route.second == 0 && i < dense->GetMetricValuesPerIteration().size(); ++i)
+        {
+          const double value = dense->GetMetricValuesPerIteration()[i];
+          lossDifference =
+            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+        }
+      }
+      const double draws =
+        MaxDifference(dense->GetOutput(), run(false, 0, 1.0)->GetOutput(), fixed->GetLargestPossibleRegion());
+      std::cout << "a share of 0.3 of the cells, " << variant.label
+                << ", by bricks and with every box drawn against the dense iterations: fields within "
+                << fieldDifference << " mm, losses within " << lossDifference
+                << " of theirs; the draws move the field by " << draws << " mm" << std::endl;
+      if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(draws > 1e-4))
+      {
+        std::cerr << "With SamplingPercentage < 1, the runs by regions draw different cells." << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {

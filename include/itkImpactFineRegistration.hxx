@@ -2119,12 +2119,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       const std::string name = m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
       losses.push_back(Impact::LossFactory::Instance().Create(name));
-      if (!losses.back()->IsPerPointMean() && !losses.back()->IsSpatial() && m_SamplingPercentage < 1.0 && !jacobian)
-      {
-        itkExceptionMacro("ImpactFineRegistration: distance '"
-                          << name << "' is a statistic over all the points, which needs one draw of them an "
-                          << "iteration; with RegionSize, Static mode draws them box by box.");
-      }
       if (losses.back()->IsSpatial() && m_SamplingPercentage < 1.0)
       {
         itkExceptionMacro("ImpactFineRegistration: distance '"
@@ -2459,24 +2453,36 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const auto [f, m] = rowsOf(fixed, moving, rows);
     return losses[l]->forwardValue(f, m);
   };
-  // The rows that count among `counted` (bool {1, 1, n...}; every row when undefined), a share of them drawn at
-  // random with SamplingPercentage < 1.
-  auto drawRows = [&](const torch::Tensor & counted, int64_t count) -> torch::Tensor {
+  // The rows that count among `counted` (bool {1, 1, n...}, of the cells [c0, c1); every row when undefined). With
+  // SamplingPercentage < 1, each cell with that chance at every iteration (`drawIteration`), by a hash of its number on
+  // the grid, the iteration and Seed: every pass of an iteration and every way of cutting the grid into units draw the
+  // same cells, and a statistic over all the points (NCC) takes one draw of them.
+  unsigned int drawIteration = 0;
+  auto drawRows = [&](const torch::Tensor & counted, const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     torch::Tensor rows;
-    if (counted.defined())
+    if (m_SamplingPercentage < 1.0)
+    {
+      constexpr int64_t                modulus = 2147483647; // the Lehmer generator's, 2^31 - 1
+      const std::vector<torch::Tensor> index = Impact::BoxIndices(c0, c1, device);
+      torch::Tensor flat = torch::zeros({}, torch::TensorOptions().dtype(torch::kLong).device(device));
+      for (unsigned int d = 0; d < Dim; ++d)
+      {
+        flat = flat * cells[d] + index[d];
+      }
+      torch::Tensor hash = (flat.flatten() + (static_cast<int64_t>(drawIteration) + 1) * 1000003 +
+                            static_cast<int64_t>(m_Seed) * 7919 + 1) %
+                           modulus;
+      for (const int64_t shift : { 13, 7, 17 })
+      {
+        hash = (hash * 48271) % modulus;
+        hash = hash.bitwise_xor(hash.bitwise_right_shift(shift));
+      }
+      const torch::Tensor drawn = hash.to(torch::kFloat64) < m_SamplingPercentage * static_cast<double>(modulus);
+      rows = (counted.defined() ? drawn.logical_and(counted.flatten()) : drawn).nonzero().flatten();
+    }
+    else if (counted.defined())
     {
       rows = counted.flatten().nonzero().flatten();
-    }
-    else if (m_SamplingPercentage < 1.0)
-    {
-      rows = torch::arange(count, torch::TensorOptions().dtype(torch::kLong).device(device));
-    }
-    if (m_SamplingPercentage < 1.0 && rows.numel() > 0)
-    {
-      const int64_t drawn =
-        std::max<int64_t>(1, std::llround(m_SamplingPercentage * static_cast<double>(rows.numel())));
-      rows = rows.index_select(
-        0, torch::randint(rows.numel(), { drawn }, torch::TensorOptions().dtype(torch::kLong).device(device)));
     }
     return rows;
   };
@@ -3245,6 +3251,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
+      drawIteration = iteration;
       drawSubsets(channels);
       // The moving maps are read past a refresh's reference, the moving mask at the whole field.
       const torch::Tensor smoothed = smoothControl(theta);
@@ -3257,7 +3264,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           Impact::WarpMap<Dim>(movingShare, wholeStart, cells, base, smoothed.detach() * voxelsToCells) >= 0.5;
         counted = counted.defined() ? counted.logical_and(holds) : holds;
       }
-      const torch::Tensor rows = drawRows(counted, cellCountTotal);
+      const torch::Tensor rows = drawRows(counted, wholeStart, cells);
       torch::Tensor       total = torch::zeros({}, onDevice);
       if (!rows.defined() || rows.numel() > 0)
       {
@@ -3317,7 +3324,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // The units' counts are taken again where they change: with a moving mask the cells that count follow the field,
     // the sampled points change with every draw, and a swept model's points with the axis drawn, of which each has its
     // own set of counts.
-    const bool                        recounts = movingShare.defined() || swept || sampledJacobian;
+    // Static mode's draws (SamplingPercentage < 1) change the cells that count at every iteration too.
+    const bool recounts = movingShare.defined() || swept || sampledJacobian || m_SamplingPercentage < 1.0;
     std::vector<Impact::CellBox>      units;
     std::vector<int64_t>              perUnit(Dim), unitsAlong(Dim);
     std::vector<size_t>               order;
@@ -3505,8 +3513,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         // Nothing of it counts: its edges alone, no map read.
         return regularizer(smoothed, box.cell0, box.cell1, origin);
       }
-      const torch::Tensor   rows = drawRows(reading.counted, box.Count());
-      const double          share = static_cast<double>(reading.count) / countedCells[countSet()];
+      const torch::Tensor rows = drawRows(reading.counted, box.cell0, box.cell1);
+      const double        share =
+        static_cast<double>(m_SamplingPercentage < 1.0 ? rows.numel() : reading.count) / countedCells[countSet()];
       const Impact::CellBox block = Impact::CellsAround(box, std::vector<int64_t>(Dim, lossHalo), cells);
       const Impact::CellBox points = swept ? sweptPoints(box) : box;
       if (gathering)
@@ -3874,7 +3883,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // How many of the cells (points) of `box` count, for the smoothed field `smoothed` of the cells from `origin` on.
     auto countOf =
       [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) {
-        return sampledJacobian ? keptPoints(box, smoothed, origin).size(0) : readingOf(box, smoothed, origin).count;
+        if (sampledJacobian)
+        {
+          return keptPoints(box, smoothed, origin).size(0);
+        }
+        const Reading reading = readingOf(box, smoothed, origin);
+        return m_SamplingPercentage < 1.0 && reading.count > 0 ? drawRows(reading.counted, box.cell0, box.cell1).numel()
+                                                               : reading.count;
       };
     // The smoothed residual past a refresh's reference of the cells of `window` whose control cells are `control`:
     // the field the moving maps are read at; undefined without FeatureMapUpdateInterval.
@@ -3916,6 +3931,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     m_MetricValuesPerIteration.reserve(m_NumberOfIterations);
     for (unsigned int iteration = 0; iteration < m_NumberOfIterations; ++iteration)
     {
+      drawIteration = iteration;
       const size_t drawn = drawsBoxes ? std::min<size_t>(m_RegionsPerIteration, order.size()) : 0;
       for (size_t i = 0; i < drawn; ++i)
       {

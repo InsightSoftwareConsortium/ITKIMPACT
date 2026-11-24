@@ -268,11 +268,14 @@ public:
    * masks keep, the moving one where the field reads it: they are counted over the grid before the bricks are stepped),
    * with the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
    * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
-   * iteration costs and holds then follows those boxes, not the image.
+   * iteration costs and holds then follows those boxes, not the image. With SamplingPercentage < 1, Static mode reads
+   * at every iteration each cell with that chance, drawn by a hash of the cell's number on the grid, the iteration and
+   * Seed: every unit and every pass of an iteration draw the same cells, as many on average as the whole-image run
+   * draws, though not the same ones.
    * Point-wise distances; LNCC, whose windows a unit takes on its cells and half the widest window around them,
    * keeping the terms of its own; NCC and OrganDice, statistics over all the points, from their sums gathered over
    * every unit at every iteration without the graph (with RegionsPerIteration too, a pass over the grid), of whose
-   * gradient each unit's step takes its part (in Static mode, with SamplingPercentage 1 only); feature layers at the
+   * gradient each unit's step takes its part; feature layers at the
    * image's resolution (MIND) or a power of two coarser, no coarser than the control cells (a region then starts on the
    * layer's lattice). PCA in Static mode: each layer's basis fitted on the fixed features of every voxel from their
    * sums gathered by one more pass over the boxes, each image's maps centred by its own features' mean and projected on
