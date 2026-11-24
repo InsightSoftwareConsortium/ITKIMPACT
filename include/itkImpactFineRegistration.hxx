@@ -1277,7 +1277,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           }
           // The moving side again, with the graph, a batch at a time: each batch's backward reaches the smoothed field
           // and frees its network graph. A per-point distance's batch weighs its share of the points. A batch that runs
-          // out of device memory is replayed at half the size, with the gradient it had added taken back.
+          // out of device memory is replayed at half the size, the gradient set back to the copy it started from: none
+          // when it ran out making the copy, which then added nothing.
           torch::Tensor gradientBefore;
           for (size_t i = 0; i < movingConfigs.size(); ++i)
           {
@@ -1286,6 +1287,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
               device,
               n,
               [&](int64_t begin, int64_t end) {
+                gradientBefore.reset();
                 gradientBefore = smoothed.grad().clone();
                 const std::vector<torch::Tensor> layers =
                   Impact::PatchCentreFeatures(movingConfigs[i], patchesOf(i, begin, end, true), movingMetadata);
@@ -1311,7 +1313,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
                   simValue += surrogate.template item<double>();
                 }
               },
-              [&] { smoothed.mutable_grad().copy_(gradientBefore); });
+              [&] {
+                if (gradientBefore.defined())
+                {
+                  smoothed.mutable_grad().copy_(gradientBefore);
+                }
+              });
           }
         }
         smoothedControl.backward(smoothed.grad()); // the smoothing passes, once: -> theta.grad
@@ -3706,6 +3713,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                 }
                 return;
               }
+              gradientBefore.reset(); // none to set back if the copy runs out of memory
               gradientBefore = leaf.grad().clone();
               const std::vector<torch::Tensor> layers =
                 Impact::PatchCentreFeatures(movingConfigs[i], patchesOf(i, begin, end, leaf), movingMetadata);
@@ -3724,7 +3732,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               value += surrogate.template item<double>();
             },
             [&] {
-              if (leaf.defined())
+              if (gradientBefore.defined())
               {
                 leaf.mutable_grad().copy_(gradientBefore);
               }
