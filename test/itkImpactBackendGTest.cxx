@@ -2833,6 +2833,23 @@ TEST(ImpactLoss, ForwardValueGradientFiniteDifference)
   }
 }
 
+// NCC on a channel constant over the points (one a ReLU zeroes, a map read past the image): a finite gradient, from
+// the points and from their sums (ValueFromSums, which the runs by regions differentiate).
+TEST(ImpactLoss, NCCGradientIsFiniteOnAConstantChannel)
+{
+  torch::manual_seed(11);
+  auto                loss = itk::Impact::LossFactory::Instance().Create("NCC");
+  const torch::Tensor fixed = torch::rand({ 32, 3 });
+  torch::Tensor       moving = torch::rand({ 32, 3 });
+  moving.select(1, 1).fill_(0.5);
+  const torch::Tensor leaf = moving.clone().requires_grad_(true);
+  loss->forwardValue(fixed, leaf).backward();
+  EXPECT_TRUE(torch::isfinite(leaf.grad()).all().item<bool>()) << leaf.grad();
+  const torch::Tensor sums = itk::Impact::PointSums(fixed, moving).requires_grad_(true);
+  const torch::Tensor seeds = torch::autograd::grad({ loss->ValueFromSums(sums, 32.0) }, { sums })[0];
+  EXPECT_TRUE(torch::isfinite(seeds).all().item<bool>()) << seeds;
+}
+
 // --- ImpactFineRegistration: fast Torch-backed Adam dense registration ---------
 namespace
 {

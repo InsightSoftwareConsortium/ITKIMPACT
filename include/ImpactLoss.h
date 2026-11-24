@@ -856,11 +856,16 @@ private:
    * |covariance| <= sqrt(varFixed * varMoving) (Cauchy-Schwarz), flooring the denominator
    * makes such a channel contribute a correlation of 0 -- the neutral value -- instead of a
    * NaN which, through the mean over channels, would turn the whole metric value and its
-   * derivative into NaN and silently stall the registration. */
+   * derivative into NaN and silently stall the registration. A zero variance's square root
+   * is taken without its derivative, infinite there: the floor's zero times it was NaN. */
   static torch::Tensor
   Denominator(const torch::Tensor & varFixed, const torch::Tensor & varMoving)
   {
-    return (torch::sqrt(varFixed) * torch::sqrt(varMoving)).clamp_min(s_epsilon);
+    auto root = [](const torch::Tensor & variance) {
+      const torch::Tensor positive = variance > 0.0;
+      return torch::where(positive, torch::sqrt(torch::where(positive, variance, 1.0)), 0.0);
+    };
+    return (root(varFixed) * root(varMoving)).clamp_min(s_epsilon);
   }
 
 public:
