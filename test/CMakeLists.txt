@@ -82,7 +82,8 @@ itk_add_test(NAME itkInterpolateVectorImageFunctionTest
 itk_add_test(NAME itkImpactFineRegistrationRegionTest
   COMMAND ImpactTestDriver itkImpactFineRegistrationRegionTest
   ${ITK_TEST_OUTPUT_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModelDown.pt
-  ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModel.pt ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModel2D.pt)
+  ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModel.pt ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModel2D.pt
+  ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModelNorm.pt)
 itk_add_test(NAME itkImpactCoarseRegistrationRegionTest
   COMMAND ImpactTestDriver itkImpactCoarseRegistrationRegionTest
   ${ITK_TEST_OUTPUT_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Data/ImpactToyModelDown.pt)

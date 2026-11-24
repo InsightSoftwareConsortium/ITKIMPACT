@@ -2181,6 +2181,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // one forward (a region is sized to fit the device, so the tiler ExtractFeatureLayers measures the device for at
   // every call has nothing to cut), a swept one slice by slice along ITK axis `axis`; the region itself in intensity
   // mode. With `withGrad`, differentiable to the region.
+  // In Static mode the models take the statistics of their normalisations over the whole image (below), each model's
+  // of each image; none until they are gathered, and none in the Jacobian mode, where every region keeps its own.
+  std::vector<std::vector<torch::Tensor>> fixedNorms(m_FixedModelsConfiguration.size()),
+    movingNorms(movingConfigs.size());
   auto layersOf = [&](const torch::Tensor & image, bool moving, bool withGrad = false, int axis = -1) {
     return Impact::RegionLayers<Dim>(featureMode ? (moving ? movingConfigs : m_FixedModelsConfiguration)
                                                  : std::vector<ImpactModelConfiguration>{},
@@ -2190,7 +2194,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                      takesMetadata ? &(moving ? movingMetadata : fixedMetadata) : nullptr,
                                      "ImpactFineRegistration",
                                      withGrad,
-                                     axis);
+                                     axis,
+                                     moving ? &movingNorms : &fixedNorms);
   };
   std::vector<int64_t> cellVoxels(Dim),
     featureCellVoxels(Dim); // a cell's voxels, and its widest window on the models' grid
@@ -2599,6 +2604,62 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       }
     }
   };
+  // Static mode: the statistics over the whole image of each model's normalisations by its input's own (NormCount),
+  // one pass over the boxes a normalisation: each box's input of it (NormInput, those gathered before handed over),
+  // on its own lattice, summed over the box's own samples in double precision, gives the mean and the biased variance
+  // of the whole image's, as the whole-image run normalises it. `read` gives the image of a box's region.
+  auto gatherNorms = [&](bool moving, auto && read) {
+    const std::vector<ImpactModelConfiguration> & configs = moving ? movingConfigs : m_FixedModelsConfiguration;
+    const ImpactImageMetadata                     metadata =
+      takesMetadata ? (moving ? movingMetadata : fixedMetadata) : ImpactImageMetadata{};
+    torch::NoGradGuard                      noGrad;
+    std::vector<std::vector<torch::Tensor>> norms(configs.size());
+    for (size_t c = 0; c < configs.size(); ++c)
+    {
+      ModelTo(configs[c], device);
+      const int64_t count = configs[c].GetDimension() == Dim ? NormCount(configs[c]) : 0;
+      for (int64_t k = 0; k < count; ++k)
+      {
+        torch::Tensor sums;
+        double        samples = 0.0;
+        for (const Impact::CellBox & box : boxes)
+        {
+          std::vector<int64_t> lowPad(Dim);
+          const torch::Tensor  image = featureInput(
+            box.cell0, box.cell1, lowPad, -1, [&](const RegionType & span) { return read(box, span); }, true);
+          torch::Tensor own = NormInput(configs[c], Impact::ModelInput<Dim>(configs[c], image), metadata, norms[c]);
+          for (unsigned int d = 0; d < Dim; ++d)
+          {
+            // The box's own voxels, from the cells' first to the next box's, on the lattice of the input.
+            const int64_t axis = 2 + static_cast<int64_t>(d);
+            const int64_t stride =
+              int64_t{ 1 } << std::max<int64_t>(
+                0,
+                std::llround(std::log2(static_cast<double>(image.size(axis)) / static_cast<double>(own.size(axis)))));
+            const int64_t end = box.cell1[d] == cells[d] ? featureSpatial[d] : featureWindows[d].starts[box.cell1[d]];
+            const int64_t first = (lowPad[d] + stride - 1) / stride;
+            const int64_t last = std::min(
+              own.size(axis), (lowPad[d] + end - featureWindows[d].starts[box.cell0[d]] + stride - 1) / stride);
+            own = own.narrow(axis, first, last - first);
+          }
+          const torch::Tensor part = own.to(torch::kFloat64).transpose(0, 1).reshape({ own.size(1), -1 });
+          const torch::Tensor moments = torch::stack({ part.sum(1), (part * part).sum(1) });
+          sums = sums.defined() ? sums + moments : moments;
+          samples += static_cast<double>(part.size(1));
+        }
+        const torch::Tensor mean = sums[0] / samples;
+        norms[c].push_back(
+          torch::stack({ mean, (sums[1] / samples - mean * mean).clamp_min(0.0) }).to(GetModelDtype(configs[c])));
+      }
+    }
+    return norms;
+  };
+  if (featureMode && !jacobian)
+  {
+    fixedNorms = gatherNorms(false, [&](const Impact::CellBox &, const RegionType & span) { return readFixed(span); });
+    movingNorms =
+      gatherNorms(true, [&](const Impact::CellBox &, const RegionType & span) { return movingOnFixed(span, false); });
+  }
   const bool fitsPca = featureMode && !sampledJacobian &&
                        std::any_of(m_PCA.begin(), m_PCA.end(), [](unsigned int components) { return components > 0; });
   if (fitsPca && !jacobian)
@@ -3137,7 +3198,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       return std::make_pair(smoothControl(Impact::NarrowTo(thetaRef, window.cell0, window.cell1).to(device)),
                             window.cell0);
     };
-    // With PCA, the moving features are centred by the mean of those of the image the field now warps.
+    // The moving image the field now warps: its normalisations' statistics, and with PCA its features' mean.
+    movingNorms = gatherNorms(true, [&](const Impact::CellBox & box, const RegionType & span) {
+      const auto [smoothed, origin] = fieldAround(box);
+      return warpedOn(readMovingImage, span, smoothed, origin);
+    });
     if (std::any_of(pcaBasis.begin(), pcaBasis.end(), [](const torch::Tensor & basis) { return basis.defined(); }))
     {
       movingPcaMean = meansOver(true, pcaBasis, [&](const Impact::CellBox & box, const RegionType & span) {

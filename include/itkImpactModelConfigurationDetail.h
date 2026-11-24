@@ -88,11 +88,28 @@ ModelTo(const ImpactModelConfiguration & configuration, const torch::Device & de
   configuration.GetImpl()->model->to(device);
 }
 
+/** The stats and direction of `metadata` as a metadata-aware model takes them. Passing an *undefined* tensor into a
+ * model that actually reads it -- e.g. SAM's input normalisation does aten::size on `stats` -- aborts LibTorch's alias
+ * analysis ("no op for aten::size"): the schema's empty-tensor default stands for a field left undefined, so that the
+ * model takes its no-metadata path instead of crashing. */
+inline std::pair<torch::Tensor, torch::Tensor>
+MetadataArguments(const ImpactImageMetadata & metadata, const torch::Tensor & input)
+{
+  const torch::Tensor empty = torch::empty({ 0 }, input.options().dtype(torch::kFloat32));
+  return { metadata.stats.defined() ? metadata.stats : empty,
+           metadata.direction.defined() ? metadata.direction : empty };
+}
+
 /** Run the model's forward, assembling positional arguments per the introspected schema:
  * always the patch; plus the requested layer count when forward takes >= 2 inputs; plus the
- * stats and direction of `metadata` when it takes >= 4. Returns the per-layer output tensors. */
+ * stats and direction of `metadata` when it takes >= 4; plus `norms` when given, the statistics of
+ * its normalisations (NormCount) the model takes in place of its input's own. Returns the per-layer
+ * output tensors. */
 inline std::vector<torch::jit::IValue>
-Forward(const ImpactModelConfiguration & configuration, torch::Tensor inputPatch, const ImpactImageMetadata & metadata)
+Forward(const ImpactModelConfiguration &   configuration,
+        torch::Tensor                      inputPatch,
+        const ImpactImageMetadata &        metadata,
+        const std::vector<torch::Tensor> & norms = {})
 {
   detail::ImpactModelConfigurationImpl * impl = configuration.GetImpl();
   std::vector<torch::jit::IValue>        args;
@@ -104,16 +121,43 @@ Forward(const ImpactModelConfiguration & configuration, torch::Tensor inputPatch
   }
   if (impl->nArgs >= 4)
   {
-    // A metadata-aware model (nArgs >= 4) takes the image's intensity statistics and direction.
-    // Passing an *undefined* tensor into a model that actually reads it -- e.g. SAM's input
-    // normalisation does aten::size on `stats` -- aborts LibTorch's alias analysis ("no op for
-    // aten::size"). Fall back to the schema's empty-tensor default so the model takes its
-    // no-metadata path instead of crashing.
-    const torch::Tensor empty = torch::empty({ 0 }, inputPatch.options().dtype(torch::kFloat32));
-    args.emplace_back(metadata.stats.defined() ? metadata.stats : empty);
-    args.emplace_back(metadata.direction.defined() ? metadata.direction : empty);
+    const auto [stats, direction] = MetadataArguments(metadata, inputPatch);
+    args.emplace_back(stats);
+    args.emplace_back(direction);
+  }
+  if (!norms.empty())
+  {
+    args.emplace_back(c10::List<torch::Tensor>(norms));
   }
   return impl->model->forward(std::move(args)).toList().vec();
+}
+
+/** How many normalisations by its input's own statistics (TS's instance normalisation, MIND's bound on its
+ * variance) the model applies up to its last requested layer: what its norm_count method says, 0 for a model without
+ * one, which then always normalises by its input's own. */
+inline int64_t
+NormCount(const ImpactModelConfiguration & configuration)
+{
+  torch::jit::script::Module & model = GetModel(configuration);
+  if (!model.find_method("norm_count"))
+  {
+    return 0;
+  }
+  return model.run_method("norm_count", configuration.GetImpl()->nLayers.item<int64_t>()).toInt();
+}
+
+/** The input of the model's normalisation number norms.size(), on the image's axes, those before it normalised by
+ * `norms` (one [2, C] tensor each: the mean and the biased variance of its input). */
+inline torch::Tensor
+NormInput(const ImpactModelConfiguration &   configuration,
+          const torch::Tensor &              input,
+          const ImpactImageMetadata &        metadata,
+          const std::vector<torch::Tensor> & norms)
+{
+  const auto [stats, direction] = MetadataArguments(metadata, input);
+  return GetModel(configuration)
+    .run_method("norm_input", input, stats, direction, c10::List<torch::Tensor>(norms))
+    .toTensor();
 }
 
 /** Forward with the metadata SetupImageMetadata stored in the configuration. A configuration is shared

@@ -696,21 +696,38 @@ MetadataByBlocks(const TDirection & direction, unsigned int dim, TReadBlocks && 
   return metadata;
 }
 
+/** An image region ({1, 1, span...}) as a model takes it: in its precision, its channels repeated. */
+template <unsigned int Dim>
+torch::Tensor
+ModelInput(const ImpactModelConfiguration & config, const torch::Tensor & image)
+{
+  torch::Tensor input = image.to(GetModelDtype(config));
+  if (config.GetNumberOfChannels() > 1)
+  {
+    std::vector<int64_t> repeats(Dim + 2, 1);
+    repeats[1] = static_cast<int64_t>(config.GetNumberOfChannels());
+    input = input.repeat(repeats);
+  }
+  return input;
+}
+
 /** The kept feature layers of an image region ({1, 1, span...}), each at its own resolution, each model run on the
  * region whole in one forward, `metadata` (when given) set on the configurations first; the region itself with no
  * model. A model of one dimension fewer than the image runs on its slices along ITK axis `sweepAxis`, one forward a
  * slice, its layers stacked along that axis, as ExtractFeatureLayers sweeps it. With `withGrad` the layers keep the
- * graph back to `image`. `layerCount` is what the caller keeps, checked. */
+ * graph back to `image`. `layerCount` is what the caller keeps, checked. `norms`, when given, holds for each model the
+ * statistics over the whole image of its normalisations (Forward), so that the region is normalised as the image. */
 template <unsigned int Dim>
 std::vector<torch::Tensor>
-RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
-             const torch::Tensor &                         image,
-             const torch::Device &                         device,
-             size_t                                        layerCount,
-             const ImpactImageMetadata *                   metadata,
-             const char *                                  who,
-             bool                                          withGrad = false,
-             int                                           sweepAxis = -1)
+RegionLayers(const std::vector<ImpactModelConfiguration> &   configs,
+             const torch::Tensor &                           image,
+             const torch::Device &                           device,
+             size_t                                          layerCount,
+             const ImpactImageMetadata *                     metadata,
+             const char *                                    who,
+             bool                                            withGrad = false,
+             int                                             sweepAxis = -1,
+             const std::vector<std::vector<torch::Tensor>> * norms = nullptr)
 {
   if (configs.empty())
   {
@@ -718,20 +735,15 @@ RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
   }
   std::vector<torch::Tensor> layers;
   torch::AutoGradMode        gradMode(withGrad);
-  for (const ImpactModelConfiguration & config : configs)
+  for (size_t c = 0; c < configs.size(); ++c)
   {
+    const ImpactModelConfiguration & config = configs[c];
     if (metadata != nullptr)
     {
       config.GetImpl()->imageMetadata = *metadata;
     }
     ModelTo(config, device);
-    torch::Tensor input = image.to(GetModelDtype(config));
-    if (config.GetNumberOfChannels() > 1)
-    {
-      std::vector<int64_t> repeats(Dim + 2, 1);
-      repeats[1] = static_cast<int64_t>(config.GetNumberOfChannels());
-      input = input.repeat(repeats);
-    }
+    const torch::Tensor             input = ModelInput<Dim>(config, image);
     std::vector<torch::jit::IValue> outputs;
     if (config.GetDimension() < Dim)
     {
@@ -753,7 +765,8 @@ RegionLayers(const std::vector<ImpactModelConfiguration> & configs,
     }
     else
     {
-      outputs = Forward(config, input);
+      outputs = Forward(
+        config, input, config.GetImpl()->imageMetadata, norms != nullptr ? (*norms)[c] : std::vector<torch::Tensor>{});
     }
     const std::vector<bool> & mask = config.GetLayersMask();
     for (size_t i = 0; i < outputs.size(); ++i)

@@ -148,7 +148,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   if (argc < 2)
   {
     std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
-              << " <temporary directory> [<model with half-resolution layers> <3x3x3 model> <its 2D counterpart>]"
+              << " <temporary directory> [<model with half-resolution layers> <3x3x3 model> <its 2D counterpart> "
+                 "<a model with instance normalisations>]"
               << std::endl;
     return EXIT_FAILURE;
   }
@@ -1523,6 +1524,89 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
                     << std::endl;
           return EXIT_FAILURE;
         }
+      }
+    }
+  }
+
+  // 19. A model that normalises by its input's statistics (two instance normalisations, at the image's resolution and
+  // at half of it) in Static mode: the statistics over the whole image of each, gathered by a pass over the boxes a
+  // normalisation, handed to every box. With and without a moving mask, with PCA, and with the moving maps refreshed
+  // every two iterations (their statistics gathered again on the image the field warps). Whole against by regions on
+  // the resident maps, by bricks of one box from mapped files and with every box drawn at every iteration: the
+  // fields, and the losses at every iteration.
+  if (argc >= 6)
+  {
+    const auto movingMask = CutMask(moving);
+    struct Variant
+    {
+      const char * label;
+      bool         masked;
+      bool         pca;
+      int          interval;
+    };
+    for (const Variant & variant : { Variant{ "", false, false, -1 },
+                                     Variant{ ", a moving mask", true, false, -1 },
+                                     Variant{ ", PCA", false, true, -1 },
+                                     Variant{ ", the moving maps refreshed every two iterations", false, false, 2 } })
+    {
+      auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+        auto fine = FineType::New();
+        fine->SetFixedImage(fixed);
+        fine->SetMovingImage(moving);
+        fine->SetInitialDisplacementField(start);
+        if (variant.masked)
+        {
+          fine->SetMovingMask(movingMask);
+        }
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[5], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+        if (variant.pca)
+        {
+          fine->SetPCA({ 1, 1 });
+        }
+        fine->SetFeatureMapUpdateInterval(variant.interval);
+        Configure(fine, 6);
+        if (byRegions)
+        {
+          fine->SetRegionSize(16);
+          fine->SetRegionHalo(3);
+          fine->SetRegionsPerIteration(regionsPerIteration);
+          if (mapped)
+          {
+            fine->SetResidentFeatureBudget(1);
+            fine->SetBrickBytes(1);
+            fine->SetScratchDirectory(scratch);
+          }
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto whole = run(false, false, 0);
+      double     fieldDifference = 0.0, lossDifference = 0.0;
+      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+      {
+        const auto region = run(true, route.first, route.second);
+        fieldDifference = std::max(
+          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+        {
+          const double value = whole->GetMetricValuesPerIteration()[i];
+          lossDifference =
+            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+        }
+      }
+      const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+      std::cout << "a model with instance normalisations" << variant.label
+                << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
+                << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
+      if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(moved > 1e-3))
+      {
+        std::cerr << "With a model that normalises by its input's statistics, the runs by regions differ from the "
+                     "whole-image run."
+                  << std::endl;
+        return EXIT_FAILURE;
       }
     }
   }
