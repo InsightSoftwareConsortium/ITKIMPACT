@@ -2026,13 +2026,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     {
       const std::string name = m_Distance.empty() ? std::string("L2") : m_Distance[std::min(l, m_Distance.size() - 1)];
       losses.push_back(Impact::LossFactory::Instance().Create(name));
-      if (losses.back()->IsSpatial())
+      if (losses.back()->IsSpatial() && m_SamplingPercentage < 1.0)
       {
-        itkExceptionMacro("ImpactFineRegistration: distance '" << name
-                                                               << "' correlates windows of whole maps; RegionSize "
-                                                                  "compares the features cell by cell.");
+        itkExceptionMacro("ImpactFineRegistration: distance '"
+                          << name << "' correlates windows of dense maps, which the points SamplingPercentage draws "
+                          << "do not have.");
       }
-      if (!losses.back()->IsPerPointMean())
+      if (!losses.back()->IsPerPointMean() && !losses.back()->IsSpatial())
       {
         itkExceptionMacro("ImpactFineRegistration: distance '"
                           << name
@@ -2299,6 +2299,32 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     channelCount += c;
   }
   const bool drawsBoxes = m_RegionsPerIteration > 0; // an iteration steps those boxes alone
+  // A spatial distance (LNCC) reads windows of the maps, of IsotropicWindow's samples on the whole map: a unit's terms
+  // are taken on its cells and `lossHalo` around them, half the widest window in cells (a swept model's maps keep the
+  // image's voxels along the axis swept), and kept on its own.
+  const bool spatialLoss = std::any_of(
+    losses.begin(), losses.end(), [](const std::unique_ptr<Impact::Loss> & loss) { return loss->IsSpatial(); });
+  auto windowOf = [&](const torch::Tensor & map) {
+    return Impact::IsotropicWindow(spatial, map.sizes(), m_LNCCKernel);
+  };
+  int64_t lossHalo = 0;
+  for (int axis = swept ? 0 : -1; spatialLoss && axis < (swept ? static_cast<int>(Dim) : 0); ++axis)
+  {
+    const int64_t        keep = keepOf(axis);
+    std::vector<int64_t> shape{ 1, 1 };
+    shape.insert(shape.end(), cells.begin(), cells.end());
+    if (keep >= 0)
+    {
+      shape[2 + keep] = spatial[keep];
+    }
+    const std::vector<int64_t> window = Impact::IsotropicWindow(spatial, shape, m_LNCCKernel);
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      const int64_t side = window[d] / 2;
+      lossHalo =
+        std::max(lossHalo, static_cast<int64_t>(d) == keep ? (side + cellVoxels[d] - 1) / cellVoxels[d] : side);
+    }
+  }
   // What the run holds on the device at its peak with everything resident, in floats a cell. Stepping every cell
   // at once: an iteration's graph over the whole grid, Dim * (17 + the smoothing passes) for the field, its state and
   // the corners the warp reads, six a channel (the two maps, the features sampled, their difference and the gradients
@@ -2316,9 +2342,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     mapFloats += static_cast<double>(channelCount * spatial[d]) / static_cast<double>(cells[d]);
   }
   // A refresh's reference field, and its residual through the graph of a dense iteration.
-  const double  heldFloats = mapFloats + static_cast<double>((refreshes ? 5 : 4) * Dim) + 2.0;
+  const double heldFloats = mapFloats + static_cast<double>((refreshes ? 5 : 4) * Dim) + 2.0;
+  // A spatial distance's windows, a channel: the five moments, their combinations and the gradients back. With LNCC
+  // (windows of 5 cells, 6 channels, on the CPU) a dense run held 0.78 of the count, a brick's step 0.80 of BrickBytes.
+  const int64_t windowFloats = spatialLoss ? 8 : 0;
   const int64_t denseFloats = static_cast<int64_t>(Dim) * (17 + smoothingPasses + (refreshes ? 3 : 0)) +
-                              6 * channelCount + (drawsCells ? channelCount + 4 : 0);
+                              (6 + windowFloats) * channelCount + (drawsCells ? channelCount + 4 : 0);
   const double budget =
     m_ResidentFeatureBudget > 0 ? static_cast<double>(m_ResidentFeatureBudget) : Impact::ResidentBudget(device);
   // In the Jacobian mode a unit's features are computed on its voxels and `spanExtra` around them (the models' reach,
@@ -2377,8 +2406,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       fieldReach = std::max({ fieldReach, c - cellOf(margin - margin % spanAlign), cellOf(high - 1) + 1 - c });
     }
   }
-  // What a unit's step reads around it: in Static mode, the regularizer's next cell, with the smoothing's reach.
-  const int64_t reach = (jacobian ? fieldReach : 1) + static_cast<int64_t>(m_ControlGridSmoothingIterations);
+  // What a unit's step reads around it: the field its cells and a spatial distance's halo read, in Static mode the
+  // regularizer's next cell at least, with the smoothing's reach.
+  const int64_t reach = (jacobian ? fieldReach + lossHalo : std::max<int64_t>(1, lossHalo)) +
+                        static_cast<int64_t>(m_ControlGridSmoothingIterations);
   // What a Jacobian step holds on the device for each voxel of its span: the warp (the position, the displacement and
   // the value, with their gradients) and the network's activations, forward and backward, measured on CUDA on the
   // probe region, else taken as four floats a channel at each layer's samples. On patches, the two images' reads; the
@@ -2426,18 +2457,21 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     return count;
   };
   // A brick's loss is over its own cells and reads the field `reach` around them; a drawn box's loss is over the
-  // cells within `reach` of it (every term that reads its cells), which read the field twice that around it.
+  // cells within `reach` of it (every term that reads its cells), which read the field twice that around it. The
+  // channels are read on the cells and a spatial distance's halo.
   const int64_t partReach = drawsBoxes ? reach : 0;
+  const double  channelFloats = static_cast<double>(4 + windowFloats);
   auto          stepBytes = [&](int64_t boxesASide) {
     double spanVoxels = 1.0;
     for (unsigned int d = 0; d < Dim; ++d)
     {
       spanVoxels *= static_cast<double>(std::min(
-        spatial[d], std::min(cells[d], boxesASide * perBox[d] + 2 * partReach) * cellVoxels[d] + 2 * spanExtra[d]));
+        spatial[d],
+        std::min(cells[d], boxesASide * perBox[d] + 2 * (partReach + lossHalo)) * cellVoxels[d] + 2 * spanExtra[d]));
     }
     return 4.0 * (static_cast<double>(Dim * (6 + m_ControlGridSmoothingIterations)) *
                     brickCells(boxesASide, partReach + reach) +
-                  4.0 * static_cast<double>(channelCount) * brickCells(boxesASide, partReach)) +
+                  channelFloats * static_cast<double>(channelCount) * brickCells(boxesASide, partReach + lossHalo)) +
            voxelBytes * spanVoxels;
   };
   // The dense iterations when their graph fits; else the maps and the state stay resident when they fit with the
@@ -2819,7 +2853,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         {
           const torch::Tensor moving =
             Impact::WarpMap<Dim>(pick(l, movingMaps[l]), wholeStart, cells, base, displacement);
-          const torch::Tensor value = rowsLoss(l, pick(l, fixedMaps[l]), moving, rows);
+          const torch::Tensor value =
+            losses[l]->IsSpatial()
+              ? losses[l]->forwardSpatial(pick(l, fixedMaps[l]), moving, windowOf(fixedMaps[l]), counted)
+              : rowsLoss(l, pick(l, fixedMaps[l]), moving, rows);
           if (normalizes && !normalization.IsLatched(l))
           {
             normalization.Latch(l, value.template item<double>());
@@ -3008,7 +3045,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     // The loss of the cells of `box` for the smoothed field `smoothed` of the cells from `origin` on; `raw`, when
     // given, takes each layer's unweighted value times the box's share. The Jacobian mode compares the fixed maps with
-    // the moving features re-extracted from the image the field warps.
+    // the moving features re-extracted from the image the field warps. A spatial distance takes its terms on the block
+    // of the box and `lossHalo` cells around it, and averages those of the box's points that count.
     auto partLoss = [&](const Impact::CellBox &      box,
                         const torch::Tensor &        smoothed,
                         const std::vector<int64_t> & origin,
@@ -3020,27 +3058,63 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         // Nothing of it counts: its edges alone, no map read.
         return regularizer(smoothed, box.cell0, box.cell1, origin);
       }
-      const torch::Tensor              rows = drawRows(reading.counted, box.Count());
-      const double                     share = static_cast<double>(reading.count) / countedCells[countSet()];
-      const Impact::CellBox            points = swept ? sweptPoints(box) : box;
+      const torch::Tensor   rows = drawRows(reading.counted, box.Count());
+      const double          share = static_cast<double>(reading.count) / countedCells[countSet()];
+      const Impact::CellBox block = Impact::CellsAround(box, std::vector<int64_t>(Dim, lossHalo), cells);
+      const Impact::CellBox points = swept ? sweptPoints(box) : box;
+      const Impact::CellBox blockPoints = swept ? sweptPoints(block) : block;
+      // The box's points within a map of the block's.
+      auto ownOf = [&](torch::Tensor map) {
+        for (unsigned int d = 0; d < Dim; ++d)
+        {
+          map = map.narrow(
+            2 + static_cast<int64_t>(d), points.cell0[d] - blockPoints.cell0[d], points.cell1[d] - points.cell0[d]);
+        }
+        return map;
+      };
       const std::vector<torch::Tensor> warped =
-        jacobian ? pooledWarped(box.cell0, box.cell1, smoothed, origin, swept ? static_cast<int>(sweptAxis) : -1)
+        jacobian ? pooledWarped(block.cell0, block.cell1, smoothed, origin, swept ? static_cast<int>(sweptAxis) : -1)
                  : std::vector<torch::Tensor>{};
+      const Reading blockReading = spatialLoss && !jacobian ? readingOf(block, smoothed, origin, residual) : Reading{};
+      torch::Tensor kept; // the block's points a spatial distance averages: the box's that count
+      if (spatialLoss)
+      {
+        std::vector<int64_t> shape{ 1, 1 };
+        for (unsigned int d = 0; d < Dim; ++d)
+        {
+          shape.push_back(blockPoints.cell1[d] - blockPoints.cell0[d]);
+        }
+        kept = torch::zeros(shape, torch::TensorOptions().dtype(torch::kBool).device(device));
+        ownOf(kept).fill_(true);
+        if (reading.counted.defined())
+        {
+          ownOf(kept).logical_and_(reading.counted);
+        }
+      }
+      // Static mode: layer l's moving map on the cells of a reading `at`, warped from the pooled maps.
+      auto movingOn = [&](size_t l, const Reading & at) {
+        return Impact::WarpMap<Dim>(
+          pick(l, Impact::NarrowTo(movingMaps[l], at.m0, at.m1).to(device)), at.m0, cells, at.index, at.displacement);
+      };
       torch::Tensor total = torch::zeros({}, onDevice);
       if (!rows.defined() || rows.numel() > 0)
       {
         for (size_t l = 0; l < losses.size(); ++l)
         {
-          const torch::Tensor fixedLayer =
-            Impact::NarrowTo(swept ? sweptMaps[sweptAxis][l] : fixedMaps[l], points.cell0, points.cell1).to(device);
-          const torch::Tensor sampled =
-            jacobian ? pick(l, warped[l])
-                     : Impact::WarpMap<Dim>(pick(l, Impact::NarrowTo(movingMaps[l], reading.m0, reading.m1).to(device)),
-                                            reading.m0,
-                                            cells,
-                                            reading.index,
-                                            reading.displacement);
-          const torch::Tensor value = rowsLoss(l, pick(l, fixedLayer), sampled, rows);
+          const torch::Tensor & fixedMap = swept ? sweptMaps[sweptAxis][l] : fixedMaps[l];
+          torch::Tensor         value;
+          if (losses[l]->IsSpatial())
+          {
+            const torch::Tensor fixedBlock =
+              Impact::NarrowTo(fixedMap, blockPoints.cell0, blockPoints.cell1).to(device);
+            value = losses[l]->forwardSpatial(
+              pick(l, fixedBlock), jacobian ? pick(l, warped[l]) : movingOn(l, blockReading), windowOf(fixedMap), kept);
+          }
+          else
+          {
+            const torch::Tensor fixedLayer = Impact::NarrowTo(fixedMap, points.cell0, points.cell1).to(device);
+            value = rowsLoss(l, pick(l, fixedLayer), jacobian ? pick(l, ownOf(warped[l])) : movingOn(l, reading), rows);
+          }
           if (raw != nullptr)
           {
             (*raw)[l] += value.template item<double>() * share;

@@ -269,8 +269,9 @@ public:
    * with the regularizer's differences whose first cell lies in it. Both routes reproduce the whole-image run.
    * RegionsPerIteration steps instead, at every iteration, the cells of that many boxes drawn at random: what an
    * iteration costs and holds then follows those boxes, not the image.
-   * Point-wise distances, feature layers at the image's resolution (MIND) or a power of two coarser, no coarser than
-   * the control cells (a region then starts on the layer's lattice); PCA and a model that resamples the image are
+   * Point-wise distances and LNCC, whose windows a unit takes on its cells and half the widest window around them,
+   * keeping the terms of its own; feature layers at the image's resolution (MIND) or a power of two coarser, no coarser
+   * than the control cells (a region then starts on the layer's lattice); PCA and a model that resamples the image are
    * refused, save on the patches of the sampled Jacobian mode. FeatureMapUpdateInterval pools the moving maps again, a
    * box at a time, from the moving image the field warps.
    * The Jacobian mode keeps the fixed features pooled to the cells, as Static mode, and at every iteration takes each

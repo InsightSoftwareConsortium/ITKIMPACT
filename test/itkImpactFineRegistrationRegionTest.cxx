@@ -104,6 +104,21 @@ Configure(FineType * fine, unsigned int iterations, double epsilon = 1.0)
   fine->SetSeed(3);
 }
 
+// A mask on `image`'s grid that cuts the boxes unevenly.
+FineType::MaskImageType::Pointer
+CutMask(const ImageType * image)
+{
+  auto mask = FineType::MaskImageType::New();
+  mask->SetRegions(image->GetLargestPossibleRegion());
+  mask->Allocate();
+  itk::ImageRegionIteratorWithIndex<FineType::MaskImageType> it(mask, mask->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
+  }
+  return mask;
+}
+
 double
 MaxDifference(const FieldType * a, const FieldType * b, const FieldType::RegionType & region)
 {
@@ -647,16 +662,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   // mean over the grid. By bricks, and with every box drawn at every iteration, from resident maps and from mapped
   // files: the field of the dense iterations on the resident maps.
   {
-    using MaskType = FineType::MaskImageType;
-    auto movingMask = MaskType::New();
-    movingMask->SetRegions(moving->GetLargestPossibleRegion());
-    movingMask->Allocate();
-    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
-    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-    {
-      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
-    }
-    auto masked = [&](unsigned int regionsPerIteration, bool mapped) {
+    const auto movingMask = CutMask(moving);
+    auto       masked = [&](unsigned int regionsPerIteration, bool mapped) {
       auto fine = FineType::New();
       fine->SetFixedImage(fixed);
       fine->SetMovingImage(moving);
@@ -816,15 +823,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   // files; the dense one also with a moving mask, and with every box drawn at every iteration.
   if (argc >= 5)
   {
-    using MaskType = FineType::MaskImageType;
-    auto movingMask = MaskType::New();
-    movingMask->SetRegions(moving->GetLargestPossibleRegion());
-    movingMask->Allocate();
-    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
-    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-    {
-      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
-    }
+    const auto movingMask = CutMask(moving);
     struct Variant
     {
       const char * label;
@@ -924,15 +923,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   // scaled), right after a refresh too, where every cell reads the maps exactly at a sample.
   if (argc >= 5)
   {
-    using MaskType = FineType::MaskImageType;
-    auto movingMask = MaskType::New();
-    movingMask->SetRegions(moving->GetLargestPossibleRegion());
-    movingMask->Allocate();
-    itk::ImageRegionIteratorWithIndex<MaskType> it(movingMask, movingMask->GetLargestPossibleRegion());
-    for (it.GoToBegin(); !it.IsAtEnd(); ++it)
-    {
-      it.Set(it.GetIndex()[1] < 26 && it.GetIndex()[0] + it.GetIndex()[2] > 20 ? 1 : 0);
-    }
+    const auto movingMask = CutMask(moving);
     for (const bool masked : { false, true })
     {
       auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration, int interval = 2) {
@@ -990,6 +981,107 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         std::cerr << "With the moving maps refreshed, the runs by regions differ from the whole-image run."
                   << std::endl;
         return EXIT_FAILURE;
+      }
+    }
+  }
+
+  // 13. LNCC by regions: a unit's terms taken on its cells and half the window around them, and kept on its own. The
+  // first layer by LNCC (LNCCKernel 5 and 7, and 3 on maps pooled along every axis; a swept model's window of 3 is
+  // one sample in the plane, three along the axis, whose variance cancels), the second by L2, in Static mode and in
+  // the Jacobian mode, dense and swept (FeatureChunkSize 0: the whole-image run's windows over the whole volume), with
+  // and without a moving mask. Whole against by regions on the resident maps, by bricks of one box from mapped files
+  // and, but for the swept run, with every box drawn at every iteration: the fields, and the losses at every iteration.
+  if (argc >= 5)
+  {
+    const auto movingMask = CutMask(moving);
+    struct Variant
+    {
+      const char * label;
+      const char * model;
+      unsigned int dimension;
+      bool         jacobian;
+    };
+    for (const Variant & variant : { Variant{ "Static mode", argv[3], 3, false },
+                                     Variant{ "Jacobian mode, dense", argv[3], 3, true },
+                                     Variant{ "Jacobian mode, swept 2D", argv[4], 2, true } })
+    {
+      for (const auto & [kernel, masked] : { std::make_pair(3u, false),
+                                             std::make_pair(5u, false),
+                                             std::make_pair(7u, false),
+                                             std::make_pair(5u, true) })
+      {
+        if (kernel == 3 && variant.dimension < 3)
+        {
+          continue;
+        }
+        auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+          auto fine = FineType::New();
+          fine->SetFixedImage(fixed);
+          fine->SetMovingImage(moving);
+          fine->SetInitialDisplacementField(start);
+          if (masked)
+          {
+            fine->SetMovingMask(movingMask);
+          }
+          fine->AddModelConfiguration(itk::ImpactModelConfiguration(variant.model,
+                                                                    variant.dimension,
+                                                                    1,
+                                                                    std::vector<unsigned int>(variant.dimension, 0),
+                                                                    { 0.f, 0.f, 0.f },
+                                                                    std::vector<unsigned int>(variant.dimension, 0),
+                                                                    { true, true },
+                                                                    false));
+          fine->SetDistance({ "LNCC", "L2" });
+          fine->SetLayersWeight({ 1.f, 1.f });
+          fine->SetLNCCKernel(kernel);
+          if (variant.jacobian)
+          {
+            fine->SetMode("Jacobian");
+            fine->SetFeatureChunkSize(0);
+          }
+          Configure(fine, 6);
+          if (byRegions)
+          {
+            fine->SetRegionSize(16);
+            fine->SetRegionHalo(1);
+            fine->SetRegionsPerIteration(regionsPerIteration);
+            if (mapped)
+            {
+              fine->SetResidentFeatureBudget(1);
+              fine->SetBrickBytes(1);
+              fine->SetScratchDirectory(scratch);
+            }
+          }
+          fine->Update();
+          return fine;
+        };
+        const auto whole = run(false, false, 0);
+        double     fieldDifference = 0.0, lossDifference = 0.0;
+        for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+        {
+          if (route.second > 0 && variant.dimension < 3)
+          {
+            continue;
+          }
+          const auto region = run(true, route.first, route.second);
+          fieldDifference = std::max(
+            fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+          for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+          {
+            const double value = whole->GetMetricValuesPerIteration()[i];
+            lossDifference =
+              std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+          }
+        }
+        const double moved = MaxDifference(whole->GetOutput(), start, fixed->GetLargestPossibleRegion());
+        std::cout << "LNCC, " << variant.label << ", a window of " << kernel << (masked ? ", a moving mask" : "")
+                  << ", by regions against whole: fields within " << fieldDifference << " mm, losses within "
+                  << lossDifference << " of theirs, for a field moved by " << moved << " mm" << std::endl;
+        if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(moved > 1e-3))
+        {
+          std::cerr << "With LNCC, the runs by regions differ from the whole-image run." << std::endl;
+          return EXIT_FAILURE;
+        }
       }
     }
   }

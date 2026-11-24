@@ -152,7 +152,7 @@ struct Peaks
 // the coarse stage's field, which it asks by regions, and stepping every cell by bricks of one box. With
 // `brickBytes` its bricks hold that many bytes, with `regionsPerIteration` it steps that many boxes drawn at every
 // iteration. `resident` keeps the maps on the device, each stage on its own; `masked` gives both images a mask. With
-// `model`, the fine stage alone, in Jacobian mode on that model.
+// `model`, the fine stage alone, in `mode` on that model, its two layers compared by `distance`.
 struct Settings
 {
   unsigned int       side{ 48 };
@@ -161,6 +161,8 @@ struct Settings
   itk::SizeValueType brickBytes{ 0 };
   unsigned int       regionsPerIteration{ 0 };
   std::string        model;
+  std::string        mode{ "Jacobian" };
+  std::string        distance{ "L2" };
 };
 
 // What a run held, what each stage counted it would hold resident, and whether it ran as asked: by regions, the
@@ -266,8 +268,8 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
   {
     fine->AddModelConfiguration(itk::ImpactModelConfiguration(
       settings.model, 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
-    fine->SetDistance({ "L2", "L2" });
-    fine->SetMode("Jacobian");
+    fine->SetDistance({ settings.distance, settings.distance });
+    fine->SetMode(settings.mode);
     fine->SetRegionHalo(1);
   }
   fine->SetGridShrinkFactor(1);
@@ -419,6 +421,38 @@ main(int argc, char * argv[])
     if (!drawn.asAsked || !within("fine stage, four boxes drawn an iteration", drawn.fine.device, drawn.fineCounted))
     {
       std::cerr << "With the maps resident the drawn boxes hold more than was counted, or less than half." << std::endl;
+      status = EXIT_FAILURE;
+    }
+
+    // LNCC, whose windows a step takes on its cells and a halo around them: in Static mode on the model, every cell
+    // at once on the resident maps, within what it counted; and by bricks from mapped files, within BrickBytes, where
+    // bricks of one box hold less (the model's run on its probe region, whose peak a step of a large brick passes).
+    Settings lncc;
+    lncc.side = greater;
+    lncc.model = model;
+    lncc.mode = "Static";
+    lncc.distance = "LNCC";
+    lncc.resident = true;
+    const Held lnccEvery = Run(device, temporary, lncc);
+    if (!lnccEvery.asAsked || !within("fine stage, LNCC", lnccEvery.fine.device, lnccEvery.fineCounted))
+    {
+      std::cerr << "With LNCC and the maps resident the fine stage holds more than it counted, or less than half."
+                << std::endl;
+      status = EXIT_FAILURE;
+    }
+    lncc.resident = false;
+    const Held                   lnccBox = Run(device, temporary, lncc);
+    constexpr itk::SizeValueType lnccBrickBytes = 60000000; // three boxes a side
+    lncc.brickBytes = lnccBrickBytes;
+    const Held lnccBricks = Run(device, temporary, lncc);
+    std::cout << device << ", fine stage, LNCC, bricks within " << lnccBrickBytes
+              << " bytes: " << lnccBricks.fine.device << " bytes at most on the device, " << lnccBox.fine.device
+              << " by bricks of one box" << std::endl;
+    if (!lnccBox.asAsked || !lnccBricks.asAsked ||
+        !(lnccBricks.fine.device > lnccBox.fine.device &&
+          lnccBricks.fine.device <= static_cast<double>(lnccBrickBytes)))
+    {
+      std::cerr << "With LNCC, BrickBytes does not bound what a brick's step holds on the device." << std::endl;
       status = EXIT_FAILURE;
     }
   }
