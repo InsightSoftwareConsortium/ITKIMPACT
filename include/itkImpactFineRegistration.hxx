@@ -2680,15 +2680,27 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     std::vector<int64_t> shape(Dim + 2, Impact::LatticeProbe);
     shape[0] = shape[1] = 1;
     const torch::Tensor probe = torch::zeros(shape, onDevice).requires_grad_(true);
-    const int64_t       measured = Impact::PeakDeviceBytes(device, [&] {
-      torch::Tensor total = torch::zeros({}, onDevice);
-      for (const torch::Tensor & layer : layersOf(probe, true, true, axis))
+    int64_t             measured = 0; // a probe the device has no room for leaves the estimate
+    try
+    {
+      measured = Impact::PeakDeviceBytes(device, [&] {
+        torch::Tensor total = torch::zeros({}, onDevice);
+        for (const torch::Tensor & layer : layersOf(probe, true, true, axis))
+        {
+          total = total + layer.sum();
+        }
+        torch::autograd::grad({ total }, { probe });
+      });
+    }
+    catch (const std::exception & error)
+    {
+      if (!Impact::IsDeviceOutOfMemory(error))
       {
-        total = total + layer.sum();
+        throw;
       }
-      torch::autograd::grad({ total }, { probe });
-    });
-    double              estimate = 0.0;
+      Impact::ReleaseCachedDeviceMemory(device);
+    }
+    double estimate = 0.0;
     for (size_t l = 0; l < channels.size(); ++l)
     {
       double samples = 4.0 * 4.0 * static_cast<double>(channels[l]);
