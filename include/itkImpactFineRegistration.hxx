@@ -385,43 +385,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     theta = torch::zeros(fieldShape, torch::TensorOptions().dtype(torch::kFloat32).device(device).requires_grad(true));
   }
 
-  // ---- 3. Base identity sampling grid (normalized [-1,1], last-dim order x,y,z), align_corners=false: every grid,
-  // sampling and resizing of this run follows ConvexAdam's convention. ----
+  // ---- 3. The identity affine of the base sampling grids (normalized [-1,1], last-dim order x,y,z),
+  // align_corners=false: every grid, sampling and resizing of this run follows ConvexAdam's convention. ----
   torch::Tensor idAffine = torch::eye(ImageDimension, torch::TensorOptions().dtype(torch::kFloat32).device(device));
   idAffine = torch::cat({ idAffine, torch::zeros({ static_cast<int64_t>(ImageDimension), 1 }, idAffine.options()) }, 1)
                .unsqueeze(0); // {1, N, N+1}
-  std::vector<int64_t> gridSize;
-  gridSize.push_back(1);
-  gridSize.push_back(1);
-  for (auto s : spatial)
-  {
-    gridSize.push_back(s);
-  }
-  torch::Tensor grid0 = torch::affine_grid_generator(idAffine, gridSize, /*align_corners=*/false); // {1, z,y,x, N}
-
-  // The loss grid reads the field as ConvexAdam counts it, (cells - 1)/2 cells of shrink voxels for half its extent
-  // (Impact::SamplesPerVoxel): its sampling grid (align_corners=false) spans cells/2, so the field it returns is
-  // (cells - 1)/cells of the displacement it matched, and so is this one.
-  // A warp of the image itself (the Jacobian mode, a feature refresh, the warped output) is normalized by half the
-  // image's extent, what the returned field means.
-  std::vector<float> imageScaleValues(ImageDimension);
-  for (unsigned int d = 0; d < ImageDimension; ++d)
-  {
-    imageScaleValues[d] = static_cast<float>(static_cast<double>(spatial[d]) / 2.0);
-  }
-  torch::Tensor imageScale =
-    torch::from_blob(imageScaleValues.data(), { static_cast<int64_t>(ImageDimension) }, torch::kFloat32)
-      .clone()
-      .to(device);
-
-  // Permutation moving the channel dim (1) to last: {0, 2, 3, ..., N+1, 1}.
-  std::vector<int64_t> toChannelLast;
-  toChannelLast.push_back(0);
-  for (unsigned int d = 0; d < ImageDimension; ++d)
-  {
-    toChannelLast.push_back(2 + static_cast<int64_t>(d));
-  }
-  toChannelLast.push_back(1);
 
   namespace F = torch::nn::functional;
   const auto sampleOpts =
@@ -464,11 +432,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     return resizeField(smoothControl(control), spatial);
   };
 
-  // Build the normalized grid_sample sampling grid from a control field: upsample to full
-  // resolution, channel-last, normalize and reorder (z,y,x) -> (x,y,z).
-  auto gridFromControl = [&](const torch::Tensor & control) -> torch::Tensor {
-    torch::Tensor dd = controlGridToFullField(control).permute(toChannelLast);
-    return grid0 + (dd / imageScale).flip(-1);
+  // The moving image (or its mask's share) warped by a full-resolution field in voxels, what the returned field means:
+  // the Jacobian mode's warp, a feature refresh's and the warped output.
+  const std::vector<int64_t>       imageOrigin(ImageDimension, 0);
+  const std::vector<torch::Tensor> imageIndex = Impact::BoxIndices(imageOrigin, spatial, device);
+  auto                             warpImage = [&](const torch::Tensor & image, const torch::Tensor & field) {
+    return Impact::WarpMap<ImageDimension>(image, imageOrigin, spatial, imageIndex, field);
   };
 
   // A map on the grid of a feature layer warped by a (smoothed) control field, DIRECTLY at that layer's resolution: the
@@ -479,11 +448,17 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   std::vector<std::vector<int64_t>>       layerSpatials; // per-layer spatial size (z,y,x)
   std::vector<std::vector<torch::Tensor>> layerIndex;    // per-layer sample positions (Impact::BoxIndices)
   std::vector<torch::Tensor>              layerScale;    // per-layer samples a voxel of displacement, {1, Dim, 1...}
-  auto                                    samplesPerVoxel = [&](const std::vector<int64_t> & extent) {
+  const bool                              jacobianMode = featureMode && (m_Mode == "Jacobian");
+  // A map's samples a voxel of displacement moves by. The loss grid reads the field as ConvexAdam counts it, (cells -
+  // 1)/2 cells of shrink voxels for half its extent (Impact::SamplesPerVoxel), so the field it returns is (cells -
+  // 1)/cells of the displacement it matched. The Jacobian mode warps the image itself: the map's samples over the
+  // image's voxels.
+  auto samplesPerVoxel = [&](const std::vector<int64_t> & extent) {
     std::vector<float> values(ImageDimension);
     for (unsigned int d = 0; d < ImageDimension; ++d)
     {
-      values[d] = Impact::SamplesPerVoxel(extent[d], coarseSpatial[d], shrink[d]);
+      values[d] = jacobianMode ? static_cast<float>(static_cast<double>(extent[d]) / static_cast<double>(spatial[d]))
+                               : Impact::SamplesPerVoxel(extent[d], coarseSpatial[d], shrink[d]);
     }
     std::vector<int64_t> shape(ImageDimension + 2, 1);
     shape[1] = static_cast<int64_t>(ImageDimension);
@@ -558,7 +533,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     else
       return F::adaptive_avg_pool2d(layer, F::AdaptiveAvgPool2dFuncOptions({ target[0], target[1] }));
   };
-  const bool jacobianMode = featureMode && (m_Mode == "Jacobian");
   if (m_LNCCKernel < 1 || m_LNCCKernel % 2 == 0)
   {
     // An even window has no centre voxel: the correlation would sit half a voxel off the point it is read at.
@@ -951,7 +925,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       {
         // Online mode: precompute the fixed features on the comparison grid. The moving features are
         // re-extracted from the warped image every iteration in the Adam loop and pooled to this same
-        // grid, so movingLayers / layerBaseGrid (the frozen-warp machinery) are unused here.
+        // grid, so movingLayers (the frozen-warp machinery) are unused here; the masks are warped on it.
         fixedLayersOnline.resize(fixedLayers.size());
         for (size_t l = 0; l < fixedLayers.size(); ++l)
         {
@@ -961,10 +935,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
             const std::vector<int64_t> ls(fixedLayersOnline[l].sizes().begin() + 2, fixedLayersOnline[l].sizes().end());
             fixedLayerMask.push_back(fixedMaskOn(ls));
             movingLayerShare.push_back(movingShareOn(ls));
-            std::vector<int64_t> gs{ 1, 1 };
-            gs.insert(gs.end(), ls.begin(), ls.end());
-            layerBaseGrid.push_back(torch::affine_grid_generator(idAffine, gs, /*align_corners=*/false));
             layerSpatials.push_back(ls);
+            layerIndex.push_back(Impact::BoxIndices(imageOrigin, ls, device));
+            layerScale.push_back(samplesPerVoxel(ls));
           }
         }
       }
@@ -973,7 +946,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     {
       // Static mode: downsample the fixed/moving feature layers to the Adam similarity resolution
       // (never upsampling), then precompute the identity base grid at each layer's resulting
-      // resolution so the loss grid is built directly there (reuses grid0 for full-resolution layers).
+      // resolution so the loss grid is built directly there.
       layerBaseGrid.resize(movingLayers.size());
       layerSpatials.resize(movingLayers.size());
       for (size_t l = 0; l < movingLayers.size(); ++l)
@@ -984,11 +957,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         layerSpatials[l] = ls;
         layerIndex.push_back(Impact::BoxIndices(std::vector<int64_t>(ImageDimension, 0), ls, device));
         layerScale.push_back(samplesPerVoxel(ls));
-        if (sampled && ls == spatial) // the base grid places the points a share of the voxels draws
-        {
-          layerBaseGrid[l] = grid0;
-        }
-        else if (sampled)
+        if (sampled) // the base grid places the points a share of the voxels draws
         {
           std::vector<int64_t> gs{ 1, 1 };
           for (auto s : ls)
@@ -1168,9 +1137,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           const torch::Tensor displacement = F::grid_sample(smoothedControl.detach(), centres, controlOpts)
                                                .reshape({ static_cast<int64_t>(ImageDimension), kept.size(0) })
                                                .t();
-          const torch::Tensor holds = F::grid_sample(movingMaskShare,
-                                                     centres + (displacement / imageScale).flip(-1).reshape(where),
-                                                     sampleOpts) >= 0.5;
+          const auto [index, moved] = Impact::PointWarp(kept.flip(-1).to(onDevice), displacement);
+          const torch::Tensor holds =
+            Impact::WarpMap<ImageDimension>(movingMaskShare, imageOrigin, spatial, index, moved) >= 0.5;
           kept = kept.index_select(0, holds.flatten().nonzero().flatten().to(torch::kCPU));
         }
         const int64_t n = kept.size(0);
@@ -1184,37 +1153,29 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         {
           // Model i's patches of points [begin, end), {b, 1, reversed PatchSize...}: in the fixed image, or in the
           // moving image as the field warps it (differentiable, so the gradient reaches the control grid). The patch
-          // voxels are placed a batch at a time, as grid_sample coordinates (x, y, z: ITK order).
+          // voxels are placed a batch at a time, the field read there through grid_sample coordinates (x, y, z: ITK
+          // order).
           auto patchesOf = [&](size_t i, int64_t begin, int64_t end, bool moving) {
-            const torch::Tensor grid =
-              (Impact::SampledPatchPositions<ImageDimension>(m_FixedModelsConfiguration[i],
-                                                             kept.narrow(0, begin, end - begin),
-                                                             fixedSpacing,
-                                                             m_Seed,
-                                                             i,
-                                                             {},
-                                                             onDevice) +
-               0.5) /
-                toGridOnDevice -
-              1.0;
-            const int64_t        samples = grid.size(0) * grid.size(1);
+            const torch::Tensor positions = Impact::SampledPatchPositions<ImageDimension>(
+              m_FixedModelsConfiguration[i], kept.narrow(0, begin, end - begin), fixedSpacing, m_Seed, i, {}, onDevice);
+            const int64_t        samples = positions.size(0) * positions.size(1);
             std::vector<int64_t> where(ImageDimension + 2, 1); // grid_sample's {1, [1,] 1, samples, Dim}
             where[ImageDimension] = samples;
             where[ImageDimension + 1] = ImageDimension;
-            torch::Tensor at = grid.reshape(where);
-            if (moving)
-            {
-              const torch::Tensor displacement = F::grid_sample(smoothed, at, controlOpts)
-                                                   .reshape({ static_cast<int64_t>(ImageDimension), samples })
-                                                   .t();
-              at = at + (displacement / imageScale).flip(-1).reshape(where);
-            }
+            const torch::Tensor displacement =
+              moving ? F::grid_sample(smoothed, ((positions + 0.5) / toGridOnDevice - 1.0).reshape(where), controlOpts)
+                         .reshape({ static_cast<int64_t>(ImageDimension), samples })
+                         .t()
+                     : torch::Tensor();
+            const auto [index, moved] = Impact::PointWarp(
+              positions.flip(-1).reshape({ samples, static_cast<int64_t>(ImageDimension) }), displacement);
             std::vector<int64_t> shape{ end - begin, 1 };
             for (const int64_t extent : Impact::PatchTensorShape(m_FixedModelsConfiguration[i]))
             {
               shape.push_back(extent);
             }
-            return F::grid_sample(moving ? movingT : fixedT, at, sampleOpts).reshape(shape);
+            return Impact::WarpMap<ImageDimension>(moving ? movingT : fixedT, imageOrigin, spatial, index, moved)
+              .reshape(shape);
           };
           std::vector<size_t> firstLayer{ 0 }; // model i's kept layers start at firstLayer[i] in the flat list
           for (const auto & config : m_FixedModelsConfiguration)
@@ -1358,16 +1319,23 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       else if (jacSliced)
       {
         // Peak memory is bounded by taking the field's swept axis in chunks: each chunk backprops
-        // into a detached grid leaf -- its network subgraph is then freed -- and the shared field->grid
+        // into a detached field leaf -- its network subgraph is then freed -- and the shared control->field
         // graph is traversed once at the end. The per-point feature distance decomposes over voxels, so
         // weighting a chunk by its voxel fraction makes the accumulated gradient equal the whole mean's.
         const auto keep = static_cast<int64_t>(ImageDimension - 1 - sweptAxis); // tensor spatial index swept
         reg.backward();
-        const torch::Tensor fullGrid = gridFromControl(theta); // {1, spatial..., Dim}, graph to theta
-        torch::Tensor       gridLeaf = fullGrid.detach().clone();
-        gridLeaf.set_requires_grad(true);
-        const int64_t nLead = gridLeaf.size(1 + keep);
+        const torch::Tensor fullField = controlGridToFullField(theta); // {1, Dim, spatial...}, graph to theta
+        torch::Tensor       fieldLeaf = fullField.detach().clone();
+        fieldLeaf.set_requires_grad(true);
+        const int64_t nLead = spatial[keep];
         const int64_t chunk = (m_FeatureChunkSize == 0) ? nLead : std::min<int64_t>(m_FeatureChunkSize, nLead);
+        // The moving image warped by `field` on the slices `pick` (a tensor and its axis to those of the swept axis it
+        // reads) takes of the image.
+        auto warpSlices = [&](const torch::Tensor & field, const auto & pick) {
+          std::vector<torch::Tensor> index = imageIndex;
+          index[keep] = pick(index[keep], 1 + keep);
+          return Impact::WarpMap<ImageDimension>(movingT, imageOrigin, spatial, index, pick(field, 2 + keep));
+        };
         // A swept model's PCA centres the moving features by their own mean over the slices its basis was read on
         // (Impact::PcaSlices), which the chunks only give piece by piece: taken from those slices of the moving
         // image as the field warps it now, without the graph, as the FireANTs engine detaches it.
@@ -1376,8 +1344,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
               return basis.defined();
             }))
         {
-          const torch::Tensor slices =
-            F::grid_sample(movingT, Impact::PcaSlices(gridLeaf.detach(), 1 + keep), sampleOpts);
+          const torch::Tensor              slices = warpSlices(fieldLeaf.detach(), &Impact::PcaSlices);
           const std::vector<torch::Tensor> ml = Impact::ExtractFeatureLayers<ImageDimension>(
             movingConfigs, slices, device, {}, false, {}, static_cast<int>(sweptAxis));
           for (size_t l = 0; l < movingMeans.size(); ++l)
@@ -1397,7 +1364,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           if (movingMask.defined())
           {
             torch::NoGradGuard noGrad;
-            warpedMoving = F::grid_sample(movingMaskShare, fullGrid.detach(), sampleOpts) >= 0.5;
+            warpedMoving = warpImage(movingMaskShare, fieldLeaf.detach()) >= 0.5;
           }
           for (size_t l = 0; l < fixedSwept->layers.size(); ++l)
           {
@@ -1416,9 +1383,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         auto chunkShare = [&](size_t l, int64_t i0, int64_t di) {
           return counted[l].narrow(2 + keep, i0, di).sum().to(torch::kFloat32) / countedTotal[l];
         };
-        // Each layer's loss over the chunk [i0, i0 + di) of the swept axis.
-        auto chunkLosses = [&](int64_t i0, int64_t di, const torch::Tensor & gz, bool withGrad) {
-          torch::Tensor              movingChunk = F::grid_sample(movingT, gz, sampleOpts); // grad -> gridLeaf
+        // Each layer's loss over the chunk [i0, i0 + di) of the swept axis, the image warped by `field`.
+        auto chunkLosses = [&](int64_t i0, int64_t di, const torch::Tensor & field, bool withGrad) {
+          const torch::Tensor movingChunk =
+            warpSlices(field, [&](const torch::Tensor & tensor, int64_t axis) { return tensor.narrow(axis, i0, di); });
           std::vector<torch::Tensor> ml = Impact::ExtractFeatureLayers<ImageDimension>(
             movingConfigs, movingChunk, device, {}, withGrad, {}, static_cast<int>(sweptAxis));
           std::vector<torch::Tensor> values;
@@ -1447,7 +1415,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
           {
             const int64_t              di = std::min(chunk, nLead - i0);
-            std::vector<torch::Tensor> values = chunkLosses(i0, di, gridLeaf.detach().narrow(1 + keep, i0, di), false);
+            std::vector<torch::Tensor> values = chunkLosses(i0, di, fieldLeaf.detach(), false);
             whole.resize(values.size(), 0.0);
             for (size_t l = 0; l < values.size(); ++l)
             {
@@ -1465,8 +1433,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         for (int64_t i0 = 0; i0 < nLead; i0 += chunk)
         {
           const int64_t              di = std::min(chunk, nLead - i0);
-          torch::Tensor              gz = gridLeaf.narrow(1 + keep, i0, di);
-          std::vector<torch::Tensor> values = chunkLosses(i0, di, gz, true);
+          std::vector<torch::Tensor> values = chunkLosses(i0, di, fieldLeaf, true);
           torch::Tensor              simChunk = torch::zeros({}, theta.options());
           for (size_t l = 0; l < values.size(); ++l)
           {
@@ -1475,10 +1442,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           }
           torch::Tensor weighted =
             masked ? simChunk : simChunk * (static_cast<double>(di) / static_cast<double>(nLead));
-          weighted.backward(); // accumulates into gridLeaf.grad; this chunk's network graph is freed
+          weighted.backward(); // accumulates into fieldLeaf.grad; this chunk's network graph is freed
           simValue += weighted.template item<double>();
         }
-        fullGrid.backward(gridLeaf.grad()); // shared field->grid graph, once: gridLeaf.grad -> theta.grad
+        fullField.backward(fieldLeaf.grad()); // shared control->field graph, once: fieldLeaf.grad -> theta.grad
         lossValue = simValue + reg.template item<double>();
       }
       else
@@ -1486,9 +1453,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         // Full-dimension model: warp the whole moving image, re-extract its features, and pool each layer to the
         // loss grid as the fixed one is pooled, so that a cell compares the same voxels on both sides (a single
         // backward pass).
-        torch::Tensor              movingWarped = F::grid_sample(movingT, gridFromControl(theta), sampleOpts);
-        std::vector<torch::Tensor> ml =
-          Impact::ExtractFeatureLayers<ImageDimension>(movingConfigs, movingWarped, device, {}, true, fixedSpacing);
+        std::vector<torch::Tensor> ml = Impact::ExtractFeatureLayers<ImageDimension>(
+          movingConfigs, warpImage(movingT, controlGridToFullField(theta)), device, {}, true, fixedSpacing);
         torch::Tensor sim = torch::zeros({}, theta.options());
         for (size_t l = 0; l < ml.size(); ++l)
         {
@@ -1502,12 +1468,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
           if (masked)
           {
             counted = countedVoxels(fixedLayerMask[l], movingLayerShare[l], [&](const torch::Tensor & share) {
-              return F::grid_sample(
-                share,
-                layerBaseGrid[l] +
-                  (resizeField(smoothControl(theta.detach()), layerSpatials[l]).permute(toChannelLast) / imageScale)
-                    .flip(-1),
-                sampleOpts);
+              return warpLayer(share, l, smoothControl(theta.detach()));
             });
           }
           sim =
@@ -1592,8 +1553,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       torch::NoGradGuard noGrad;
       thetaRef = theta.detach().clone();
       refreshed = true;
-      torch::Tensor movingWarped = F::grid_sample(movingT, gridFromControl(thetaRef), sampleOpts);
-      movingLayers = extractMovingFeatures(movingWarped);
+      movingLayers = extractMovingFeatures(warpImage(movingT, controlGridToFullField(thetaRef)));
       for (size_t l = 0; l < movingLayers.size(); ++l)
       {
         movingLayers[l] = poolLayerToLoss(movingLayers[l]).contiguous(); // match the pooled fixed layers
@@ -1605,7 +1565,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   // NumberOfIterations == 0 case (pure identity / geometry check) is well defined.
   {
     torch::NoGradGuard noGrad;
-    warped = F::grid_sample(movingT, gridFromControl(theta), sampleOpts);
+    warped = warpImage(movingT, controlGridToFullField(theta));
   }
 
   // ---- 5. Geometry-correct writeback (once), via the shared convention. ----
@@ -1961,46 +1921,47 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto readMovingImage = [&](const RegionType & region) { return movingOnFixed(region, false); };
   auto readMovingMask = [&](const RegionType & region) { return movingOnFixed(region, true); };
   auto readFixedMask = [&](const RegionType & region) { return readMask(m_FixedMask.GetPointer(), region); };
-  // What `read` gives for a region of the fixed grid, at `positions` ({n, Dim}, voxels of the fixed grid in tensor
-  // order), by linear interpolation with zeros past the image, as grid_sample reads an image whole: the region read is
-  // the box of the positions, cut at the image, zeros around it. {n}, differentiable to the positions.
-  auto sampleAt = [&](auto && read, const torch::Tensor & positions) -> torch::Tensor {
-    const int64_t        count = positions.size(0);
-    std::vector<int64_t> lo(Dim), hi(Dim);
-    RegionType           region;
-    bool                 inside = count > 0;
-    if (inside)
+  // What `read` gives for a region of the fixed grid at the voxels `index` (per tensor axis, integers broadcasting to
+  // {1, n...}) moved by `displacement` ({1, Dim, n...}, in voxels), as Impact::WarpMap reads the whole image: the
+  // region read is the box of the voxels they read, cut at the image. {1, 1, n...}, differentiable to the displacement.
+  auto readWarped = [&](auto && read, const std::vector<torch::Tensor> & index, const torch::Tensor & displacement) {
+    std::vector<int64_t> shape(displacement.sizes().begin(), displacement.sizes().end());
+    shape[1] = 1;
+    if (displacement.numel() == 0)
     {
-      torch::NoGradGuard  noGrad;
-      const torch::Tensor bounds =
-        torch::stack({ std::get<0>(positions.min(0)), std::get<0>(positions.max(0)) }).floor().to(torch::kCPU);
+      return torch::zeros(shape, onDevice);
+    }
+    std::vector<torch::Tensor> ends;
+    {
+      torch::NoGradGuard noGrad;
       for (unsigned int d = 0; d < Dim; ++d)
       {
-        lo[d] = static_cast<int64_t>(bounds[0][d].template item<double>());
-        hi[d] = static_cast<int64_t>(bounds[1][d].template item<double>()) + 2;
-        const int64_t from = std::max<int64_t>(lo[d], 0), to = std::min(hi[d], spatial[d]);
-        inside = inside && from < to;
-        region.SetIndex(Dim - 1 - d, fixedRegion.GetIndex()[Dim - 1 - d] + static_cast<IndexValueType>(from));
-        region.SetSize(Dim - 1 - d, static_cast<SizeValueType>(std::max<int64_t>(to - from, 0)));
+        const torch::Tensor sample = index[d] + Impact::WarpBelow(displacement.select(1, d)).to(torch::kLong);
+        ends.push_back(sample.min());
+        ends.push_back(sample.max());
       }
     }
-    if (!inside)
+    const torch::Tensor  bounds = torch::stack(ends).to(torch::kCPU);
+    std::vector<int64_t> lo(Dim);
+    RegionType           region;
+    for (unsigned int d = 0; d < Dim; ++d)
     {
-      return torch::zeros({ count }, onDevice);
+      lo[d] = std::max<int64_t>(bounds[2 * d].template item<int64_t>(), 0);
+      const int64_t hi = std::min(bounds[2 * d + 1].template item<int64_t>() + 2, spatial[d]);
+      if (hi <= lo[d])
+      {
+        return torch::zeros(shape, onDevice);
+      }
+      region.SetIndex(Dim - 1 - d, fixedRegion.GetIndex()[Dim - 1 - d] + static_cast<IndexValueType>(lo[d]));
+      region.SetSize(Dim - 1 - d, static_cast<SizeValueType>(hi - lo[d]));
     }
-    std::vector<int64_t> padding; // F::pad takes its pairs from the last axis backwards
-    for (int d = static_cast<int>(Dim) - 1; d >= 0; --d)
-    {
-      const int64_t from = static_cast<int64_t>(region.GetIndex()[Dim - 1 - d] - fixedRegion.GetIndex()[Dim - 1 - d]);
-      padding.push_back(from - lo[d]);
-      padding.push_back(hi[d] - from - static_cast<int64_t>(region.GetSize()[Dim - 1 - d]));
-    }
-    std::vector<int64_t> shape(Dim + 2, 1); // the positions as {1, Dim, 1, ..., n}, which gridIn lays out for a
-    shape[1] = static_cast<int64_t>(Dim);   // grid_sample of n points
-    shape[Dim + 1] = count;
-    return F::grid_sample(
-             F::pad(read(region), F::PadFuncOptions(padding)), gridIn(positions.t().reshape(shape), lo, hi), sampleOpts)
-      .flatten();
+    return Impact::WarpMap<Dim>(read(region), lo, spatial, index, displacement);
+  };
+  // What `read` gives at the points `positions` ({n, Dim}, voxels of the fixed grid in tensor order) moved by `moved`
+  // ({n, Dim}, undefined for none), as the whole-image run reads them (Impact::PointWarp). {n}.
+  auto readAt = [&](auto && read, const torch::Tensor & positions, const torch::Tensor & moved) {
+    const auto [index, displacement] = Impact::PointWarp(positions, moved);
+    return readWarped(read, index, displacement).flatten();
   };
   // The field {1, Dim, n...} at the voxels [lo, hi) of the fixed grid (tensor order), in voxels: the smoothed control
   // field `smoothed` of the cells from `origin` on, resized to the image as the whole-image run resizes it.
@@ -2042,8 +2003,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         hi[d] = lo[d] + static_cast<int64_t>(span.GetSize()[Dim - 1 - d]);
         shape.push_back(hi[d] - lo[d]);
       }
-      const torch::Tensor at = cellPositions(lo, hi) + fieldOnVoxels(smoothed, origin, lo, hi);
-      return sampleAt(read, at.flatten(2).squeeze(0).t()).reshape(shape);
+      return readWarped(read, Impact::BoxIndices(lo, hi, device), fieldOnVoxels(smoothed, origin, lo, hi));
     };
 
   // ---- The feature models and distances. ----
@@ -3164,36 +3124,35 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // The sampled Jacobian mode's points in `box`, kept as the whole-image run keeps its draws: every model's patch
     // inside the image, the fixed mask holding at the point and the moving mask, warped by `smoothed` (the field of the
     // cells from `origin` on), at the point. {k, Dim}, ITK indices on the host.
-    auto keptPoints = [&](const Impact::CellBox &      box,
-                          const torch::Tensor &        smoothed,
-                          const std::vector<int64_t> & origin) {
-      torch::NoGradGuard noGrad;
-      torch::Tensor      points = drawnIn(box);
-      if (points.size(0) == 0)
-      {
+    auto keptPoints =
+      [&](const Impact::CellBox & box, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) {
+        torch::NoGradGuard noGrad;
+        torch::Tensor      points = drawnIn(box);
+        if (points.size(0) == 0)
+        {
+          return points;
+        }
+        torch::Tensor fits = torch::ones({ points.size(0) }, torch::TensorOptions().dtype(torch::kBool).device(device));
+        for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
+        {
+          const ImpactModelConfiguration & config = m_FixedModelsConfiguration[i];
+          const torch::Tensor              corners = Impact::SampledPatchPositions<Dim>(
+            config, points, fixedSpacing, m_Seed, i, Impact::PatchCorners(config), onDevice);
+          fits = fits & ((corners >= 0.0) & (corners <= upper)).flatten(1).all(1);
+        }
+        if (m_FixedMask.IsNotNull())
+        {
+          fits = fits & (readAt(readFixedMask, points.to(onDevice).flip(-1), {}) >= 0.5);
+        }
+        points = points.index_select(0, fits.nonzero().flatten().to(torch::kCPU));
+        if (m_MovingMask.IsNotNull() && points.size(0) > 0)
+        {
+          const torch::Tensor centres = points.to(onDevice).flip(-1);
+          const torch::Tensor holds = readAt(readMovingMask, centres, fieldAtPoints(smoothed, origin, centres)) >= 0.5;
+          points = points.index_select(0, holds.nonzero().flatten().to(torch::kCPU));
+        }
         return points;
-      }
-      torch::Tensor fits = torch::ones({ points.size(0) }, torch::TensorOptions().dtype(torch::kBool).device(device));
-      for (size_t i = 0; i < m_FixedModelsConfiguration.size(); ++i)
-      {
-        const ImpactModelConfiguration & config = m_FixedModelsConfiguration[i];
-        const torch::Tensor              corners = Impact::SampledPatchPositions<Dim>(
-          config, points, fixedSpacing, m_Seed, i, Impact::PatchCorners(config), onDevice);
-        fits = fits & ((corners >= 0.0) & (corners <= upper)).flatten(1).all(1);
-      }
-      if (m_FixedMask.IsNotNull())
-      {
-        fits = fits & (sampleAt(readFixedMask, points.to(onDevice).flip(-1)) >= 0.5);
-      }
-      points = points.index_select(0, fits.nonzero().flatten().to(torch::kCPU));
-      if (m_MovingMask.IsNotNull() && points.size(0) > 0)
-      {
-        const torch::Tensor centres = points.to(onDevice).flip(-1);
-        const torch::Tensor holds = sampleAt(readMovingMask, centres + fieldAtPoints(smoothed, origin, centres)) >= 0.5;
-        points = points.index_select(0, holds.nonzero().flatten().to(torch::kCPU));
-      }
-      return points;
-    };
+      };
     std::vector<size_t> firstLayer{ 0 }; // model i's kept layers start at firstLayer[i] in the flat list
     for (const auto & config : m_FixedModelsConfiguration)
     {
@@ -3229,8 +3188,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           {
             shape.push_back(extent);
           }
-          return (field.defined() ? sampleAt(readMovingImage, at + fieldAtPoints(field, origin, at))
-                                  : sampleAt(readFixed, at))
+          return (field.defined() ? readAt(readMovingImage, at, fieldAtPoints(field, origin, at))
+                                  : readAt(readFixed, at, {}))
             .reshape(shape);
         };
         // A side's centre features of the batch [begin, end) of model i, as layer l compares them.

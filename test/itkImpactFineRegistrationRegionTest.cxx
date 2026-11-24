@@ -698,8 +698,10 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   // 10. A moving image with an empty band, from a zero field and from a field of whole voxels. Where a point reads a
   // map exactly at a sample the interpolation has a kink, and the slope it takes there must not hang on the grid the
   // map is read through: in the band, where nothing pulls the field back, the routes would part. The intensities and a
-  // 3x3x3 convolution (RegionHalo 1), whole against by regions: on the resident maps, by bricks of one box from mapped
-  // files, and with every box drawn at every iteration.
+  // 3x3x3 convolution (RegionHalo 1), and the Jacobian mode, which warps the image itself, with that convolution, its
+  // 2D counterpart swept along an axis drawn at every iteration, and on the patches around a fifth of the voxels. Whole
+  // against by regions: on the resident maps, by bricks of one box from mapped files, and, but for the swept and the
+  // sampled runs, with every box drawn at every iteration.
   if (argc >= 4)
   {
     ImageType::Pointer banded = Texture(size, 1.5, -1.0, 0.5);
@@ -719,7 +721,23 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     translation[1] = -1.0f;
     translation[2] = 2.0f;
     wholeVoxels->FillBuffer(translation);
-    for (const bool withModel : { false, true })
+    struct Variant
+    {
+      const char * label;
+      const char * model; // none: the intensities
+      unsigned int dimension;
+      bool         jacobian;
+      double       sampling;
+    };
+    std::vector<Variant> variants{ Variant{ "the intensities", nullptr, 3, false, 1.0 },
+                                   Variant{ "a 3x3x3 convolution", argv[3], 3, false, 1.0 } };
+    if (argc >= 5)
+    {
+      variants.push_back(Variant{ "the Jacobian mode, a 3x3x3 convolution", argv[3], 3, true, 1.0 });
+      variants.push_back(Variant{ "the Jacobian mode, swept 2D", argv[4], 2, true, 1.0 });
+      variants.push_back(Variant{ "the Jacobian mode, sampled", argv[3], 3, true, 0.2 });
+    }
+    for (const Variant & variant : variants)
     {
       for (const bool fromZero : { true, false })
       {
@@ -731,13 +749,26 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
           {
             fine->SetInitialDisplacementField(wholeVoxels);
           }
-          if (withModel)
+          if (variant.model)
           {
-            fine->AddModelConfiguration(itk::ImpactModelConfiguration(
-              argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+            const unsigned int patch = variant.sampling < 1.0 ? 3 : 0; // the patch a sampled point's model runs on
+            fine->AddModelConfiguration(
+              itk::ImpactModelConfiguration(variant.model,
+                                            variant.dimension,
+                                            1,
+                                            std::vector<unsigned int>(variant.dimension, patch),
+                                            { 0.f, 0.f, 0.f },
+                                            std::vector<unsigned int>(variant.dimension, 0),
+                                            { true, true },
+                                            false));
             fine->SetDistance({ "L2", "L2" });
             fine->SetLayersWeight({ 1.f, 1.f });
           }
+          if (variant.jacobian)
+          {
+            fine->SetMode("Jacobian");
+          }
+          fine->SetSamplingPercentage(variant.sampling);
           Configure(fine, 6);
           if (byRegions)
           {
@@ -758,13 +789,16 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
         double     difference = 0.0;
         for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
         {
+          if (route.second > 0 && (variant.dimension < 3 || variant.sampling < 1.0))
+          {
+            continue;
+          }
           difference = std::max(difference,
                                 MaxDifference(whole->GetOutput(),
                                               run(true, route.first, route.second)->GetOutput(),
                                               fixed->GetLargestPossibleRegion()));
         }
-        std::cout << "an empty band, " << (withModel ? "a 3x3x3 convolution" : "the intensities") << ", from "
-                  << (fromZero ? "a zero field" : "whole voxels")
+        std::cout << "an empty band, " << variant.label << ", from " << (fromZero ? "a zero field" : "whole voxels")
                   << ", by regions against whole: max |difference| = " << difference << " mm" << std::endl;
         if (!(difference < 1e-5))
         {

@@ -558,6 +558,31 @@ BoxIndices(const std::vector<int64_t> & c0, const std::vector<int64_t> & c1, con
   return axes;
 }
 
+/** WarpMap's `index` and `displacement` for points at `positions` ({n, Dim}, samples of the map in tensor order) moved
+ * by `moved` ({n, Dim}, undefined for none): each point's sample is floor(position) and its displacement the rest plus
+ * `moved`, so that a point on a sample moved by a whole displacement takes the slope above, as a box's points do. */
+inline std::pair<std::vector<torch::Tensor>, torch::Tensor>
+PointWarp(const torch::Tensor & positions, const torch::Tensor & moved)
+{
+  const torch::Tensor        below = positions.floor();
+  const torch::Tensor        rest = positions - below;
+  std::vector<torch::Tensor> index;
+  for (int64_t d = 0; d < positions.size(1); ++d)
+  {
+    index.push_back(below.select(1, d).to(torch::kLong).unsqueeze(0));
+  }
+  return { index, (moved.defined() ? rest + moved : rest).t().unsqueeze(0) };
+}
+
+/** The whole part of a displacement `along` (in samples) that a warp reads from: a displacement less than 1e-4 of a
+ * sample below a whole one is taken as that whole one, so that two ways of computing the same field, which round it
+ * differently, take the same slope there. */
+inline torch::Tensor
+WarpBelow(const torch::Tensor & along)
+{
+  return torch::floor(along + 1e-4);
+}
+
 /** What WarpMap reads from, the corners around each point along each axis: the offset of the sample below in the
  * window and whether it lies in the map, and the weight above. Computed again by the backward pass, which keeps
  * nothing of the forward but its inputs. */
@@ -565,7 +590,7 @@ struct WarpCorners
 {
   std::vector<torch::Tensor> below;  // per axis, the sample below each point, in the window ({1, n...})
   std::vector<torch::Tensor> inside; // per axis and side (2 d + upper), whether that sample lies in the map
-  std::vector<torch::Tensor> above;  // per axis, the weight of the sample above, d - floor(d)
+  std::vector<torch::Tensor> above;  // per axis, the weight of the sample above, d - WarpBelow(d)
   std::vector<int64_t>       window;
 };
 
@@ -581,7 +606,7 @@ MakeWarpCorners(const torch::Tensor &              map,
   for (size_t d = 0; d < dim; ++d)
   {
     const torch::Tensor along = displacement.select(1, static_cast<int64_t>(d));
-    const torch::Tensor whole = torch::floor(along);
+    const torch::Tensor whole = WarpBelow(along);
     const torch::Tensor sample = index[d] + whole.to(torch::kLong);
     corners.window.push_back(map.size(2 + static_cast<int64_t>(d)));
     corners.above.push_back(along - whole);
@@ -701,9 +726,9 @@ public:
 /** `map` ({1, C, window...}: the samples of a map of `extent` samples from `first` on, tensor order) read by linear
  * interpolation, zeros past the map, at the samples `index` (per tensor axis, integers broadcasting to {1, n...})
  * moved by `displacement` ({1, Dim, n...}, in the map's samples): {1, C, n...}, differentiable to the displacement (the
- * map is a constant). Along each axis a point reads from its sample plus floor(d), with the weight d - floor(d): at a
- * whole displacement the slope is the one above it. The window holds every sample the points read. The backward pass
- * reads the corners again, so that the graph holds no more than the displacement. */
+ * map is a constant). Along each axis a point reads from its sample plus WarpBelow(d), with the weight the rest of d:
+ * at a whole displacement the slope is the one above it. The window holds every sample the points read. The backward
+ * pass reads the corners again, so that the graph holds no more than the displacement. */
 template <unsigned int Dim>
 torch::Tensor
 WarpMap(const torch::Tensor &              map,
