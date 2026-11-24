@@ -2789,7 +2789,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       totalCount += static_cast<double>(count);
     }
   }
-  if (occupied.empty())
+  // On patches and swept, the points count by the fixed mask at their voxel and by its share of their slice: a mask
+  // thinner than half a cell holds some, as in the whole-image run.
+  if (occupied.empty() && !sampledJacobian && !swept)
   {
     itkExceptionMacro("ImpactFineRegistration: the fixed mask holds no voxel.");
   }

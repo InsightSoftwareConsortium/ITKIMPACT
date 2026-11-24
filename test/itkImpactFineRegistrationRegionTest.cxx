@@ -391,6 +391,67 @@ LnccNextToBoxesLeftOut(const ImageType *   fixed,
   }
   return EXIT_SUCCESS;
 }
+
+// The Jacobian mode with a fixed mask of one line of voxels along y: a quarter of each cell it crosses, which no
+// cell's share holds, where the points on the patches around a fifth of the voxels count by their voxel, and a swept
+// model's by the share of its slice along x and along z. Whole against by regions on the resident maps and by bricks
+// of one box from mapped files: the fields, and the losses at every iteration.
+int
+ThinFixedMask(const ImageType *   fixed,
+              const ImageType *   moving,
+              FieldType *         start,
+              const char *        model,
+              const char *        model2D,
+              const std::string & scratch)
+{
+  auto line = FineType::MaskImageType::New();
+  line->SetRegions(fixed->GetLargestPossibleRegion());
+  line->Allocate();
+  for (itk::ImageRegionIteratorWithIndex<FineType::MaskImageType> it(line, line->GetLargestPossibleRegion());
+       !it.IsAtEnd();
+       ++it)
+  {
+    it.Set(it.GetIndex()[0] == 20 && it.GetIndex()[2] == 14 ? 1 : 0);
+  }
+  for (const bool sampled : { true, false })
+  {
+    auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fixed);
+      fine->SetMovingImage(moving);
+      fine->SetInitialDisplacementField(start);
+      fine->SetFixedMask(line);
+      if (sampled)
+      {
+        AddModel(fine, model, 3, { "L2", "L2" }, 3);
+        fine->SetSamplingPercentage(0.2);
+      }
+      else
+      {
+        AddModel(fine, model2D, 2);
+      }
+      fine->SetMode("Jacobian");
+      Configure(fine, 6);
+      if (byRegions)
+      {
+        ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto      whole = run(false, false, 0);
+    const Distances distances = CompareRoutes(whole, run, false);
+    std::cout << "a fixed mask of one line, Jacobian mode, " << (sampled ? "sampled" : "swept 2D")
+              << ", by regions against whole: fields within " << distances.field << " mm, losses within "
+              << distances.loss << " of theirs" << std::endl;
+    if (!(distances.field < 1e-5) || !(distances.loss < 1e-5))
+    {
+      std::cerr << "With a fixed mask of one line, the runs by regions differ from the whole-image run." << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+  return EXIT_SUCCESS;
+}
 } // namespace
 
 int
@@ -1709,7 +1770,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   // 22. Checks of their own, each printing what it compares.
   if (argc >= 4 && (SubsetOfComponentsOnPatches(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS ||
                     PatchesPastTheImage(fixed, moving, argv[3], scratch) != EXIT_SUCCESS ||
-                    LnccNextToBoxesLeftOut(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS))
+                    LnccNextToBoxesLeftOut(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS ||
+                    (argc >= 5 && ThinFixedMask(fixed, moving, start, argv[3], argv[4], scratch) != EXIT_SUCCESS)))
   {
     return EXIT_FAILURE;
   }
