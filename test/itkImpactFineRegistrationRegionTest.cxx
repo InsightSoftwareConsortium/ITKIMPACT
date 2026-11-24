@@ -297,18 +297,18 @@ SubsetOfComponentsOnPatches(const ImageType *   fixed,
 int
 PatchesPastTheImage(const ImageType * fixed, const ImageType * moving, const char * model, const std::string & scratch)
 {
-  auto far = FieldType::New();
-  far->SetRegions(fixed->GetLargestPossibleRegion());
-  far->Allocate();
+  auto pastImage = FieldType::New();
+  pastImage->SetRegions(fixed->GetLargestPossibleRegion());
+  pastImage->Allocate();
   FieldType::PixelType shift;
   shift.Fill(0.0f);
   shift[2] = 34.0f;
-  far->FillBuffer(shift);
+  pastImage->FillBuffer(shift);
   auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
     auto fine = FineType::New();
     fine->SetFixedImage(fixed);
     fine->SetMovingImage(moving);
-    fine->SetInitialDisplacementField(far);
+    fine->SetInitialDisplacementField(pastImage);
     fine->AddModelConfiguration(
       itk::ImpactModelConfiguration(model, 3, 1, { 3, 3, 3 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { false, true }, false));
     fine->SetDistance({ "L2" });
