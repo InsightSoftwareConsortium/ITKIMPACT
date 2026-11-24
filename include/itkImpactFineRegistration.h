@@ -274,21 +274,23 @@ public:
    * every unit at every iteration without the graph (with RegionsPerIteration too, a pass over the grid), of whose
    * gradient each unit's step takes its part (in Static mode, with SamplingPercentage 1 only); feature layers at the
    * image's resolution (MIND) or a power of two coarser, no coarser than the control cells (a region then starts on the
-   * layer's lattice); PCA and a model that resamples the image are refused, save on the patches of the sampled Jacobian
-   * mode. FeatureMapUpdateInterval pools the moving maps again, a box at a time, from the moving image the field warps.
-   * The Jacobian mode keeps the fixed features pooled to the cells, as Static mode, and at every iteration takes each
-   * unit (a brick, or a box drawn) on its own: the field interpolated at the voxels of its cells and RegionHalo around
-   * them (cut at the image), the moving image read by regions where they land and warped there, the network run on
-   * the warped region with its graph and its layers pooled to the unit's cells, as the whole-image run pools them. A
-   * model of one dimension fewer is run slice by slice along the axis drawn for the iteration, against fixed maps kept
-   * for each axis. With SamplingPercentage < 1 the points are drawn as the whole-image run draws them, and those of
-   * a unit each give a patch read from the two images by regions, run a batch at a time. Every way reproduces the
-   * whole-image run; a brick that runs out of device memory is replayed at half its side, down to a box. The initial
-   * displacement field may lie on any grid: it is read at the fixed image's voxels and resized to the control grid,
-   * as the whole-image run resizes its dense field, by regions through its own pipeline as the images are (a
-   * streaming reader, or the output of ImpactCoarseRegistration run by regions, is asked for the region around
-   * each box alone). The output is produced by region:
-   * request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
+   * layer's lattice). PCA in Static mode: each layer's basis fitted on the fixed features of every voxel from their
+   * sums gathered by one more pass over the boxes, each image's maps centred by its own features' mean and projected on
+   * it as they are pooled; in the Jacobian mode it is refused, as a model that resamples the image is, save on the
+   * patches of the sampled Jacobian mode. FeatureMapUpdateInterval pools the moving maps again, a box at a time, from
+   * the moving image the field warps (with PCA, after a pass that takes their new mean). The Jacobian mode keeps the
+   * fixed features pooled to the cells, as Static mode, and at every iteration takes each unit (a brick, or a box
+   * drawn) on its own: the field interpolated at the voxels of its cells and RegionHalo around them (cut at the image),
+   * the moving image read by regions where they land and warped there, the network run on the warped region with its
+   * graph and its layers pooled to the unit's cells, as the whole-image run pools them. A model of one dimension fewer
+   * is run slice by slice along the axis drawn for the iteration, against fixed maps kept for each axis. With
+   * SamplingPercentage < 1 the points are drawn as the whole-image run draws them, and those of a unit each give a
+   * patch read from the two images by regions, run a batch at a time. Every way reproduces the whole-image run; a brick
+   * that runs out of device memory is replayed at half its side, down to a box. The initial displacement field may lie
+   * on any grid: it is read at the fixed image's voxels and resized to the control grid, as the whole-image run resizes
+   * its dense field, by regions through its own pipeline as the images are (a streaming reader, or the output of
+   * ImpactCoarseRegistration run by regions, is asked for the region around each box alone). The output is produced by
+   * region: request a region of GetOutput() (or stream it to a writer) rather than the whole field, and take the field
    * on the control grid from GetControlGridTransform(). GetWarpedMovingImage() is not produced. With the pooled
    * maps in mapped files, nothing the run holds in host memory or on the device grows with the image, save about
    * a hundred bytes a box (the lists of the boxes and their counts of cells) and, in the sampled Jacobian mode, the

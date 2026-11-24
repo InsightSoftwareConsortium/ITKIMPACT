@@ -1083,9 +1083,18 @@ RunTiledModel(const ImpactModelConfiguration &                                  
   }
 }
 
+/** The PCA basis {C, newC} of a channel covariance {C, C}: its eigenvectors of the `newC` largest eigenvalues. eigh
+ * returns ascending eigenvalues, so the largest components live at the end. */
+inline torch::Tensor
+PcaBasisOfCovariance(const torch::Tensor & covariance, int64_t newC)
+{
+  torch::Tensor eigenvalues, eigenvectors;
+  std::tie(eigenvalues, eigenvectors) = torch::linalg_eigh(covariance);
+  return eigenvectors.narrow(1, covariance.size(0) - newC, newC);
+}
+
 /** Fit a PCA basis on a feature tensor {C, spatial...} (no batch): channel-covariance
- * eigendecomposition, keep the top `newC` principal components. Returns the {C, newC} basis.
- * eigh returns ascending eigenvalues, so the largest components live at the end. */
+ * eigendecomposition, keep the top `newC` principal components. Returns the {C, newC} basis. */
 inline torch::Tensor
 PcaFit(const torch::Tensor & input, int64_t newC)
 {
@@ -1093,10 +1102,7 @@ PcaFit(const torch::Tensor & input, int64_t newC)
   const int64_t N = input.numel() / C;
   torch::Tensor reshaped = input.reshape({ C, N });
   torch::Tensor centered = reshaped - reshaped.mean(1, /*keepdim=*/true);
-  torch::Tensor covariance = torch::matmul(centered, centered.t()) / static_cast<double>(N - 1);
-  torch::Tensor eigenvalues, eigenvectors;
-  std::tie(eigenvalues, eigenvectors) = torch::linalg_eigh(covariance);
-  return eigenvectors.narrow(1, C - newC, newC); // {C, newC}, largest-eigenvalue components
+  return PcaBasisOfCovariance(torch::matmul(centered, centered.t()) / static_cast<double>(N - 1), newC);
 }
 
 /** Project a feature tensor {C, spatial...} onto a PCA basis {C, K} -> {K, spatial...}.

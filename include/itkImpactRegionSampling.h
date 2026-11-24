@@ -458,6 +458,31 @@ PoolLayerToCells(torch::Tensor                    layer,
   return PoolByWindows<Dim>(layer, relative);
 }
 
+/** The samples of a layer ({1, C, samples...}) of a span of the image that belong to the cells [c0, c1): those of
+ * their voxels, the voxels past the last cell with the last, along every axis, at the layer's resolution, so that
+ * the boxes of a grid share out the whole layer's samples. `lowPad` is where the cells start in the span, which
+ * starts on the layer's lattice. */
+template <unsigned int Dim>
+torch::Tensor
+OwnLayerSamples(torch::Tensor                    layer,
+                const LayerLattice &             lattice,
+                const std::vector<int64_t> &     lowPad,
+                const std::vector<int64_t> &     c0,
+                const std::vector<int64_t> &     c1,
+                const std::vector<PoolWindows> & windows,
+                const std::vector<int64_t> &     spatial)
+{
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t stride = lattice.stride[d];
+    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
+    const int64_t first = windows[d].starts[c0[d]] / stride;
+    const int64_t last = c1[d] == cells ? lattice.Samples(d, spatial[d]) : windows[d].starts[c1[d]] / stride;
+    layer = layer.narrow(2 + static_cast<int64_t>(d), lowPad[d] / stride, last - first);
+  }
+  return layer;
+}
+
 /** What F::interpolate, linear along every axis (align_corners false), gives at the samples [o0, o1) of a whole map
  * of `inputSize` samples resized to `outputSize`, computed from `piece` ({1, C, piece...}), the samples of the whole
  * map from `first` on: torch's source index and weights, in single precision, so that the piece reads what the whole

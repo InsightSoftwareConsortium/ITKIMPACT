@@ -1182,6 +1182,94 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 15. PCA in Static mode: each layer's basis fitted on the fixed features of every voxel by a pass over the boxes,
+  // each image's maps centred by its own mean and projected on it. One component of each layer, with and without a
+  // moving mask, with the moving maps refreshed every two iterations (their new mean taken by a pass), and on a pair of
+  // odd sizes, whose voxels past the last cells the last boxes take. Whole against by regions on the resident maps, by
+  // bricks of one box from mapped files and with every box drawn at every iteration: the fields, and the losses at
+  // every iteration; the components move the field off the run without PCA.
+  if (argc >= 4)
+  {
+    const auto                movingMask = CutMask(moving);
+    const ImageType::SizeType odd = { { 49, 41, 33 } };
+    ImageType::Pointer        oddFixed = Texture(odd, 0.0, 0.0, 0.0);
+    ImageType::Pointer        oddMoving = Texture(odd, 1.5, -1.0, 0.5);
+    const FieldType::Pointer  oddStart = StartingField(oddFixed);
+    struct Variant
+    {
+      const char * label;
+      bool         masked;
+      int          interval;
+      bool         odd;
+    };
+    for (const Variant & variant : { Variant{ "", false, -1, false },
+                                     Variant{ ", a moving mask", true, -1, false },
+                                     Variant{ ", the moving maps refreshed every two iterations", false, 2, false },
+                                     Variant{ ", odd sizes", false, -1, true } })
+    {
+      const ImageType * pairFixed = variant.odd ? oddFixed.GetPointer() : fixed.GetPointer();
+      auto              run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration, bool pca = true) {
+        auto fine = FineType::New();
+        fine->SetFixedImage(pairFixed);
+        fine->SetMovingImage(variant.odd ? oddMoving.GetPointer() : moving.GetPointer());
+        fine->SetInitialDisplacementField(variant.odd ? oddStart : start);
+        if (variant.masked)
+        {
+          fine->SetMovingMask(movingMask);
+        }
+        fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true }, false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+        if (pca)
+        {
+          fine->SetPCA({ 1, 1 });
+        }
+        fine->SetFeatureMapUpdateInterval(variant.interval);
+        Configure(fine, 6);
+        if (byRegions)
+        {
+          fine->SetRegionSize(16);
+          fine->SetRegionHalo(1);
+          fine->SetRegionsPerIteration(regionsPerIteration);
+          if (mapped)
+          {
+            fine->SetResidentFeatureBudget(1);
+            fine->SetBrickBytes(1);
+            fine->SetScratchDirectory(scratch);
+          }
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto whole = run(false, false, 0);
+      double     fieldDifference = 0.0, lossDifference = 0.0;
+      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+      {
+        const auto region = run(true, route.first, route.second);
+        fieldDifference =
+          std::max(fieldDifference,
+                   MaxDifference(whole->GetOutput(), region->GetOutput(), pairFixed->GetLargestPossibleRegion()));
+        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+        {
+          const double value = whole->GetMetricValuesPerIteration()[i];
+          lossDifference =
+            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+        }
+      }
+      const double reduces = MaxDifference(
+        whole->GetOutput(), run(false, false, 0, false)->GetOutput(), pairFixed->GetLargestPossibleRegion());
+      std::cout << "PCA" << variant.label << ", by regions against whole: fields within " << fieldDifference
+                << " mm, losses within " << lossDifference << " of theirs; the components move the field by " << reduces
+                << " mm" << std::endl;
+      if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(reduces > 1e-5))
+      {
+        std::cerr << "With PCA, the runs by regions differ from the whole-image run." << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {
