@@ -3019,7 +3019,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   for (size_t b = 0; b < boxes.size(); ++b)
   {
     const Impact::CellBox & box = boxes[b];
-    if (countByBox[b] > 0 && !sampledJacobian && !swept)
+    // The fixed maps of a box the fixed mask leaves out are read by a spatial distance alone: by the windows of the
+    // cells that count around it.
+    if ((countByBox[b] > 0 || spatialLoss) && !sampledJacobian && !swept)
     {
       const std::vector<torch::Tensor> layers = pooledFixed(box.cell0, box.cell1);
       for (size_t l = 0; l < layers.size(); ++l)

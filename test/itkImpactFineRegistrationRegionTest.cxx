@@ -333,6 +333,64 @@ PatchesPastTheImage(const ImageType * fixed, const ImageType * moving, const cha
   }
   return EXIT_SUCCESS;
 }
+
+// LNCC with a fixed mask that holds the first 32 voxels along y: it leaves out the last row of boxes, next to cells it
+// keeps whose windows read the fixed maps there. In Static mode and in the dense Jacobian mode, whole against by
+// regions on the resident maps, by bricks of one box from mapped files and with every box drawn at every iteration:
+// the fields, and the losses at every iteration.
+int
+LnccNextToBoxesLeftOut(const ImageType *   fixed,
+                       const ImageType *   moving,
+                       FieldType *         start,
+                       const char *        model,
+                       const std::string & scratch)
+{
+  auto band = FineType::MaskImageType::New();
+  band->SetRegions(fixed->GetLargestPossibleRegion());
+  band->Allocate();
+  for (itk::ImageRegionIteratorWithIndex<FineType::MaskImageType> it(band, band->GetLargestPossibleRegion());
+       !it.IsAtEnd();
+       ++it)
+  {
+    it.Set(it.GetIndex()[1] < 32 ? 1 : 0);
+  }
+  for (const bool jacobian : { false, true })
+  {
+    auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(fixed);
+      fine->SetMovingImage(moving);
+      fine->SetInitialDisplacementField(start);
+      fine->SetFixedMask(band);
+      AddModel(fine, model, 3, { "LNCC", "L2" });
+      fine->SetLNCCKernel(5);
+      if (jacobian)
+      {
+        fine->SetMode("Jacobian");
+      }
+      Configure(fine, 6);
+      if (byRegions)
+      {
+        ByRegions(fine, 1, regionsPerIteration, mapped, scratch);
+      }
+      fine->Update();
+      return fine;
+    };
+    const auto      whole = run(false, false, 0);
+    const Distances distances = CompareRoutes(whole, run);
+    std::cout << "LNCC next to boxes the fixed mask leaves out, " << (jacobian ? "Jacobian mode" : "Static mode")
+              << ", by regions against whole: fields within " << distances.field << " mm, losses within "
+              << distances.loss << " of theirs" << std::endl;
+    if (!(distances.field < 1e-5) || !(distances.loss < 1e-5))
+    {
+      std::cerr << "With LNCC next to boxes the fixed mask leaves out, the runs by regions differ from the whole-image "
+                   "run."
+                << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+  return EXIT_SUCCESS;
+}
 } // namespace
 
 int
@@ -1650,7 +1708,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
 
   // 22. Checks of their own, each printing what it compares.
   if (argc >= 4 && (SubsetOfComponentsOnPatches(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS ||
-                    PatchesPastTheImage(fixed, moving, argv[3], scratch) != EXIT_SUCCESS))
+                    PatchesPastTheImage(fixed, moving, argv[3], scratch) != EXIT_SUCCESS ||
+                    LnccNextToBoxesLeftOut(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS))
   {
     return EXIT_FAILURE;
   }
