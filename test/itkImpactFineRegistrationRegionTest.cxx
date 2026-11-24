@@ -25,6 +25,7 @@
 
 #include "itkImpactFineRegistration.h"
 
+#include "itkDisplacementFieldTransform.h"
 #include "itkImageFileReader.h"
 #include "itkImageFileWriter.h"
 #include "itkImageRegionIteratorWithIndex.h"
@@ -449,6 +450,53 @@ ThinFixedMask(const ImageType *   fixed,
       std::cerr << "With a fixed mask of one line, the runs by regions differ from the whole-image run." << std::endl;
       return EXIT_FAILURE;
     }
+  }
+  return EXIT_SUCCESS;
+}
+
+// A moving mask on a grid of its own, streamed from a file, through a moving transform that is not linear (a field of
+// zeros): each region reads the region of the mask it maps to, where a resampler would ask its input whole, and the
+// field is that of the run without the transform.
+int
+MovingMaskThroughAField(const ImageType *   fixed,
+                        const ImageType *   moving,
+                        FieldType *         start,
+                        const std::string & temporary)
+{
+  const std::string maskFile = temporary + "/itkImpactFineRegistrationRegionTest_mask.mha";
+  ITK_TRY_EXPECT_NO_EXCEPTION(itk::WriteImage(CoarseCutMask(moving), maskFile));
+  auto reader = itk::ImageFileReader<FineType::MaskImageType>::New();
+  reader->SetFileName(maskFile);
+  reader->UseStreamingOn();
+  using ZeroType = itk::DisplacementFieldTransform<double, 3>;
+  auto zeros = ZeroType::DisplacementFieldType::New();
+  zeros->SetRegions(fixed->GetLargestPossibleRegion());
+  zeros->Allocate(true);
+  auto zero = ZeroType::New();
+  zero->SetDisplacementField(zeros);
+  auto run = [&](const FineType::MaskImageType * mask, const FineType::TransformType * transform) {
+    auto fine = FineType::New();
+    fine->SetFixedImage(fixed);
+    fine->SetMovingImage(moving);
+    fine->SetInitialDisplacementField(start);
+    fine->SetMovingMask(mask);
+    fine->SetMovingTransform(transform);
+    Configure(fine, 6);
+    ByRegions(fine, 0, 0, false, "");
+    fine->Update();
+    return fine;
+  };
+  const auto   through = run(reader->GetOutput(), zero);
+  const auto   plain = run(CoarseCutMask(moving), nullptr);
+  const double difference = MaxDifference(through->GetOutput(), plain->GetOutput(), fixed->GetLargestPossibleRegion());
+  std::cout << "a moving mask on a grid of its own through a field of zeros, against no transform: max |difference| = "
+            << difference << " mm; the mask's reader holds " << reader->GetOutput()->GetBufferedRegion().GetSize()
+            << " of " << reader->GetOutput()->GetLargestPossibleRegion().GetSize() << std::endl;
+  if (reader->GetOutput()->GetBufferedRegion() == reader->GetOutput()->GetLargestPossibleRegion() ||
+      !(difference < 1e-5))
+  {
+    std::cerr << "Through a transform that is not linear, the moving mask is read whole, or differs." << std::endl;
+    return EXIT_FAILURE;
   }
   return EXIT_SUCCESS;
 }
@@ -1768,6 +1816,10 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   }
 
   // 22. Checks of their own, each printing what it compares.
+  if (MovingMaskThroughAField(fixed, moving, start, temporary) != EXIT_SUCCESS)
+  {
+    return EXIT_FAILURE;
+  }
   if (argc >= 4 && (SubsetOfComponentsOnPatches(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS ||
                     PatchesPastTheImage(fixed, moving, argv[3], scratch) != EXIT_SUCCESS ||
                     LnccNextToBoxesLeftOut(fixed, moving, start, argv[3], scratch) != EXIT_SUCCESS ||

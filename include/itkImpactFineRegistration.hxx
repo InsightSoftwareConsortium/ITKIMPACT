@@ -1783,41 +1783,29 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     return torch::stack(components, -1).flip(-1); // {1, n..., Dim}
   };
 
-  // ---- Masks, read by regions: the fixed one on the fixed grid, the moving one on the moving image's grid, read with
-  // it. A mask on a grid of its own is brought onto the fixed grid (the moving one through the moving transform) by a
-  // resampler, nearest neighbour, that asks its input for each region alone, as the whole-image run brings it there
-  // (MaskOnGrid). ----
-  std::vector<ProcessObject::Pointer> maskResamplers; // alive for as long as their outputs are read
-  auto                                onFixedGrid = [&](const MaskImageType * mask, const TransformType * transform) {
-    auto resample = ResampleImageFilter<MaskImageType, MaskImageType, double>::New();
-    resample->SetInput(mask);
-    if (transform != nullptr)
-    {
-      resample->SetTransform(transform);
-    }
-    resample->SetInterpolator(NearestNeighborInterpolateImageFunction<MaskImageType, double>::New());
-    resample->SetUseReferenceImage(true);
-    resample->SetReferenceImage(m_FixedImage);
-    resample->UpdateOutputInformation();
-    maskResamplers.push_back(resample.GetPointer());
-    return typename MaskImageType::ConstPointer(resample->GetOutput());
-  };
-  typename MaskImageType::ConstPointer fixedMask = m_FixedMask, movingMaskOnFixed;
+  // ---- Masks, read by regions. The fixed one on the fixed grid: from a grid of its own, through a resampler, nearest
+  // neighbour, that asks its input for each region alone, as the whole-image run brings it there (MaskOnGrid). The
+  // moving one as the moving image is read (below), on whatever grid it lies. ----
+  typename MaskImageType::ConstPointer fixedMask = m_FixedMask;
+  ProcessObject::Pointer               fixedMaskResampler; // alive for as long as its output is read
   if (m_FixedMask.IsNotNull())
   {
     const_cast<MaskImageType *>(m_FixedMask.GetPointer())->UpdateOutputInformation();
     if (!Impact::SameGrid(m_FixedMask.GetPointer(), m_FixedImage.GetPointer()))
     {
-      fixedMask = onFixedGrid(m_FixedMask.GetPointer(), nullptr);
+      auto resample = ResampleImageFilter<MaskImageType, MaskImageType, double>::New();
+      resample->SetInput(m_FixedMask);
+      resample->SetInterpolator(NearestNeighborInterpolateImageFunction<MaskImageType, double>::New());
+      resample->SetUseReferenceImage(true);
+      resample->SetReferenceImage(m_FixedImage);
+      resample->UpdateOutputInformation();
+      fixedMask = resample->GetOutput();
+      fixedMaskResampler = resample.GetPointer();
     }
   }
   if (m_MovingMask.IsNotNull())
   {
     const_cast<MaskImageType *>(m_MovingMask.GetPointer())->UpdateOutputInformation();
-    if (!Impact::SameGrid(m_MovingMask.GetPointer(), m_MovingImage.GetPointer()))
-    {
-      movingMaskOnFixed = onFixedGrid(m_MovingMask.GetPointer(), m_MovingTransform.GetPointer());
-    }
   }
 
   // ---- Reads: each through the image's own pipeline, counted, telling whether the input streams. ----
@@ -1834,29 +1822,18 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     return (Impact::ReadRegion(mask, region) != 0).to(torch::kFloat32).to(device);
   };
 
-  // ---- The moving transform, and where a fixed voxel reads the moving image. ----
-  const bool identityMap =
-    m_MovingTransform.IsNull() && Impact::SameGrid(m_MovingImage.GetPointer(), m_FixedImage.GetPointer());
+  // ---- The moving transform, and where a fixed voxel reads the moving image or its mask. ----
   const bool linearMap = m_MovingTransform.IsNull() ||
                          m_MovingTransform->GetTransformCategory() == TransformType::TransformCategoryEnum::Linear;
-  // The moving continuous index (tensor order) at every voxel of `window`, a region of the fixed grid: {1, Dim,
-  // window...} on the device. Evaluated at the corners of a lattice of at most four voxels a step (the window's
-  // corners alone for a linear map, which the interpolation then reproduces exactly) and interpolated linearly.
-  auto movingIndexField = [&](const RegionType & window) -> torch::Tensor {
+  // The continuous index (tensor order) in `image`, the moving image or its mask, at every voxel of `window`, a region
+  // of the fixed grid, through the moving transform: {1, Dim, window...} on the device. Evaluated at the corners of a
+  // lattice of at most four voxels a step (the window's corners alone for a linear map, which the interpolation then
+  // reproduces exactly) and interpolated linearly.
+  auto movingIndexField = [&](const RegionType & window, const ImageBase<Dim> * image) -> torch::Tensor {
     std::vector<int64_t> size(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
       size[d] = static_cast<int64_t>(window.GetSize()[Dim - 1 - d]);
-    }
-    if (identityMap)
-    {
-      std::vector<int64_t> start(Dim), stop(Dim);
-      for (unsigned int d = 0; d < Dim; ++d)
-      {
-        start[d] = static_cast<int64_t>(window.GetIndex()[Dim - 1 - d]);
-        stop[d] = start[d] + size[d];
-      }
-      return cellPositions(start, stop);
     }
     std::vector<int64_t> knots(Dim);
     int64_t              total = 1;
@@ -1885,7 +1862,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       {
         point = m_MovingTransform->TransformPoint(point);
       }
-      const auto movingIndex = m_MovingImage->template TransformPhysicalPointToContinuousIndex<double>(point);
+      const auto movingIndex = image->template TransformPhysicalPointToContinuousIndex<double>(point);
       for (unsigned int d = 0; d < Dim; ++d)
       {
         buffer[static_cast<size_t>(d) * total + flat] = static_cast<float>(movingIndex[Dim - 1 - d]);
@@ -1925,47 +1902,52 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     return Impact::PoolLayerToCells<Dim>(
       layer, lattice, lowPad, c0, c1, windows, spatial, "ImpactFineRegistration", keep);
   };
-  // The moving image (with `mask`, the moving mask by nearest neighbour) on the voxels of `span`, a region of the fixed
-  // grid, through the moving transform: {1, 1, span...}, zeros where it reads past the moving image.
+  // The moving image (with `mask`, the moving mask by nearest neighbour, on its grid or on one of its own) on the
+  // voxels of `span`, a region of the fixed grid, through the moving transform: {1, 1, span...}, zeros where it reads
+  // past it. The region read is the one those voxels map to, a voxel around: never the whole image, which a resampler
+  // asks of its input through a transform that is not linear.
   auto movingOnFixed = [&](const RegionType & span, bool mask) -> torch::Tensor {
-    if (mask && movingMaskOnFixed.IsNotNull())
+    const ImageBase<Dim> * image = m_MovingImage.GetPointer();
+    if (mask)
     {
-      return readMask(movingMaskOnFixed.GetPointer(), span);
+      image = m_MovingMask.GetPointer();
     }
-    if (identityMap)
+    auto read = [&](const RegionType & region) {
+      return mask ? readMask(m_MovingMask.GetPointer(), region) : readMoving(region);
+    };
+    if (m_MovingTransform.IsNull() && Impact::SameGrid(image, m_FixedImage.GetPointer()))
     {
-      return mask ? readMask(m_MovingMask.GetPointer(), span) : readMoving(span);
+      return read(span);
     }
-    const torch::Tensor  movingIndex = movingIndexField(span); // {1, Dim, span...} on the device
+    const torch::Tensor  movingIndex = movingIndexField(span, image); // {1, Dim, span...} on the device
     std::vector<int64_t> windowShape{ 1, 1 };
     for (unsigned int d = 0; d < Dim; ++d)
     {
       windowShape.push_back(static_cast<int64_t>(span.GetSize()[Dim - 1 - d]));
     }
-    // The region of the moving image those indices read, one voxel around for the interpolation.
-    typename MovingImageType::RegionType movingRead;
-    std::vector<int64_t>                 readStart(Dim), readStop(Dim);
-    const torch::Tensor                  bounds =
+    // The region of the image those indices read, one voxel around for the interpolation.
+    const RegionType &   whole = image->GetLargestPossibleRegion();
+    RegionType           imageRead;
+    std::vector<int64_t> readStart(Dim), readStop(Dim);
+    const torch::Tensor  bounds =
       torch::stack({ std::get<0>(movingIndex.flatten(2).min(2)), std::get<0>(movingIndex.flatten(2).max(2)) }, 0)
         .to(torch::kCPU); // {2, 1, Dim}
     for (unsigned int d = 0; d < Dim; ++d)
     {
       const auto    low = static_cast<int64_t>(std::floor(bounds[0][0][d].template item<double>())) - 1;
       const auto    high = static_cast<int64_t>(std::ceil(bounds[1][0][d].template item<double>())) + 1;
-      const int64_t first = movingRegion.GetIndex()[Dim - 1 - d];
-      const int64_t extent = static_cast<int64_t>(movingRegion.GetSize()[Dim - 1 - d]);
+      const int64_t first = whole.GetIndex()[Dim - 1 - d];
+      const int64_t extent = static_cast<int64_t>(whole.GetSize()[Dim - 1 - d]);
       readStart[d] = std::max(low, first);
       readStop[d] = std::min(high + 1, first + extent);
       if (readStop[d] <= readStart[d])
       {
         return torch::zeros(windowShape, onDevice);
       }
-      movingRead.SetIndex(Dim - 1 - d, static_cast<IndexValueType>(readStart[d]));
-      movingRead.SetSize(Dim - 1 - d, static_cast<SizeValueType>(readStop[d] - readStart[d]));
+      imageRead.SetIndex(Dim - 1 - d, static_cast<IndexValueType>(readStart[d]));
+      imageRead.SetSize(Dim - 1 - d, static_cast<SizeValueType>(readStop[d] - readStart[d]));
     }
-    const torch::Tensor grid = gridIn(movingIndex, readStart, readStop);
-    return mask ? F::grid_sample(readMask(m_MovingMask.GetPointer(), movingRead), grid, nearestOpts)
-                : F::grid_sample(readMoving(movingRead), grid, sampleOpts);
+    return F::grid_sample(read(imageRead), gridIn(movingIndex, readStart, readStop), mask ? nearestOpts : sampleOpts);
   };
   auto readMovingImage = [&](const RegionType & region) { return movingOnFixed(region, false); };
   auto readMovingMask = [&](const RegionType & region) { return movingOnFixed(region, true); };
