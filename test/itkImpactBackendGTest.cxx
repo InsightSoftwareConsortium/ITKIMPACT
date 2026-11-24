@@ -3910,9 +3910,6 @@ TEST(ImpactTorchAdam, LowResControlGrid)
     EXPECT_LT(err[d], 0.3) << "low-res axis " << d << " displacement off";
 }
 
-// A GridShrinkFactor large enough to collapse a control-grid axis to size 1 must still produce
-// a finite field: the diffusion regularizer must skip the degenerate (no-forward-difference)
-// axis rather than averaging over zero elements (NaN).
 // The fine stage's warp of a map: off the samples, grid_sample's interpolation and its gradient to the displacement,
 // from any window of the map; at a whole displacement, the slope above.
 TEST(ImpactTorchAdam, WarpMapReadsAsGridSampleAndTakesTheSlopeAbove)
@@ -3987,6 +3984,9 @@ TEST(ImpactTorchAdam, WarpMapGoesBySlabs)
   }
 }
 
+// A GridShrinkFactor large enough to collapse a control-grid axis to size 1 must still produce
+// a finite field: the diffusion regularizer must skip the degenerate (no-forward-difference)
+// axis rather than averaging over zero elements (NaN).
 TEST(ImpactTorchAdam, DegenerateControlGridFinite)
 {
   ImageType::SpacingType spacing;
