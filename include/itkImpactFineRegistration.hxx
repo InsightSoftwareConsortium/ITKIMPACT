@@ -3653,6 +3653,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               pointFixedSums[l].Add(fixedCentres[l].t());
             }
           }
+          // A batch that runs out of device memory is replayed from the sums as they were before it.
+          std::vector<Impact::PcaSums> sumsBefore;
           for (size_t i = 0; i < movingConfigs.size(); ++i)
           {
             Impact::ForEachBatch(
@@ -3660,6 +3662,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               device,
               n,
               [&](int64_t begin, int64_t end) {
+                sumsBefore = pointMovingSums;
                 const std::vector<torch::Tensor> layers =
                   Impact::PatchCentreFeatures(movingConfigs[i], patchesOf(i, begin, end, smoothed), movingMetadata);
                 for (size_t k = 0; k < layers.size(); ++k)
@@ -3670,7 +3673,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                   }
                 }
               },
-              [] {});
+              [&] { pointMovingSums = sumsBefore; });
           }
           return value;
         }
@@ -3683,7 +3686,10 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
           leaf = smoothed.detach().requires_grad_(true);
           leaf.mutable_grad() = torch::zeros_like(leaf);
         }
-        torch::Tensor gradientBefore;
+        // What a batch adds to, as it was before the batch: a batch that runs out of device memory is replayed from it.
+        torch::Tensor              gradientBefore;
+        std::vector<torch::Tensor> gatheredBefore;
+        std::vector<double>        rawBefore;
         for (size_t i = 0; i < movingConfigs.size(); ++i)
         {
           Impact::ForEachBatch(
@@ -3694,6 +3700,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               const double weight = static_cast<double>(end - begin) / total;
               if (raw != nullptr || gathering)
               {
+                gatheredBefore = gatheredSums;
+                rawBefore = raw != nullptr ? *raw : std::vector<double>{};
                 torch::NoGradGuard               noGrad;
                 const std::vector<torch::Tensor> layers =
                   Impact::PatchCentreFeatures(movingConfigs[i], patchesOf(i, begin, end, smoothed), movingMetadata);
@@ -3735,6 +3743,14 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
               if (gradientBefore.defined())
               {
                 leaf.mutable_grad().copy_(gradientBefore);
+              }
+              if (gathering)
+              {
+                gatheredSums = gatheredBefore;
+              }
+              if (raw != nullptr)
+              {
+                *raw = rawBefore;
               }
             });
         }
