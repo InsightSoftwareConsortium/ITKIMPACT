@@ -212,14 +212,15 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
     const double held = static_cast<double>(hostLive.load());
     hostPeak = hostLive.load();
 #if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
-    const auto             aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
-    const c10::DeviceIndex index = torchDevice.has_index() ? torchDevice.index() : c10::DeviceIndex{ 0 };
-    int64_t                heldOnDevice = 0;
+    int64_t heldOnDevice = 0;
     if (torchDevice.is_cuda())
     {
       torch::zeros({ 1 }, torchDevice); // the allocator counts a device once CUDA holds something on it
-      c10::cuda::CUDACachingAllocator::resetPeakStats(index);
-      heldOnDevice = c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].current;
+      itk::Impact::ResetDevicePeak(torchDevice);
+      const c10::DeviceIndex index = torchDevice.has_index() ? torchDevice.index() : c10::DeviceIndex{ 0 };
+      heldOnDevice = c10::cuda::CUDACachingAllocator::getDeviceStats(index)
+                       .allocated_bytes[static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE)]
+                       .current;
     }
 #endif
     run();
@@ -228,8 +229,8 @@ Run(const std::string & device, const std::string & temporary, const Settings & 
 #if ITK_IMPACT_HAS_CUDA_MEMORY_STATS
     if (torchDevice.is_cuda())
     {
-      peaks.device = static_cast<double>(
-        c10::cuda::CUDACachingAllocator::getDeviceStats(index).allocated_bytes[aggregate].peak - heldOnDevice);
+      // The run's own peak, through the resets of the probes that measure it (PeakDeviceBytes).
+      peaks.device = static_cast<double>(itk::Impact::DevicePeak(torchDevice) - heldOnDevice);
     }
 #endif
     return peaks;
