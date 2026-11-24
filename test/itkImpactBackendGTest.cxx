@@ -2850,6 +2850,52 @@ TEST(ImpactLoss, NCCGradientIsFiniteOnAConstantChannel)
   EXPECT_TRUE(torch::isfinite(seeds).all().item<bool>()) << seeds;
 }
 
+// The statistics of a model's normalisations gathered over boxes (GatherNorms) are the whole image's: here the second
+// at a quarter of the resolution, the last box along x of one voxel, whose input of five voxels gives two samples of it
+// (a ratio of 2.5), from which its stride cannot be told.
+TEST(ImpactRegionSampling, GatherNormsAreTheWholeImages)
+{
+  torch::manual_seed(13);
+  const itk::ImpactModelConfiguration   config(std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModelNormQuarter.pt",
+                                             3,
+                                             1,
+                                               { 0, 0, 0 },
+                                               { 0.f, 0.f, 0.f },
+                                               { 0, 0, 0 },
+                                               { true, true },
+                                             false);
+  const std::vector<int64_t>            spatial{ 8, 8, 21 }; // tensor order: x, the last, in boxes of 10, 10 and 1
+  const torch::Tensor                   image = torch::rand({ 1, 1, spatial[0], spatial[1], spatial[2] });
+  std::vector<itk::Impact::PoolWindows> windows;
+  for (const int64_t extent : spatial)
+  {
+    windows.push_back(itk::Impact::UniformPoolWindows(extent, 1));
+  }
+  // A box's input: its voxels and two around (the two convolutions' reach), from a multiple of four voxels (the
+  // stride's), on to the image's end along an axis the box ends it.
+  auto boxInput = [&](const itk::Impact::CellBox & box, std::vector<int64_t> & lowPad) {
+    torch::Tensor input = image;
+    for (unsigned int d = 0; d < 3; ++d)
+    {
+      const int64_t start = std::max<int64_t>(box.cell0[d] - 2, 0) / 4 * 4;
+      const int64_t stop = box.cell1[d] == spatial[d] ? spatial[d] : std::min(box.cell1[d] + 2, spatial[d]);
+      lowPad[d] = box.cell0[d] - start;
+      input = input.narrow(2 + d, start, stop - start);
+    }
+    return input;
+  };
+  const std::vector<torch::Tensor> gathered = itk::Impact::GatherNorms<3>(
+    { config }, {}, itk::Impact::TileCells(spatial, { 8, 8, 10 }), windows, spatial, torch::kCPU, boxInput)[0];
+  ASSERT_EQ(gathered.size(), 2u);
+  std::vector<torch::Tensor> whole;
+  for (size_t k = 0; k < gathered.size(); ++k)
+  {
+    const torch::Tensor input = itk::NormInput(config, image, {}, whole).to(torch::kFloat64);
+    whole.push_back(torch::stack({ input.mean({ 0, 2, 3, 4 }), input.var({ 0, 2, 3, 4 }, false) }).to(torch::kFloat32));
+    EXPECT_LT((gathered[k] - whole[k]).abs().max().item<double>(), 1e-5) << "normalisation " << k;
+  }
+}
+
 // --- ImpactFineRegistration: fast Torch-backed Adam dense registration ---------
 namespace
 {

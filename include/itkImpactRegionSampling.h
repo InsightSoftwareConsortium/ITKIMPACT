@@ -1257,20 +1257,28 @@ GatherNorms(const std::vector<ImpactModelConfiguration> & configs,
     const int64_t count = configs[c].GetDimension() == Dim ? NormCount(configs[c]) : 0;
     for (int64_t k = 0; k < count; ++k)
     {
+      // The lattice of the normalisation's input, from a probe as a layer's: the sizes of a short box's input and of
+      // its own do not tell its stride.
+      std::vector<int64_t> probe(Dim + 2, LatticeProbe);
+      probe[0] = probe[1] = 1;
+      const LayerLattice lattice = LayerLattices<Dim>(
+        { NormInput(configs[c],
+                    ModelInput<Dim>(configs[c], torch::zeros(probe, torch::TensorOptions().device(device))),
+                    metadata,
+                    norms[c]) },
+        "IMPACT")[0];
       torch::Tensor sums;
       double        samples = 0.0;
       for (const CellBox & box : boxes)
       {
         std::vector<int64_t> lowPad(Dim);
-        const torch::Tensor  image = boxInput(box, lowPad);
-        torch::Tensor        own = NormInput(configs[c], ModelInput<Dim>(configs[c], image), metadata, norms[c]);
+        torch::Tensor        own =
+          NormInput(configs[c], ModelInput<Dim>(configs[c], boxInput(box, lowPad)), metadata, norms[c]);
         for (unsigned int d = 0; d < Dim; ++d)
         {
           // The box's own samples, from its cells' first to the next box's, on the lattice of the input.
           const int64_t axis = 2 + static_cast<int64_t>(d);
-          const int64_t stride =
-            int64_t{ 1 } << std::max<int64_t>(
-              0, std::llround(std::log2(static_cast<double>(image.size(axis)) / static_cast<double>(own.size(axis)))));
+          const int64_t stride = lattice.stride[d];
           const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
           const int64_t end = box.cell1[d] == cells ? spatial[d] : windows[d].starts[box.cell1[d]];
           const int64_t first = (lowPad[d] + stride - 1) / stride;

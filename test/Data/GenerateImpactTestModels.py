@@ -148,6 +148,15 @@ class ImpactToyModelNorm(torch.nn.Module):
         return captured
 
 
+class ImpactToyModelNormQuarter(ImpactToyModelNorm):
+    """ImpactToyModelNorm with its second normalisation at a quarter of the input's resolution (a convolution of
+    stride 4): the input of a short region gives it a number of samples from which its stride cannot be told."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = torch.nn.Conv3d(3, 2, kernel_size=3, stride=4, padding=1, bias=True)
+
+
 def main() -> None:
     torch.manual_seed(20240601)
     model = ImpactToyModel().eval()
@@ -172,6 +181,11 @@ def main() -> None:
     norm = ImpactToyModelNorm().eval()
     torch.jit.script(norm).save("ImpactToyModelNorm.pt")
     print("wrote ImpactToyModelNorm.pt")
+
+    torch.manual_seed(20240601)
+    quarter = ImpactToyModelNormQuarter().eval()
+    torch.jit.script(quarter).save("ImpactToyModelNormQuarter.pt")
+    print("wrote ImpactToyModelNormQuarter.pt")
 
 
 
