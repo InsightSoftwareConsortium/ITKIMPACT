@@ -1287,11 +1287,13 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
                                      Variant{ "Jacobian mode, dense", argv[3], 3, true },
                                      Variant{ "Jacobian mode, swept 2D", argv[4], 2, true } })
     {
-      for (const auto & [kernel, masked] : { std::make_pair(3u, false),
-                                             std::make_pair(5u, false),
-                                             std::make_pair(7u, false),
-                                             std::make_pair(5u, true) })
+      for (const auto & setting : { std::make_pair(3u, false),
+                                    std::make_pair(5u, false),
+                                    std::make_pair(7u, false),
+                                    std::make_pair(5u, true) })
       {
+        const unsigned int kernel = setting.first;
+        const bool         masked = setting.second;
         if (kernel == 3 && variant.dimension < 3)
         {
           continue;
@@ -1475,10 +1477,12 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     const auto movingMask = CutMask(moving);
     for (const bool jacobian : { false, true })
     {
-      for (const auto & [voxel, masked] :
+      for (const auto & setting :
            { std::make_pair(0.75f, false), std::make_pair(1.5f, false), std::make_pair(1.5f, true) })
       {
-        auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+        const float voxel = setting.first;
+        const bool  masked = setting.second;
+        auto        run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
           auto fine = FineType::New();
           fine->SetFixedImage(fixed);
           fine->SetMovingImage(moving);
