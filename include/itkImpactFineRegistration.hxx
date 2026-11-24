@@ -1667,6 +1667,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const bool jacobian = featureMode && m_Mode == "Jacobian";
   const bool sampledJacobian = jacobian && m_SamplingPercentage < 1.0;
   const bool swept = jacobian && !sampledJacobian && m_FixedModelsConfiguration[0].GetDimension() < Dim;
+  // Static mode with models of one dimension fewer: they sweep the ITK axis closest to head-feet, as the whole-image
+  // run sweeps them, and their maps are pooled to the cells along every axis.
+  const int mapSweep = featureMode && !jacobian && m_FixedModelsConfiguration[0].GetDimension() < Dim
+                         ? static_cast<int>(Impact::HeadFeetAxis(m_FixedImage->GetDirection(), Dim))
+                         : -1;
   // FeatureMapUpdateInterval: Static mode pools its moving maps again, every that many iterations, from the moving
   // image the field warps, and reads them past that field.
   const bool refreshes = featureMode && !jacobian && m_FeatureMapUpdateInterval > 0;
@@ -2084,9 +2089,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   bool                                       takesMetadata = false; // a model that reads the image's statistics
   if (featureMode)
   {
-    const Impact::RegionModelRun run = sampledJacobian ? Impact::RegionModelRun::Patches
-                                       : swept         ? Impact::RegionModelRun::Swept
-                                                       : Impact::RegionModelRun::Maps;
+    const Impact::RegionModelRun run = sampledJacobian          ? Impact::RegionModelRun::Patches
+                                       : swept || mapSweep >= 0 ? Impact::RegionModelRun::Swept
+                                                                : Impact::RegionModelRun::Maps;
     // PCA is fitted by regions in Static mode (below).
     const std::vector<unsigned int> refusedPca = jacobian ? m_PCA : std::vector<unsigned int>{};
     // The maps' models may resample the image to their voxel size (`featureSpatial`, above).
@@ -2206,7 +2211,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       featureCellVoxels,
       device,
       !m_MovingModelsConfiguration.empty(),
-      [&](const torch::Tensor & image, bool moving) { return layersOf(image, moving, false, axis); },
+      [&](const torch::Tensor & image, bool moving) {
+        return layersOf(image, moving, false, axis >= 0 ? axis : mapSweep);
+      },
       "ImpactFineRegistration"));
   }
   // A map's lattices; those of a swept model's along ITK axis `axis`.
@@ -2305,7 +2312,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // voxels along it kept.
   auto pooledFixed = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1, int axis = -1) {
     std::vector<int64_t>       lowPad(Dim);
-    std::vector<torch::Tensor> layers = layersOf(featureInput(c0, c1, lowPad, axis, readFixed), false, false, axis);
+    std::vector<torch::Tensor> layers =
+      layersOf(featureInput(c0, c1, lowPad, axis, readFixed), false, false, axis >= 0 ? axis : mapSweep);
     pooledToCells(layers, latticesAlong(axis).fixed, lowPad, c0, c1, keepOf(axis));
     reduced(layers, fixedPcaMean);
     return layers;
@@ -2320,7 +2328,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     std::vector<int64_t> lowPad(Dim);
     const torch::Tensor  image = featureInput(
       c0, c1, lowPad, axis, [&](const RegionType & span) { return warpedOn(readMovingImage, span, smoothed, origin); });
-    std::vector<torch::Tensor> layers = layersOf(image, true, torch::GradMode::is_enabled(), axis);
+    std::vector<torch::Tensor> layers =
+      layersOf(image, true, torch::GradMode::is_enabled(), axis >= 0 ? axis : mapSweep);
     pooledToCells(layers, latticesAlong(axis).moving, lowPad, c0, c1, keepOf(axis));
     return layers;
   };
@@ -2341,8 +2350,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto pooledMoving = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) -> PooledMoving {
     std::vector<int64_t> lowPad(Dim);
     PooledMoving         pooled;
-    pooled.layers = layersOf(
-      featureInput(c0, c1, lowPad, -1, [&](const RegionType & span) { return movingOnFixed(span, false); }), true);
+    pooled.layers =
+      layersOf(featureInput(c0, c1, lowPad, -1, [&](const RegionType & span) { return movingOnFixed(span, false); }),
+               true,
+               false,
+               mapSweep);
     pooledToCells(pooled.layers, latticesAlong(-1).moving, lowPad, c0, c1);
     reduced(pooled.layers, movingPcaMean);
     if (m_MovingMask.IsNotNull())
@@ -2454,17 +2466,30 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // The features of the cells of `box` at each layer's resolution, of the image `read` gives for a region of the fixed
   // grid, {C, n} per layer in double precision: the samples of their voxels, the voxels past the last cell along an
   // axis with the last box, so that the boxes share out every sample of the whole layer.
+  // A model of one dimension fewer gives the samples of the slices along the axis it sweeps that PcaSlices reads.
   auto ownLayers = [&](const Impact::CellBox & box, bool moving, auto && read) {
     std::vector<int64_t>       lowPad(Dim);
-    std::vector<torch::Tensor> layers = layersOf(featureInput(box.cell0, box.cell1, lowPad, -1, read, true), moving);
+    std::vector<torch::Tensor> layers =
+      layersOf(featureInput(box.cell0, box.cell1, lowPad, -1, read, true), moving, false, mapSweep);
     const std::vector<Impact::LayerLattice> & on = moving ? latticesAlong(-1).moving : latticesAlong(-1).fixed;
     for (size_t l = 0; l < layers.size(); ++l)
     {
       const int64_t channel = layers[l].size(1);
-      layers[l] =
-        Impact::OwnLayerSamples<Dim>(layers[l], on[l], lowPad, box.cell0, box.cell1, featureWindows, featureSpatial)
-          .reshape({ channel, -1 })
-          .to(torch::kFloat64);
+      torch::Tensor own =
+        Impact::OwnLayerSamples<Dim>(layers[l], on[l], lowPad, box.cell0, box.cell1, featureWindows, featureSpatial);
+      if (mapSweep >= 0)
+      {
+        const int64_t        keep = keepOf(mapSweep);
+        std::vector<int64_t> shape(Dim + 1, 1);
+        shape[1 + keep] = featureSpatial[keep];
+        const torch::Tensor slices =
+          Impact::PcaSlices(torch::arange(featureSpatial[keep]).view(shape), 1 + keep).flatten();
+        const int64_t       first = featureWindows[keep].starts[box.cell0[keep]];
+        const torch::Tensor local =
+          slices.masked_select((slices >= first) & (slices < first + own.size(2 + keep))) - first;
+        own = own.index_select(2 + keep, local.to(own.device()));
+      }
+      layers[l] = own.reshape({ channel, -1 }).to(torch::kFloat64);
     }
     return layers;
   };

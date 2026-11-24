@@ -1344,6 +1344,99 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
+  // 17. A model of one dimension fewer in Static mode: each box run slice by slice along the axis closest to head-feet,
+  // its maps pooled to the cells along every axis. With and without a moving mask, with PCA (fitted and centred on the
+  // slices PcaSlices reads), and on images whose head-feet axis is their first, which the boxes then sweep. Whole
+  // against by regions on the resident maps, by bricks of one box from mapped files and with every box drawn at every
+  // iteration: the fields, and the losses at every iteration.
+  if (argc >= 5)
+  {
+    const auto               movingMask = CutMask(moving);
+    ImageType::Pointer       turnedFixed = Texture(size, 0.0, 0.0, 0.0);
+    ImageType::Pointer       turnedMoving = Texture(size, 1.5, -1.0, 0.5);
+    ImageType::DirectionType turned; // the head-feet axis is the first: the third row is (-1, 0, 0)
+    turned.Fill(0.0);
+    turned[0][2] = 1.0;
+    turned[1][1] = 1.0;
+    turned[2][0] = -1.0;
+    turnedFixed->SetDirection(turned);
+    turnedMoving->SetDirection(turned);
+    const FieldType::Pointer turnedStart = StartingField(turnedFixed);
+    turnedStart->SetDirection(turned);
+    struct Variant
+    {
+      const char * label;
+      bool         masked;
+      bool         pca;
+      bool         turned;
+    };
+    for (const Variant & variant : { Variant{ "", false, false, false },
+                                     Variant{ ", a moving mask", true, false, false },
+                                     Variant{ ", PCA", false, true, false },
+                                     Variant{ ", the head-feet axis first", false, false, true } })
+    {
+      auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+        auto fine = FineType::New();
+        fine->SetFixedImage(variant.turned ? turnedFixed.GetPointer() : fixed.GetPointer());
+        fine->SetMovingImage(variant.turned ? turnedMoving.GetPointer() : moving.GetPointer());
+        fine->SetInitialDisplacementField(variant.turned ? turnedStart : start);
+        if (variant.masked)
+        {
+          fine->SetMovingMask(movingMask);
+        }
+        fine->AddModelConfiguration(
+          itk::ImpactModelConfiguration(argv[4], 2, 1, { 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0 }, { true, true }, false));
+        fine->SetDistance({ "L2", "L2" });
+        fine->SetLayersWeight({ 1.f, 1.f });
+        if (variant.pca)
+        {
+          fine->SetPCA({ 1, 1 });
+        }
+        Configure(fine, 6);
+        if (byRegions)
+        {
+          fine->SetRegionSize(16);
+          fine->SetRegionHalo(1);
+          fine->SetRegionsPerIteration(regionsPerIteration);
+          if (mapped)
+          {
+            fine->SetResidentFeatureBudget(1);
+            fine->SetBrickBytes(1);
+            fine->SetScratchDirectory(scratch);
+          }
+        }
+        fine->Update();
+        return fine;
+      };
+      const auto whole = run(false, false, 0);
+      double     fieldDifference = 0.0, lossDifference = 0.0;
+      for (const auto & route : { std::make_pair(false, 0u), std::make_pair(true, 0u), std::make_pair(false, 18u) })
+      {
+        const auto region = run(true, route.first, route.second);
+        fieldDifference = std::max(
+          fieldDifference, MaxDifference(whole->GetOutput(), region->GetOutput(), fixed->GetLargestPossibleRegion()));
+        for (size_t i = 0; route.second == 0 && i < whole->GetMetricValuesPerIteration().size(); ++i)
+        {
+          const double value = whole->GetMetricValuesPerIteration()[i];
+          lossDifference =
+            std::max(lossDifference, std::abs(value - region->GetMetricValuesPerIteration()[i]) / std::abs(value));
+        }
+      }
+      const double moved = MaxDifference(whole->GetOutput(),
+                                         variant.turned ? turnedStart.GetPointer() : start.GetPointer(),
+                                         fixed->GetLargestPossibleRegion());
+      std::cout << "a 2D model in Static mode" << variant.label << ", by regions against whole: fields within "
+                << fieldDifference << " mm, losses within " << lossDifference << " of theirs, for a field moved by "
+                << moved << " mm" << std::endl;
+      if (!(fieldDifference < 1e-5) || !(lossDifference < 1e-5) || !(moved > 1e-3))
+      {
+        std::cerr << "With a 2D model in Static mode, the runs by regions differ from the whole-image run."
+                  << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
   // Every run from mapped files is gone, and its control grid with it: so are the files.
   if (!std::filesystem::is_empty(scratch))
   {

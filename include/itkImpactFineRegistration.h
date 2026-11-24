@@ -280,6 +280,9 @@ public:
    * on its own grid: a box's samples of it, those its cells' layers read, resampled from the image's region they lie in
    * as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's windows
    * as the whole-image run pools them; every model of the image's dimension on one grid, no coarser than the cells.
+   * In Static mode a model of one dimension fewer runs on a box slice by slice along the axis closest to head-feet, as
+   * the whole-image run sweeps it, its maps pooled to the cells along every axis (with PCA, fitted and centred on the
+   * slices PcaSlices reads).
    * FeatureMapUpdateInterval pools the moving maps again, a box at a time, from
    * the moving image the field warps (with PCA, after a pass that takes their new mean). The Jacobian mode keeps the
    * fixed features pooled to the cells, as Static mode, and at every iteration takes each unit (a brick, or a box
