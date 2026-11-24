@@ -458,31 +458,6 @@ PoolLayerToCells(torch::Tensor                    layer,
   return PoolByWindows<Dim>(layer, relative);
 }
 
-/** The samples of a layer ({1, C, samples...}) of a span of the image that belong to the cells [c0, c1): those of
- * their voxels, the voxels past the last cell with the last, along every axis, at the layer's resolution, so that
- * the boxes of a grid share out the whole layer's samples. `lowPad` is where the cells start in the span, which
- * starts on the layer's lattice. */
-template <unsigned int Dim>
-torch::Tensor
-OwnLayerSamples(torch::Tensor                    layer,
-                const LayerLattice &             lattice,
-                const std::vector<int64_t> &     lowPad,
-                const std::vector<int64_t> &     c0,
-                const std::vector<int64_t> &     c1,
-                const std::vector<PoolWindows> & windows,
-                const std::vector<int64_t> &     spatial)
-{
-  for (unsigned int d = 0; d < Dim; ++d)
-  {
-    const int64_t stride = lattice.stride[d];
-    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
-    const int64_t first = windows[d].starts[c0[d]] / stride;
-    const int64_t last = c1[d] == cells ? lattice.Samples(d, spatial[d]) : windows[d].starts[c1[d]] / stride;
-    layer = layer.narrow(2 + static_cast<int64_t>(d), lowPad[d] / stride, last - first);
-  }
-  return layer;
-}
-
 /** Where F::interpolate, linear, reads output sample `o` of an axis of `in` samples resized to `out`, with
  * `alignCorners` as torch takes it: torch's source index, in single precision. */
 inline float
@@ -608,8 +583,8 @@ CheckRegionModels(const std::vector<ImpactModelConfiguration> & configs,
                   const TSpacing &                              spacing,
                   unsigned int                                  dim,
                   const char *                                  who,
-                  RegionModelRun                                run = RegionModelRun::Maps,
-                  bool                                          resamples = false)
+                  RegionModelRun                                run,
+                  bool                                          resamples)
 {
   RegionModels models;
   for (const ImpactModelConfiguration & config : configs)
@@ -724,9 +699,9 @@ RegionLayers(const std::vector<ImpactModelConfiguration> &   configs,
              size_t                                          layerCount,
              const ImpactImageMetadata *                     metadata,
              const char *                                    who,
-             bool                                            withGrad = false,
-             int                                             sweepAxis = -1,
-             const std::vector<std::vector<torch::Tensor>> * norms = nullptr)
+             bool                                            withGrad,
+             int                                             sweepAxis,
+             const std::vector<std::vector<torch::Tensor>> * norms)
 {
   if (configs.empty())
   {
@@ -1181,6 +1156,13 @@ struct FeatureRegion
 {
   TRegion              span;
   std::vector<int64_t> lowPad, v0, s0, s1;
+
+  /** Whether the samples are the whole grid of `spatial` samples. */
+  bool
+  SpansGrid(const std::vector<int64_t> & spatial) const
+  {
+    return s1 == spatial && std::all_of(s0.begin(), s0.end(), [](int64_t first) { return first == 0; });
+  }
 };
 
 /** The FeatureRegion of the cells [c0, c1) on `grid`, over an image of `spatial` voxels whose grid's first index is
@@ -1337,11 +1319,64 @@ struct PcaSums
   {
     return (shift + sum / count).to(torch::kFloat32);
   }
+
+  /** The basis of `components` and the mean, into `basis` and `mean`, when samples were added: whether they were. */
+  bool
+  Fit(int64_t components, torch::Tensor & basis, torch::Tensor & mean) const
+  {
+    if (count > 0.0)
+    {
+      basis = Basis(components);
+      mean = Mean();
+    }
+    return count > 0.0;
+  }
 };
 
-/** The samples PCA reads of a layer ({1, C, samples...}) of a span among those of the cells [c0, c1)
- * (OwnLayerSamples), {C, n}: all of them, or, for a swept model's layer, which keeps the samples of the grid along
- * tensor spatial axis `keep`, those of the slices PcaSlices reads of the whole layer. */
+/** The PcaSums of `layers` layers over `boxes`: `own(box)` gives a box's own samples of every layer ({C, n} each), of
+ * which those of the layers `takes(l, samples)` keeps are added. */
+template <typename TOwn, typename TTakes>
+std::vector<PcaSums>
+PcaSumsOverBoxes(const std::vector<CellBox> & boxes, size_t layers, TOwn && own, TTakes && takes)
+{
+  std::vector<PcaSums> sums(layers);
+  for (const CellBox & box : boxes)
+  {
+    const std::vector<torch::Tensor> samples = own(box);
+    for (size_t l = 0; l < samples.size(); ++l)
+    {
+      if (takes(l, samples[l]))
+      {
+        sums[l].Add(samples[l]);
+      }
+    }
+  }
+  return sums;
+}
+
+/** The widest of each axis's windows. */
+inline std::vector<int64_t>
+WidestWindows(const std::vector<PoolWindows> & windows)
+{
+  std::vector<int64_t> widest;
+  for (const PoolWindows & along : windows)
+  {
+    int64_t side = 0;
+    for (size_t c = 0; c < along.starts.size(); ++c)
+    {
+      side = std::max(side, along.ends[c] - along.starts[c]);
+    }
+    widest.push_back(side);
+  }
+  return widest;
+}
+
+/** The samples PCA reads of a layer ({1, C, samples...}) of a span among those that belong to the cells [c0, c1), {C,
+ * n}. Those are the samples of their voxels, the voxels past the last cell with the last, along every axis, at the
+ * layer's resolution, so that the boxes of a grid share out the whole layer's samples; `lowPad` is where the cells
+ * start in the span, which starts on the layer's lattice. PCA reads all of them, or, of a swept model's layer, which
+ * keeps the samples of the grid along tensor spatial axis `keep`, those of the slices PcaSlices reads of the whole
+ * layer. */
 template <unsigned int Dim>
 torch::Tensor
 PcaOwnSamples(const torch::Tensor &            layer,
@@ -1354,7 +1389,15 @@ PcaOwnSamples(const torch::Tensor &            layer,
               int64_t                          keep)
 {
   const int64_t channels = layer.size(1);
-  torch::Tensor own = OwnLayerSamples<Dim>(layer, lattice, lowPad, c0, c1, windows, spatial);
+  torch::Tensor own = layer;
+  for (unsigned int d = 0; d < Dim; ++d)
+  {
+    const int64_t stride = lattice.stride[d];
+    const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
+    const int64_t first = windows[d].starts[c0[d]] / stride;
+    const int64_t last = c1[d] == cells ? lattice.Samples(d, spatial[d]) : windows[d].starts[c1[d]] / stride;
+    own = own.narrow(2 + static_cast<int64_t>(d), lowPad[d] / stride, last - first);
+  }
   if (keep >= 0)
   {
     std::vector<int64_t> shape(Dim + 1, 1);

@@ -1202,13 +1202,10 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // ---- The feature models, run on each region whole: on the image's grid, or on the one they resample the image to
     // (FeatureGrid); a model of one dimension fewer slice by slice along the axis closest to head-feet, as the
     // whole-image run sweeps it. ----
-    size_t              layerCount = 1;
-    bool                takesMetadata = false; // a model that reads the image's statistics
-    std::vector<double> fixedSpacing(Dim);     // ITK order
-    for (unsigned int a = 0; a < Dim; ++a)
-    {
-      fixedSpacing[a] = m_FixedImage->GetSpacing()[a];
-    }
+    size_t                    layerCount = 1;
+    bool                      takesMetadata = false; // a model that reads the image's statistics
+    const std::vector<double> fixedSpacing(m_FixedImage->GetSpacing().begin(),
+                                           m_FixedImage->GetSpacing().end()); // ITK order
     const Impact::FeatureGrid grid =
       featureMode ? Impact::ModelFeatureGrid<Dim>({ &m_FixedModelsConfiguration, &m_MovingModelsConfiguration },
                                                   spatial,
@@ -1307,16 +1304,12 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       shape.insert(shape.end(), coarse.begin(), coarse.end());
       return m_ResidentFeatures ? torch::zeros(shape, onDevice) : scratch.Zeros(shape);
     };
-    std::vector<int64_t> featureCellVoxels(Dim); // a cell's widest window on the models' grid
-    for (unsigned int d = 0; d < Dim; ++d)
-    {
-      for (int64_t c = 0; c < coarse[d]; ++c)
-      {
-        featureCellVoxels[d] = std::max(featureCellVoxels[d], grid.windows[d].ends[c] - grid.windows[d].starts[c]);
-      }
-    }
-    const Impact::RegionLattices lattices = Impact::ProbeRegionLattices<Dim>(
-      halo, featureCellVoxels, device, !m_MovingModelsConfiguration.empty(), layersOf, "ImpactCoarseRegistration");
+    const Impact::RegionLattices lattices = Impact::ProbeRegionLattices<Dim>(halo,
+                                                                             Impact::WidestWindows(grid.windows),
+                                                                             device,
+                                                                             !m_MovingModelsConfiguration.empty(),
+                                                                             layersOf,
+                                                                             "ImpactCoarseRegistration");
     // Where the features of the cells of `box` are computed (FeatureRegion), with `toEnd` on to the grid's end along an
     // axis the box ends it; the image a model runs on there.
     auto regionOf = [&](const Impact::CellBox & box, bool toEnd) {
@@ -1335,8 +1328,7 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     };
     // The statistics of each model's normalisations over the whole image (GatherNorms), each image's; a single box
     // whose region is the whole image normalises it by its own, the image's to the bit.
-    const Impact::FeatureRegion<RegionType> single = regionOf(boxes[0], false);
-    if (featureMode && (boxes.size() > 1 || single.s0 != std::vector<int64_t>(Dim, 0) || single.s1 != grid.spatial))
+    if (featureMode && (boxes.size() > 1 || !regionOf(boxes[0], false).SpansGrid(grid.spatial)))
     {
       auto gatherNorms = [&](bool moving) {
         return Impact::GatherNorms<Dim>(moving ? movingConfigs : m_FixedModelsConfiguration,
@@ -1361,30 +1353,30 @@ ImpactCoarseRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     std::vector<torch::Tensor> pcaBasis(layerCount), fixedPcaMean(layerCount), movingPcaMean(layerCount);
     if (featureMode && std::any_of(m_PCA.begin(), m_PCA.end(), [](unsigned int components) { return components > 0; }))
     {
-      std::vector<Impact::PcaSums> fixedSums(layerCount), movingSums(layerCount);
-      for (const Impact::CellBox & box : boxes)
-      {
-        const Impact::FeatureRegion<RegionType> region = regionOf(box, true);
-        for (const bool moving : { false, true })
-        {
-          const std::vector<torch::Tensor>          layers = layersOf(inputOf(region, moving), moving);
-          const std::vector<Impact::LayerLattice> & on = moving ? lattices.moving : lattices.fixed;
-          for (size_t l = 0; l < layerCount && l < m_PCA.size(); ++l)
-          {
-            if (m_PCA[l] > 0 && static_cast<int64_t>(m_PCA[l]) < layers[l].size(1))
+      auto sumsOf = [&](bool moving) {
+        return Impact::PcaSumsOverBoxes(
+          boxes,
+          layerCount,
+          [&](const Impact::CellBox & box) {
+            const Impact::FeatureRegion<RegionType>   region = regionOf(box, true);
+            std::vector<torch::Tensor>                layers = layersOf(inputOf(region, moving), moving);
+            const std::vector<Impact::LayerLattice> & on = moving ? lattices.moving : lattices.fixed;
+            for (size_t l = 0; l < layers.size(); ++l)
             {
-              (moving ? movingSums : fixedSums)[l].Add(Impact::PcaOwnSamples<Dim>(
-                layers[l], on[l], region.lowPad, box.cell0, box.cell1, grid.windows, grid.spatial, keeps[l]));
+              layers[l] = Impact::PcaOwnSamples<Dim>(
+                layers[l], on[l], region.lowPad, box.cell0, box.cell1, grid.windows, grid.spatial, keeps[l]);
             }
-          }
-        }
-      }
+            return layers;
+          },
+          [&](size_t l, const torch::Tensor & own) {
+            return l < m_PCA.size() && m_PCA[l] > 0 && static_cast<int64_t>(m_PCA[l]) < own.size(0);
+          });
+      };
+      const std::vector<Impact::PcaSums> fixedSums = sumsOf(false), movingSums = sumsOf(true);
       for (size_t l = 0; l < layerCount; ++l)
       {
-        if (fixedSums[l].count > 0.0)
+        if (fixedSums[l].Fit(m_PCA[l], pcaBasis[l], fixedPcaMean[l]))
         {
-          pcaBasis[l] = fixedSums[l].Basis(m_PCA[l]);
-          fixedPcaMean[l] = fixedSums[l].Mean();
           movingPcaMean[l] = movingSums[l].Mean();
         }
       }

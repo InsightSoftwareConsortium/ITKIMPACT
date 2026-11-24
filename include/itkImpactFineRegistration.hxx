@@ -467,7 +467,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
   };
   auto warpLayer = [&](const torch::Tensor & map, size_t l, const torch::Tensor & smoothedControl) -> torch::Tensor {
     return Impact::WarpMap<ImageDimension>(map,
-                                           std::vector<int64_t>(ImageDimension, 0),
+                                           imageOrigin,
                                            layerSpatials[l],
                                            layerIndex[l],
                                            resizeField(smoothedControl, layerSpatials[l]) * layerScale[l]);
@@ -674,8 +674,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     }
     const torch::Tensor displacement =
       F::grid_sample(smoothedResidual, points.reshape(pointShape), sampleOpts) * layerScale[l];
-    const torch::Tensor moving = Impact::WarpMap<ImageDimension>(
-      pick(l, movingLayers[l]), std::vector<int64_t>(ImageDimension, 0), layerSpatials[l], index, displacement);
+    const torch::Tensor moving =
+      Impact::WarpMap<ImageDimension>(pick(l, movingLayers[l]), imageOrigin, layerSpatials[l], index, displacement);
     const int64_t       channels = moving.size(1);
     const torch::Tensor fixed = pick(l, fixedLayers[l]).reshape({ channels, voxels }).index_select(1, drawn);
     if (!movingMask.defined())
@@ -688,11 +688,11 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       const torch::Tensor atTotal =
         smoothedTotal.defined() ? F::grid_sample(smoothedTotal, points.reshape(pointShape), sampleOpts) * layerScale[l]
                                 : displacement.detach();
-      rows = (Impact::WarpMap<ImageDimension>(
-                movingLayerShare[l], std::vector<int64_t>(ImageDimension, 0), layerSpatials[l], index, atTotal) >= 0.5)
-               .flatten()
-               .nonzero()
-               .flatten();
+      rows =
+        (Impact::WarpMap<ImageDimension>(movingLayerShare[l], imageOrigin, layerSpatials[l], index, atTotal) >= 0.5)
+          .flatten()
+          .nonzero()
+          .flatten();
     }
     if (rows.numel() == 0)
     {
@@ -956,7 +956,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         movingLayers[l] = poolLayerToLoss(movingLayers[l]).contiguous();
         std::vector<int64_t> ls(movingLayers[l].sizes().begin() + 2, movingLayers[l].sizes().end());
         layerSpatials[l] = ls;
-        layerIndex.push_back(Impact::BoxIndices(std::vector<int64_t>(ImageDimension, 0), ls, device));
+        layerIndex.push_back(Impact::BoxIndices(imageOrigin, ls, device));
         layerScale.push_back(samplesPerVoxel(ls));
         if (sampled) // the base grid places the points a share of the voxels draws
         {
@@ -1001,7 +1001,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
     fixedCoarse = poolLayerToLoss(fixedT);
     fixedCoarseMask = fixedMaskOn(coarseSpatial);
     movingCoarseShare = movingShareOn(coarseSpatial);
-    coarseIndex = Impact::BoxIndices(std::vector<int64_t>(ImageDimension, 0), coarseSpatial, device);
+    coarseIndex = Impact::BoxIndices(imageOrigin, coarseSpatial, device);
     coarseScale = samplesPerVoxel(coarseSpatial);
   }
 
@@ -1535,10 +1535,9 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
       else
       {
         // Warp the pooled moving image directly at the control-grid resolution.
-        const torch::Tensor        displacement = smoothControl(theta - thetaRef) * coarseScale;
-        const std::vector<int64_t> origin(ImageDimension, 0);
-        const torch::Tensor        warpedImage =
-          Impact::WarpMap<ImageDimension>(movingCoarse, origin, coarseSpatial, coarseIndex, displacement);
+        const torch::Tensor displacement = smoothControl(theta - thetaRef) * coarseScale;
+        const torch::Tensor warpedImage =
+          Impact::WarpMap<ImageDimension>(movingCoarse, imageOrigin, coarseSpatial, coarseIndex, displacement);
         if (!masked)
         {
           similarity = (warpedImage - fixedCoarse).pow(2).mean();
@@ -1547,7 +1546,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::GenerateData()
         {
           const torch::Tensor counted =
             countedVoxels(fixedCoarseMask, movingCoarseShare, [&](const torch::Tensor & share) {
-              return Impact::WarpMap<ImageDimension>(share, origin, coarseSpatial, coarseIndex, displacement.detach());
+              return Impact::WarpMap<ImageDimension>(
+                share, imageOrigin, coarseSpatial, coarseIndex, displacement.detach());
             });
           similarity =
             torch::where(counted, (warpedImage - fixedCoarse).pow(2), 0.0).sum() / counted.sum().clamp_min(1);
@@ -1721,11 +1721,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     spatial[d] = static_cast<int64_t>(fixedRegion.GetSize()[Dim - 1 - d]);
   }
-  std::vector<double> fixedSpacing(Dim); // ITK order
-  for (unsigned int a = 0; a < Dim; ++a)
-  {
-    fixedSpacing[a] = m_FixedImage->GetSpacing()[a];
-  }
+  // The fixed spacing, ITK order.
+  const std::vector<double>        fixedSpacing(m_FixedImage->GetSpacing().begin(), m_FixedImage->GetSpacing().end());
   const std::vector<int64_t>       shrink(Dim, static_cast<int64_t>(std::max(1u, m_GridShrinkFactor)));
   std::vector<int64_t>             cells(Dim);
   std::vector<float>               cellsPerVoxel(Dim); // a voxel of displacement in cells, by ConvexAdam's scale
@@ -2003,14 +2000,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     const auto [index, displacement] = Impact::PointWarp(positions, moved);
     return readWarped(read, index, displacement).flatten();
   };
-  // The field {1, Dim, n...} at the voxels [lo, hi) of the fixed grid (tensor order), in voxels: the smoothed control
-  // field `smoothed` of the cells from `origin` on, resized to the image as the whole-image run resizes it.
-  auto fieldOnVoxels = [&](const torch::Tensor &        smoothed,
-                           const std::vector<int64_t> & origin,
-                           const std::vector<int64_t> & lo,
-                           const std::vector<int64_t> & hi) {
-    return Impact::ResizeRegion<Dim>(smoothed, origin, cells, spatial, lo, hi, "ImpactFineRegistration");
-  };
   // The field {n, Dim} at `positions` ({n, Dim}, voxels of the fixed grid in tensor order), in voxels: the smoothed
   // control field of the cells from `origin` on read there as the whole-image run reads it at a patch's voxels, its
   // values at the first and last cell centres past them.
@@ -2033,17 +2022,19 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         .reshape({ static_cast<int64_t>(Dim), positions.size(0) })
         .t();
     };
-  // What `read` gives, warped by the field: at each voxel x of `span`, read at x + u(x). {1, 1, span...}.
+  // What `read` gives, warped by the field: at each voxel x of `span`, read at x + u(x), the smoothed control field
+  // `smoothed` of the cells from `origin` on resized to the image as the whole-image run resizes it. {1, 1, span...}.
   auto warpedOn =
     [&](auto && read, const RegionType & span, const torch::Tensor & smoothed, const std::vector<int64_t> & origin) {
-      std::vector<int64_t> lo(Dim), hi(Dim), shape{ 1, 1 };
+      std::vector<int64_t> lo(Dim), hi(Dim);
       for (unsigned int d = 0; d < Dim; ++d)
       {
         lo[d] = static_cast<int64_t>(span.GetIndex()[Dim - 1 - d] - fixedRegion.GetIndex()[Dim - 1 - d]);
         hi[d] = lo[d] + static_cast<int64_t>(span.GetSize()[Dim - 1 - d]);
-        shape.push_back(hi[d] - lo[d]);
       }
-      return readWarped(read, Impact::BoxIndices(lo, hi, device), fieldOnVoxels(smoothed, origin, lo, hi));
+      return readWarped(read,
+                        Impact::BoxIndices(lo, hi, device),
+                        Impact::ResizeRegion<Dim>(smoothed, origin, cells, spatial, lo, hi, "ImpactFineRegistration"));
     };
 
   // ---- The feature models and distances. ----
@@ -2142,16 +2133,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                                      axis,
                                      moving ? &movingNorms : &fixedNorms);
   };
-  std::vector<int64_t> cellVoxels(Dim),
-    featureCellVoxels(Dim); // a cell's voxels, and its widest window on the models' grid
+  std::vector<int64_t> cellVoxels(Dim); // a cell's voxels
   for (unsigned int d = 0; d < Dim; ++d)
   {
     cellVoxels[d] = windows[d].ends[0] - windows[d].starts[0];
-    for (int64_t c = 0; c < cells[d]; ++c)
-    {
-      featureCellVoxels[d] = std::max(featureCellVoxels[d], featureWindows[d].ends[c] - featureWindows[d].starts[c]);
-    }
   }
+  const std::vector<int64_t> featureCellVoxels = Impact::WidestWindows(featureWindows); // on the models' grid
   // Where the models' layers lie on the image, probed once, and once for each axis a swept model sweeps; the sampled
   // Jacobian mode reads no map.
   std::vector<Impact::RegionLattices> latticeSets;
@@ -2280,7 +2267,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto movingShareOf = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) {
     std::vector<int64_t> lowPad(Dim);
     const RegionType     span = spanOf(c0, c1, std::vector<int64_t>(Dim, 0), lowPad);
-    return toCells(movingOnFixed(span, true), Impact::ImageLattice(Dim), lowPad, c0, c1);
+    return toCells(readMovingMask(span), Impact::ImageLattice(Dim), lowPad, c0, c1);
   };
   // The moving features pooled over the cells [c0, c1) of the fixed grid, the moving image brought there through
   // the moving transform (the moving mask with it, as its share of each cell): {1, C, n...} per layer, and the share
@@ -2293,11 +2280,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto pooledMoving = [&](const std::vector<int64_t> & c0, const std::vector<int64_t> & c1) -> PooledMoving {
     std::vector<int64_t> lowPad(Dim);
     PooledMoving         pooled;
-    pooled.layers =
-      layersOf(featureInput(c0, c1, lowPad, -1, [&](const RegionType & span) { return movingOnFixed(span, false); }),
-               true,
-               false,
-               mapSweep);
+    pooled.layers = layersOf(featureInput(c0, c1, lowPad, -1, readMovingImage), true, false, mapSweep);
     pooledToCells(pooled.layers, latticesAlong(-1).moving, lowPad, c0, c1);
     reduced(pooled.layers, pcaBasis, movingPcaMean);
     if (m_MovingMask.IsNotNull())
@@ -2443,22 +2426,21 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     }
     return layers;
   };
-  // Each layer with a basis in `bases`: its mean {C, 1} over every sample of the image `read` gives (a function of the
-  // box and the region), swept along `axis`.
+  // Each layer's sums over every sample of the image `read` gives (a function of the box and the region), swept along
+  // `axis`, of the layers `takes(l, samples)` keeps.
+  auto sumsOver = [&](bool moving, auto && read, int axis, auto && takes) {
+    return Impact::PcaSumsOverBoxes(
+      boxes,
+      losses.size(),
+      [&](const Impact::CellBox & box) {
+        return ownLayers(box, moving, [&](const RegionType & span) { return read(box, span); }, axis);
+      },
+      takes);
+  };
+  // Each layer with a basis in `bases`: its mean {C, 1} over every sample of that image.
   auto meansOver = [&](bool moving, const std::vector<torch::Tensor> & bases, auto && read, int axis = -1) {
-    std::vector<Impact::PcaSums> sums(losses.size());
-    for (const Impact::CellBox & box : boxes)
-    {
-      const std::vector<torch::Tensor> own =
-        ownLayers(box, moving, [&](const RegionType & span) { return read(box, span); }, axis);
-      for (size_t l = 0; l < own.size(); ++l)
-      {
-        if (bases[l].defined())
-        {
-          sums[l].Add(own[l]);
-        }
-      }
-    }
+    const std::vector<Impact::PcaSums> sums =
+      sumsOver(moving, read, axis, [&](size_t l, const torch::Tensor &) { return bases[l].defined(); });
     std::vector<torch::Tensor> means(losses.size());
     for (size_t l = 0; l < means.size(); ++l)
     {
@@ -2472,24 +2454,15 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // Each layer's PCA basis and fixed mean, fitted on the fixed features of every voxel (swept along `axis`: of the
   // slices PcaSlices reads), as PcaFit fits them on the whole layer, from their sums over the boxes.
   auto fitPca = [&](std::vector<torch::Tensor> & bases, std::vector<torch::Tensor> & means, int axis) {
-    std::vector<Impact::PcaSums> sums(losses.size());
-    for (const Impact::CellBox & box : boxes)
-    {
-      const std::vector<torch::Tensor> own = ownLayers(box, false, readFixed, axis);
-      for (size_t l = 0; l < own.size(); ++l)
-      {
-        if (componentsOf(l, own[l].size(0)) > 0)
-        {
-          sums[l].Add(own[l]);
-        }
-      }
-    }
+    const std::vector<Impact::PcaSums> sums = sumsOver(
+      false,
+      [&](const Impact::CellBox &, const RegionType & span) { return readFixed(span); },
+      axis,
+      [&](size_t l, const torch::Tensor & own) { return componentsOf(l, own.size(0)) > 0; });
     for (size_t l = 0; l < losses.size(); ++l)
     {
-      if (sums[l].count > 0.0)
+      if (sums[l].Fit(m_PCA[l], bases[l], means[l]))
       {
-        bases[l] = sums[l].Basis(m_PCA[l]);
-        means[l] = sums[l].Mean();
         channels[l] = m_PCA[l];
       }
     }
@@ -2510,32 +2483,32 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       });
   };
   // A single box whose region is the whole image normalises it by its own statistics, the image's to the bit.
-  auto spansImage = [&]() {
-    const auto single = Impact::FeatureRegionOf<Dim, RegionType>(grid,
-                                                                 spatial,
-                                                                 fixedRegion.GetIndex(),
-                                                                 boxes[0].cell0,
-                                                                 boxes[0].cell1,
-                                                                 latticesAlong(-1).reach,
-                                                                 latticesAlong(-1).align,
-                                                                 std::vector<bool>(Dim, false));
-    return single.s0 == std::vector<int64_t>(Dim, 0) && single.s1 == featureSpatial;
-  };
-  const bool gathersNorms = featureMode && !jacobian && (boxes.size() > 1 || !spansImage());
+  const bool gathersNorms =
+    featureMode && !jacobian &&
+    (boxes.size() > 1 || !Impact::FeatureRegionOf<Dim, RegionType>(grid,
+                                                                   spatial,
+                                                                   fixedRegion.GetIndex(),
+                                                                   boxes[0].cell0,
+                                                                   boxes[0].cell1,
+                                                                   latticesAlong(-1).reach,
+                                                                   latticesAlong(-1).align,
+                                                                   std::vector<bool>(Dim, false))
+                            .SpansGrid(featureSpatial));
   if (gathersNorms)
   {
     fixedNorms = gatherNorms(false, [&](const Impact::CellBox &, const RegionType & span) { return readFixed(span); });
     movingNorms =
-      gatherNorms(true, [&](const Impact::CellBox &, const RegionType & span) { return movingOnFixed(span, false); });
+      gatherNorms(true, [&](const Impact::CellBox &, const RegionType & span) { return readMovingImage(span); });
   }
-  const bool fitsPca = featureMode && !sampledJacobian &&
-                       std::any_of(m_PCA.begin(), m_PCA.end(), [](unsigned int components) { return components > 0; });
+  const bool takesPca =
+    featureMode && std::any_of(m_PCA.begin(), m_PCA.end(), [](unsigned int components) { return components > 0; });
+  const bool fitsPca = takesPca && !sampledJacobian; // on patches, at every iteration (below)
   if (fitsPca && !jacobian)
   {
     // Static mode: each image's maps centred by its own features' mean.
     fitPca(pcaBasis, fixedPcaMean, -1);
     movingPcaMean = meansOver(
-      true, pcaBasis, [&](const Impact::CellBox &, const RegionType & span) { return movingOnFixed(span, false); });
+      true, pcaBasis, [&](const Impact::CellBox &, const RegionType & span) { return readMovingImage(span); });
   }
   if (fitsPca && jacobian && !swept)
   {
@@ -2753,8 +2726,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   m_ResidentBytes = static_cast<SizeValueType>(static_cast<double>(cellCountTotal) *
                                                (dense ? static_cast<double>(denseFloats) : heldFloats) * 4.0);
   m_ResidentFeatures = static_cast<double>(m_ResidentBytes) + (dense ? 0.0 : stepBytes(1)) <= budget;
-  auto atHome = [&](const std::vector<int64_t> & shape) {
-    return m_ResidentFeatures ? torch::zeros(shape, onDevice) : scratch.Zeros(shape);
+  auto atHome = [&](const std::vector<int64_t> & shape, torch::ScalarType type = torch::kFloat32) {
+    return m_ResidentFeatures ? torch::zeros(shape, onDevice.dtype(type)) : scratch.Zeros(shape, type);
   };
 
   // ---- Occupancy: each box's cells in the fixed mask (share of their voxels >= 0.5), all of them without one; at
@@ -2768,8 +2741,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   torch::Tensor fixedOn; // bool {1, 1, cells...}; undefined without a fixed mask
   if (m_FixedMask.IsNotNull())
   {
-    fixedOn = m_ResidentFeatures ? torch::zeros(maskShape, torch::TensorOptions().dtype(torch::kBool).device(device))
-                                 : scratch.Zeros(maskShape, torch::kBool);
+    fixedOn = atHome(maskShape, torch::kBool);
   }
   for (size_t b = 0; b < boxes.size(); ++b)
   {
@@ -2977,48 +2949,45 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   // A swept model's fixed maps and fixed mask, one an axis it sweeps, with the image's voxels along it.
   std::vector<std::vector<torch::Tensor>> sweptMaps(swept ? Dim : 0);
   std::vector<torch::Tensor>              sweptOn(swept ? Dim : 0);
-  auto                                    atHomeShaped = [&](int64_t channel, int axis, bool mask) {
+  // The shape of a map of `channel` channels on the cells; a swept model's along ITK axis `axis`.
+  auto mapShape = [&](int64_t channel, int axis) {
     std::vector<int64_t> shape{ 1, channel };
     for (unsigned int d = 0; d < Dim; ++d)
     {
       shape.push_back(static_cast<int64_t>(d) == keepOf(axis) ? spatial[d] : cells[d]);
     }
-    if (!mask)
-    {
-      return atHome(shape);
-    }
-    return m_ResidentFeatures ? torch::zeros(shape, torch::TensorOptions().dtype(torch::kBool).device(device))
-                                                                 : scratch.Zeros(shape, torch::kBool);
+    return shape;
   };
   for (size_t l = 0; l < losses.size() && !sampledJacobian && !swept; ++l)
   {
-    fixedMaps[l] = atHomeShaped(channels[l], -1, false);
+    fixedMaps[l] = atHome(mapShape(channels[l], -1));
     if (!jacobian)
     {
-      movingMaps[l] = atHomeShaped(channels[l], -1, false);
+      movingMaps[l] = atHome(mapShape(channels[l], -1));
     }
   }
   for (unsigned int axis = 0; axis < sweptMaps.size(); ++axis)
   {
     for (size_t l = 0; l < losses.size(); ++l)
     {
-      sweptMaps[axis].push_back(atHomeShaped(channels[l], static_cast<int>(axis), false));
+      sweptMaps[axis].push_back(atHome(mapShape(channels[l], static_cast<int>(axis))));
     }
     if (m_FixedMask.IsNotNull())
     {
-      sweptOn[axis] = atHomeShaped(1, static_cast<int>(axis), true);
+      sweptOn[axis] = atHome(mapShape(1, static_cast<int>(axis)), torch::kBool);
     }
   }
   if (m_MovingMask.IsNotNull() && !sampledJacobian && !swept)
   {
     movingShare = atHome(maskShape);
   }
-  // Where the points of the cells [c0, c1) start in a swept model's maps along `axis`.
-  auto sweptStart = [&](const std::vector<int64_t> & c0, int axis) {
-    std::vector<int64_t> start = c0;
-    const int64_t        keep = keepOf(axis);
-    start[keep] = windows[keep].starts[c0[keep]];
-    return start;
+  // The points of `box` in a swept model's maps along ITK axis `axis`: its cells, with the image's voxels along it.
+  auto sweptCells = [&](const Impact::CellBox & box, int axis) {
+    Impact::CellBox points = box;
+    const int64_t   keep = keepOf(axis);
+    points.cell0[keep] = windows[keep].starts[box.cell0[keep]];
+    points.cell1[keep] = box.cell1[keep] == cells[keep] ? spatial[keep] : windows[keep].ends[box.cell1[keep] - 1];
+    return points;
   };
   for (size_t b = 0; b < boxes.size(); ++b)
   {
@@ -3039,7 +3008,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const std::vector<torch::Tensor> layers = pooledFixed(box.cell0, box.cell1, axis);
       for (size_t l = 0; l < layers.size(); ++l)
       {
-        Impact::WriteCells(sweptMaps[axis][l], sweptStart(box.cell0, axis), layers[l]);
+        Impact::WriteCells(sweptMaps[axis][l], sweptCells(box, axis).cell0, layers[l]);
       }
       if (sweptOn[axis].defined())
       {
@@ -3047,7 +3016,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
         const RegionType     span = featureSpan(box.cell0, box.cell1, lowPad, axis);
         Impact::WriteCells(
           sweptOn[axis],
-          sweptStart(box.cell0, axis),
+          sweptCells(box, axis).cell0,
           toCells(readFixedMask(span), Impact::ImageLattice(Dim), lowPad, box.cell0, box.cell1, keepOf(axis)) >= 0.5);
       }
     }
@@ -3227,14 +3196,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     std::mt19937 axisGenerator(m_Seed);
     std::uniform_int_distribution<unsigned int> axisDistribution(0, Dim - 1);
     auto countSet = [&] { return swept ? static_cast<size_t>(sweptAxis) : size_t{ 0 }; };
-    // The points of `box` in a swept model's maps along the axis swept: its cells, with the image's voxels along it.
-    auto sweptPoints = [&](const Impact::CellBox & box) {
-      Impact::CellBox points = box;
-      const int64_t   keep = keepOf(static_cast<int>(sweptAxis));
-      points.cell0[keep] = windows[keep].starts[box.cell0[keep]];
-      points.cell1[keep] = box.cell1[keep] == cells[keep] ? spatial[keep] : windows[keep].ends[box.cell1[keep] - 1];
-      return points;
-    };
     // How the cells of `box` read the moving map for the smoothed field `smoothed` of the cells from `origin` on:
     // the cells' samples and their displacement, the cells [m0, m1) of the map they read, and the cells that count, by
     // both masks at that field (`counted`, undefined when all do; `count` of them). A box the fixed mask leaves out
@@ -3255,7 +3216,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
                          const torch::Tensor &        residual = {}) -> Reading {
       if (swept)
       {
-        const Impact::CellBox points = sweptPoints(box);
+        const Impact::CellBox points = sweptCells(box, static_cast<int>(sweptAxis));
         Reading               reading{ {}, {}, {}, {}, {}, points.Count() };
         if (m_FixedMask.IsNotNull())
         {
@@ -3341,14 +3302,13 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     // An iteration first gathers them over every unit without the graph (`gathering`), then takes the gradient of each
     // such layer's value with respect to them (`sumSeeds`); a unit's step back-propagates the seeds times its own sums,
     // a term of no value whose gradient is the unit's part of the whole one.
-    auto isGlobal = [&](size_t l) { return !losses[l]->IsPerPointMean() && !losses[l]->IsSpatial(); };
-    bool globalLoss = false;
-    for (size_t l = 0; l < losses.size(); ++l)
-    {
-      globalLoss = globalLoss || isGlobal(l);
-    }
-    bool   gathering = false;
-    double gatheredPoints = 0.0;
+    auto isGlobalLoss = [](const std::unique_ptr<Impact::Loss> & loss) {
+      return !loss->IsPerPointMean() && !loss->IsSpatial();
+    };
+    auto       isGlobal = [&](size_t l) { return isGlobalLoss(losses[l]); };
+    const bool globalLoss = std::any_of(losses.begin(), losses.end(), isGlobalLoss);
+    bool       gathering = false;
+    double     gatheredPoints = 0.0;
     // With PCA the moving features of the Jacobian mode are centred by their mean at the field of the iteration
     // (below): over every voxel, a swept model's over the slices PcaSlices reads along the axis of the iteration.
     std::vector<torch::Tensor> movingMeanNow(losses.size());
@@ -3391,12 +3351,12 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       const double        share =
         static_cast<double>(m_SamplingPercentage < 1.0 ? rows.numel() : reading.count) / countedCells[countSet()];
       const Impact::CellBox block = Impact::CellsAround(box, std::vector<int64_t>(Dim, lossHalo), cells);
-      const Impact::CellBox points = swept ? sweptPoints(box) : box;
+      const Impact::CellBox points = swept ? sweptCells(box, static_cast<int>(sweptAxis)) : box;
       if (gathering)
       {
         gatheredPoints += static_cast<double>(rows.defined() ? rows.numel() : points.Count());
       }
-      const Impact::CellBox blockPoints = swept ? sweptPoints(block) : block;
+      const Impact::CellBox blockPoints = swept ? sweptCells(block, static_cast<int>(sweptAxis)) : block;
       // The box's points within a map of the block's.
       auto ownOf = [&](torch::Tensor map) {
         for (unsigned int d = 0; d < Dim; ++d)
@@ -3886,7 +3846,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             itkExceptionMacro("ImpactFineRegistration: no drawn point has its model patch inside the image; the patch "
                               "(PatchSize x voxel size) is larger than the image, or SamplingPercentage too small.");
           }
-          if (sampledJacobian && std::any_of(m_PCA.begin(), m_PCA.end(), [](unsigned int k) { return k > 0; }))
+          if (sampledJacobian && takesPca)
           {
             // The iteration's basis and means, from both sides' features of every unit's points.
             {
@@ -3904,10 +3864,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
             }
             for (size_t l = 0; l < losses.size(); ++l)
             {
-              if (pointFixedSums[l].count > 0.0)
+              if (pointFixedSums[l].Fit(m_PCA[l], pointBasis[l], pointFixedMean[l]))
               {
-                pointBasis[l] = pointFixedSums[l].Basis(m_PCA[l]);
-                pointFixedMean[l] = pointFixedSums[l].Mean();
                 pointMovingMean[l] = pointMovingSums[l].Mean();
               }
             }
