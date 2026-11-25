@@ -1952,7 +1952,23 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       imageRead.SetIndex(Dim - 1 - d, static_cast<IndexValueType>(readStart[d]));
       imageRead.SetSize(Dim - 1 - d, static_cast<SizeValueType>(readStop[d] - readStart[d]));
     }
-    return F::grid_sample(read(imageRead), gridIn(movingIndex, readStart, readStop), mask ? nearestOpts : sampleOpts);
+    // As the whole-image run's resampler reads it (ResampleImageFilter, LinearInterpolateImageFunction, or
+    // NearestNeighborInterpolateImageFunction for the mask): a point within half a voxel past the image reads it at
+    // its index brought onto the image along each axis, the mask at its index rounded half up, and one further reads
+    // zero.
+    torch::Tensor index = movingIndex.clone();
+    torch::Tensor inside;
+    for (unsigned int d = 0; d < Dim; ++d)
+    {
+      const double  first = static_cast<double>(whole.GetIndex()[Dim - 1 - d]);
+      const double  last = first + static_cast<double>(whole.GetSize()[Dim - 1 - d]) - 1.0;
+      torch::Tensor axis = index.select(1, static_cast<int64_t>(d));
+      const auto    within = axis.ge(first - 0.5).logical_and(axis.lt(last + 0.5));
+      inside = inside.defined() ? inside.logical_and(within) : within;
+      axis.copy_((mask ? (axis + 0.5).floor() : axis).clamp(first, last));
+    }
+    return F::grid_sample(read(imageRead), gridIn(index, readStart, readStop), mask ? nearestOpts : sampleOpts) *
+           inside.unsqueeze(1);
   };
   auto readMovingImage = [&](const RegionType & region) { return movingOnFixed(region, false); };
   auto readMovingMask = [&](const RegionType & region) { return movingOnFixed(region, true); };
