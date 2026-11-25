@@ -1715,7 +1715,6 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   fixedSource->UpdateOutputInformation();
   movingSource->UpdateOutputInformation();
   const RegionType                           fixedRegion = m_FixedImage->GetLargestPossibleRegion();
-  const typename MovingImageType::RegionType movingRegion = m_MovingImage->GetLargestPossibleRegion();
   std::vector<int64_t>                       spatial(Dim); // tensor order (z, y, x)
   for (unsigned int d = 0; d < Dim; ++d)
   {
@@ -2094,8 +2093,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   const std::vector<ImpactModelConfiguration> & movingConfigs =
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
   // A metadata-aware model (MIND reads the image's range) takes the image's statistics: one pass over each image, all
-  // its voxels, in blocks of the box size, as the dense run's StatisticsImageFilter takes them (the moving ones on
-  // its own grid, where the dense run reads it resampled onto the fixed grid).
+  // its voxels, in blocks of the box size, as the dense run's StatisticsImageFilter takes them: the moving ones on the
+  // fixed grid, as the dense run reads it resampled there (past the moving image, zeros), its direction the fixed one's.
   ImpactImageMetadata fixedMetadata, movingMetadata;
   if (takesMetadata)
   {
@@ -2127,7 +2126,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       });
     };
     fixedMetadata = statistics(fixedRegion, m_FixedImage->GetDirection(), readFixed);
-    movingMetadata = statistics(movingRegion, m_MovingImage->GetDirection(), readMoving);
+    movingMetadata = statistics(fixedRegion, m_FixedImage->GetDirection(), readMovingImage);
   }
   // The feature layers of an image region {1, 1, span...}, at its resolution, each model run on the region whole in
   // one forward (a region is sized to fit the device, so the tiler ExtractFeatureLayers measures the device for at
