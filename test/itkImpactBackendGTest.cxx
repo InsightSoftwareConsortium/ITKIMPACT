@@ -30,6 +30,8 @@
 #include "itkImpactModelConfiguration.h"
 #include "itkImageToFeaturesMap.h"
 #include "itkImageToFeaturesMapInternals.h"
+#include "itkInterpolateVectorImageFunction.h"
+#include "itkVersion.h"
 #include "itkImpactOnlineInference.h"
 #include "itkImpactBatchBudget.h"
 #include "ImpactLoss.h"
@@ -290,6 +292,148 @@ TEST(ImpactBackend, ImageToFeaturesMapReusesInjectedPcaBasis)
   // Injecting A's basis reuses it verbatim; refitting on B yields a different one.
   EXPECT_TRUE(torch::equal(basisBReused[0], basisA[0]));
   EXPECT_FALSE(torch::equal(basisBRefit[0], basisA[0]));
+}
+
+namespace
+{
+// An image buffer of floats that counts the bytes it allocates: what a process keeping its images in files
+// (elastix -out-of-core) maps, as its own override of the same container does.
+class CountingContainer : public itk::ImportImageContainer<itk::SizeValueType, float>
+{
+public:
+  ITK_DISALLOW_COPY_AND_MOVE(CountingContainer);
+  using Self = CountingContainer;
+  using Superclass = itk::ImportImageContainer<itk::SizeValueType, float>;
+  using Pointer = itk::SmartPointer<Self>;
+  itkNewMacro(Self);
+  itkOverrideGetNameOfClassMacro(CountingContainer);
+
+  static std::size_t &
+  Bytes()
+  {
+    static std::size_t bytes = 0;
+    return bytes;
+  }
+
+protected:
+  CountingContainer() = default;
+  ~CountingContainer() override = default;
+
+  float *
+  AllocateElements(const ElementIdentifier size, const bool useValueInitialization = false) const override
+  {
+    Bytes() += size * sizeof(float);
+    return Superclass::AllocateElements(size, useValueInitialization);
+  }
+};
+
+class CountingContainerFactory : public itk::ObjectFactoryBase
+{
+public:
+  ITK_DISALLOW_COPY_AND_MOVE(CountingContainerFactory);
+  using Self = CountingContainerFactory;
+  using Pointer = itk::SmartPointer<Self>;
+  itkFactorylessNewMacro(Self);
+  itkOverrideGetNameOfClassMacro(CountingContainerFactory);
+
+  const char *
+  GetITKSourceVersion() const override
+  {
+    return ITK_SOURCE_VERSION;
+  }
+  const char *
+  GetDescription() const override
+  {
+    return "Counting float image buffers";
+  }
+
+protected:
+  CountingContainerFactory()
+  {
+    this->RegisterOverride(typeid(itk::ImportImageContainer<itk::SizeValueType, float>).name(),
+                           typeid(CountingContainer).name(),
+                           "Counting float image buffer",
+                           true,
+                           itk::CreateObjectFunction<CountingContainer>::New());
+  }
+};
+
+// A feature map {C, z, y, x} as a tensor, from its VectorImage.
+torch::Tensor
+MapTensor(const itk::VectorImage<float, 3> & map)
+{
+  const auto & size = map.GetLargestPossibleRegion().GetSize();
+  const auto   channels = static_cast<int64_t>(map.GetNumberOfComponentsPerPixel());
+  return torch::from_blob(const_cast<float *>(map.GetBufferPointer()),
+                          { static_cast<int64_t>(size[2]), static_cast<int64_t>(size[1]), static_cast<int64_t>(size[0]),
+                            channels })
+    .permute({ 3, 0, 1, 2 })
+    .clone();
+}
+} // namespace
+
+// The maps the filter computes with a PCA are the maps it computes without one, projected on their basis as PcaReduce
+// projects them, the basis PcaFit fits (each component up to its sign), though they are now summed a slab at a time.
+TEST(ImpactBackend, ImageToFeaturesMapPcaIsTheMapsProjection)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  auto interpolator = InterpolatorType::New();
+  interpolator->SetSplineOrder(3);
+  auto run = [&](unsigned int pca) {
+    itk::ImpactModelConfiguration config(
+      ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, false);
+    auto filter = FeatMapType::New();
+    filter->SetModelConfiguration(config);
+    filter->SetInterpolator(interpolator);
+    filter->AddInput(MakeRampImage(8, 1));
+    filter->SetPCA(pca);
+    filter->SetDevice("cpu");
+    filter->Update();
+    return filter;
+  };
+  const auto          whole = run(0);
+  const auto          reduced = run(2);
+  const torch::Tensor map = MapTensor(*whole->GetOutput(0));
+  const torch::Tensor basis = itk::GetPrincipalComponents(*reduced)[0];
+  const torch::Tensor fitted = itk::Impact::PcaFit(map, 2);
+  EXPECT_TRUE(torch::allclose((basis * fitted).sum(0).abs(), torch::ones({ 2 }), 1e-4, 1e-4));
+  EXPECT_TRUE(torch::allclose(MapTensor(*reduced->GetOutput(0)), itk::Impact::PcaTransform(map, basis), 1e-4, 1e-4));
+}
+
+// The volumes of a Static extraction live in image buffers: the resampled input, every layer before and after its
+// PCA, and the interpolation's coefficients of a map, so that a process that keeps its images in files keeps them
+// there (no map exists whole on the heap).
+TEST(ImpactBackend, ImageToFeaturesMapKeepsItsVolumesInImageBuffers)
+{
+  using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
+  using MapInterpolatorType = itk::InterpolateVectorImageFunction<
+    itk::VectorImage<float, 3>,
+    itk::BSplineInterpolateImageFunction<itk::Image<float, 3>, double, float>>;
+  auto image = MakeRampImage(8, 1);
+  auto interpolator = InterpolatorType::New();
+  interpolator->SetSplineOrder(3);
+  itk::ImpactModelConfiguration config(
+    ToyModelPath(), 3, 1, { 0, 0, 0 }, { 1.f, 1.f, 1.f }, { 2, 2, 2 }, { true, true }, false);
+  const auto factory = CountingContainerFactory::New();
+  itk::ObjectFactoryBase::RegisterFactory(factory);
+  CountingContainer::Bytes() = 0;
+  auto filter = FeatMapType::New();
+  filter->SetModelConfiguration(config);
+  filter->SetInterpolator(interpolator);
+  filter->AddInput(image);
+  filter->SetPCA(2);
+  filter->SetDevice("cpu");
+  filter->Update();
+  const std::size_t voxels = 8 * 8 * 8;
+  // The input (1 channel), the layers before the PCA (4 and 2 channels) and after it (2 and 2).
+  EXPECT_GE(CountingContainer::Bytes(), voxels * (1 + 4 + 2 + 2 + 2) * sizeof(float));
+  const std::size_t before = CountingContainer::Bytes();
+  auto              mapInterpolator = MapInterpolatorType::New();
+  mapInterpolator->SetInputImage(filter->GetOutput(0));
+  mapInterpolator->SetActiveChannels({ 0, 1 });
+  // Each channel's coefficients and the active channels' side by side.
+  EXPECT_GE(CountingContainer::Bytes() - before, voxels * (2 + 2) * sizeof(float));
+  itk::ObjectFactoryBase::UnRegisterFactory(factory);
 }
 
 // --- A2: the model and patches run on CUDA when a GPU is available ------------

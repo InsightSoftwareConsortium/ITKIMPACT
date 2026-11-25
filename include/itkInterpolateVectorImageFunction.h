@@ -31,6 +31,7 @@
 #ifndef itkInterpolateVectorImageFunction_h
 #define itkInterpolateVectorImageFunction_h
 
+#include <itkImportImageContainer.h>
 #include <itkVectorImage.h>
 #include <torch/torch.h>
 #include <itkInterpolateImageFunction.h>
@@ -155,10 +156,13 @@ private:
                    float *                           values,
                    float *                           derivatives) const;
 
-  ImagePointer              m_VectorImage;
-  std::vector<float>        m_Coefficients; // one channel after the other, each voxel after voxel (axis 0 fastest)
-  std::vector<unsigned int> m_ActiveChannels;
-  std::vector<float>        m_ActiveCoefficients; // voxel after voxel, the active channels side by side
+  // Image buffers, which a process that keeps its images in files (elastix -out-of-core) keeps there.
+  using BufferType = ImportImageContainer<SizeValueType, float>;
+
+  ImagePointer                 m_VectorImage;
+  typename BufferType::Pointer m_Coefficients; // one channel after the other, each voxel after voxel (axis 0 fastest)
+  std::vector<unsigned int>    m_ActiveChannels;
+  typename BufferType::Pointer m_ActiveCoefficients; // voxel after voxel, the active channels side by side
 };
 
 } // end namespace itk

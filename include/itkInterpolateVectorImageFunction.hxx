@@ -33,7 +33,8 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::SetInputImage(ImagePointe
   using ChannelImageType = itk::Image<float, TImage::ImageDimension>;
   const unsigned int channels = vectorImage->GetVectorLength();
   const size_t       voxels = vectorImage->GetBufferedRegion().GetNumberOfPixels();
-  std::vector<float> coefficients(voxels * channels);
+  const auto coefficients = BufferType::New();
+  coefficients->Reserve(voxels * channels);
   for (unsigned int channel = 0; channel < channels; ++channel)
   {
     auto selector = itk::VectorIndexSelectionCastImageFilter<TImage, ChannelImageType>::New();
@@ -44,12 +45,12 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::SetInputImage(ImagePointe
     decomposition->SetSplineOrder(3);
     decomposition->Update();
     const auto * channelCoefficients = decomposition->GetOutput()->GetBufferPointer();
-    std::copy(channelCoefficients, channelCoefficients + voxels, coefficients.begin() + channel * voxels);
+    std::copy(channelCoefficients, channelCoefficients + voxels, coefficients->GetBufferPointer() + channel * voxels);
   }
   this->m_VectorImage = vectorImage;
-  this->m_Coefficients = std::move(coefficients);
+  this->m_Coefficients = coefficients;
   this->m_ActiveChannels.clear();
-  this->m_ActiveCoefficients.clear();
+  this->m_ActiveCoefficients = nullptr;
 } // end SetInputImage
 
 /**
@@ -66,13 +67,20 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::SetActiveChannels(
   }
   const size_t voxels = this->m_VectorImage->GetBufferedRegion().GetNumberOfPixels();
   const size_t channels = subsetOfFeatures.size();
-  this->m_ActiveCoefficients.resize(voxels * channels);
+  this->m_ActiveCoefficients = BufferType::New();
+  this->m_ActiveCoefficients->Reserve(voxels * channels);
+  // Written voxel after voxel, as it is laid out, each channel read in order: one pass over every buffer.
+  float * const                active = this->m_ActiveCoefficients->GetBufferPointer();
+  std::vector<const float *> sources(channels);
   for (size_t c = 0; c < channels; ++c)
   {
-    const float * channel = this->m_Coefficients.data() + subsetOfFeatures[c] * voxels;
-    for (size_t voxel = 0; voxel < voxels; ++voxel)
+    sources[c] = this->m_Coefficients->GetBufferPointer() + subsetOfFeatures[c] * voxels;
+  }
+  for (size_t voxel = 0; voxel < voxels; ++voxel)
+  {
+    for (size_t c = 0; c < channels; ++c)
     {
-      this->m_ActiveCoefficients[voxel * channels + c] = channel[voxel];
+      active[voxel * channels + c] = sources[c][voxel];
     }
   }
   this->m_ActiveChannels = subsetOfFeatures;
@@ -201,7 +209,8 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::EvaluateChannels(
       };
       if (active)
       {
-        const float * coefficients = this->m_ActiveCoefficients.data() + offset * subsetOfFeatures.size() + first;
+        const float * coefficients =
+          this->m_ActiveCoefficients->GetBufferPointer() + offset * subsetOfFeatures.size() + first;
         for (size_t c = 0; c < channels; ++c)
         {
           accumulate(c, coefficients[c]);
@@ -209,7 +218,7 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::EvaluateChannels(
       }
       else
       {
-        const float * coefficients = this->m_Coefficients.data() + offset;
+        const float * coefficients = this->m_Coefficients->GetBufferPointer() + offset;
         for (size_t c = 0; c < channels; ++c)
         {
           accumulate(c, coefficients[channel[c] * voxels]);
