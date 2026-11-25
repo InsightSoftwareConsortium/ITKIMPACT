@@ -186,8 +186,10 @@ SameGrid(const TA * a, const TB * b)
 }
 
 /** The region of a grid (`spatial` in tensor order, `index` its first index) that the cells [c0, c1) of `windows`
- * span, `extra` voxels around on each tensor axis, clipped to the grid and starting on a multiple of `align` voxels
- * from the grid's first: `lowPad` what that left of the margin on the low side. */
+ * span, `extra` voxels around on each tensor axis, clipped to the grid, starting on a multiple of `align` voxels from
+ * the grid's first and ending on one from its last: a model that flips an axis (TotalSegmentator reorients what it
+ * is handed) anchors a coarse layer's samples at the end of what it reads, which then lie where the whole grid's do.
+ * `lowPad` is what that left of the margin on the low side. */
 template <typename TRegion>
 TRegion
 CellSpan(const std::vector<int64_t> &        c0,
@@ -208,7 +210,8 @@ CellSpan(const std::vector<int64_t> &        c0,
     const int64_t end = windows[d].ends[c1[d] - 1];
     const int64_t margin = std::max<int64_t>(0, first - extra[d]);
     const int64_t low = margin - margin % align;
-    const int64_t high = std::min<int64_t>(spatial[d], end + extra[d]);
+    const int64_t past = std::max<int64_t>(0, spatial[d] - end - extra[d]);
+    const int64_t high = spatial[d] - (past - past % align);
     start[Dim - 1 - d] = static_cast<IndexValueType>(low) + index[Dim - 1 - d];
     size[Dim - 1 - d] = static_cast<SizeValueType>(high - low);
     lowPad[d] = first - low;
