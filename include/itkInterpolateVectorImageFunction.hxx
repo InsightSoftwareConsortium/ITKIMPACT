@@ -103,9 +103,10 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::EvaluateChannels(
   // ApplyMirrorBoundaryConditions(), then EvaluateValueAndDerivativeAtContinuousIndexInternal().
   constexpr unsigned int Dimension = ImageDimension;
   constexpr unsigned int Support = 4;
-  using CoordRepType = typename TInterpolator::CoordRepType;
-  const Point<CoordRepType, Dimension> coordinatePoint(point);
-  const auto x = this->m_VectorImage->template TransformPhysicalPointToContinuousIndex<CoordRepType>(coordinatePoint);
+  using PointCoordinate = typename TInterpolator::CoordRepType;
+  const Point<PointCoordinate, Dimension> coordinatePoint(point);
+  const auto                              x =
+    this->m_VectorImage->template TransformPhysicalPointToContinuousIndex<PointCoordinate>(coordinatePoint);
 
   const auto & region = this->m_VectorImage->GetBufferedRegion();
   size_t       offsets[Dimension][Support];
