@@ -1148,6 +1148,23 @@ PcaSampleMean(const torch::Tensor & sample)
   return sample.reshape({ sample.size(0), -1 }).mean(1, /*keepdim=*/true);
 }
 
+/** A tensor {C, spatial...} cut along its first spatial axis into slabs of about 2^24 values, a
+ * plane at least: what a map larger than the memory is read through, a slab of pages at a time.
+ * They depend on the shape alone, so a map gives the same values held or mapped from a file. */
+inline std::vector<torch::Tensor>
+Slabs(const torch::Tensor & features)
+{
+  const int64_t              depth = features.size(1);
+  const int64_t              plane = std::max<int64_t>(features.numel() / std::max<int64_t>(depth, 1), 1);
+  const int64_t              rows = std::max<int64_t>((int64_t{ 1 } << 24) / plane, 1);
+  std::vector<torch::Tensor> slabs;
+  for (int64_t start = 0; start < depth; start += rows)
+  {
+    slabs.push_back(features.narrow(1, start, std::min(rows, depth - start)));
+  }
+  return slabs;
+}
+
 /** Reduce a feature tensor {C, spatial...} to `components` principal components. A model of the
  * image's dimension (`sweepDimension` 0) has its map fitted and centred whole; a swept model's is
  * read through PcaSlices along tensor dimension `sweepDimension`. `basis` is fitted first when

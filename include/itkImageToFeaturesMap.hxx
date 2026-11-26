@@ -21,7 +21,8 @@
 
 #include "itkImpactModelConfigurationDetail.h"
 #include "itkImageToFeaturesMapInternals.h"
-#include "ImpactLoss.h" // NormalizeFeatureChannels
+#include "itkImpactRegionSampling.h" // PcaSums
+#include "ImpactLoss.h"              // NormalizeFeatureChannels
 
 #include <algorithm>
 #include <cmath>
@@ -126,7 +127,6 @@ template <typename TInputImage, typename TInterpolator>
 void
 ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
 {
-  using TensorToImageFilterType = itk::TensorToImageFilter<ImageDimension>;
   const torch::Device device(m_Device);
 
   // Pure inference: no gradient flows back through the model here. Without the guard every
@@ -146,18 +146,19 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
   ModelTo(m_ModelConfiguration, device);
 
   // Everything below is the tiling, which itkImpactPatchTiling.h owns and the registration
-  // filters share. This filter only decides where the map lands: with PCA it has to exist as a
-  // tensor to be projected, so the accumulator allocates; without it, the map is blended straight
-  // into the output image's pixels and never exists twice.
-  const bool blendInPlace = (m_PCA == 0);
-
-  std::vector<typename OutputImageType::Pointer> images;
+  // filters share. This filter only decides where the map lands: in the output image's pixels,
+  // or with PCA in an image of the layer's own channels until they are projected. Both are images,
+  // which a process that keeps its images in files (elastix -out-of-core) keeps there, and they
+  // are read a slab at a time below (Impact::Slabs): no map exists whole in memory.
+  std::vector<typename OutputImageType::Pointer> layers; // declared before the maps that view them
   auto makeDestination = [&](std::size_t layerIndex, const std::vector<int64_t> & shape) -> torch::Tensor {
-    if (!blendInPlace)
-    {
-      return {};
-    }
     auto * output = static_cast<OutputImageType *>(this->ProcessObject::GetOutput(layerIndex));
+    if (m_PCA > 0)
+    {
+      layers.resize(std::max(layers.size(), layerIndex + 1));
+      layers[layerIndex] = OutputImageType::New();
+      output = layers[layerIndex].GetPointer();
+    }
     return AllocateFeatureImage<ImageDimension>(this->GetInput(0), shape, output);
   };
 
@@ -172,17 +173,18 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
                   makeDestination,
                   static_cast<int>(sweepAxis));
 
+  // `maps` are views of the images' pixels, normalized where they lie (each voxel over its channels),
+  // and before the PCA, as every IMPACT consumer orders them.
   const std::string & normalization = m_ModelConfiguration.GetFeatureNormalization();
-  if (blendInPlace)
+  for (const torch::Tensor & map : maps)
   {
-    // The output images already hold the maps -- `maps` are views of their pixels, normalized where they lie.
-    for (const torch::Tensor & map : maps)
+    for (const torch::Tensor & slab : normalization != "none" ? Impact::Slabs(map) : std::vector<torch::Tensor>{})
     {
-      if (normalization != "none")
-      {
-        map.copy_(Impact::NormalizeFeatureChannels(map, normalization, 0));
-      }
+      slab.copy_(Impact::NormalizeFeatureChannels(slab, normalization, 0));
     }
+  }
+  if (m_PCA == 0)
+  {
     return;
   }
 
@@ -196,17 +198,45 @@ ImageToFeaturesMap<TInputImage, TInterpolator>::GenerateData()
   }
   for (std::size_t i = 0; i < maps.size(); ++i)
   {
-    // A fresh converter per layer: a shared one would let a later layer's Update() overwrite the
-    // buffer already grafted for an earlier layer.
-    auto tensorToImageFilter = TensorToImageFilterType::New();
-    tensorToImageFilter->SetReferenceImage(this->GetInput(0));
     // Fit the PCA basis once (e.g. on the fixed image); reuse it when one was injected (e.g. on
-    // the moving image) so both share the same basis.
-    // Normalized before the PCA, as every IMPACT consumer orders them.
-    const torch::Tensor map = Impact::NormalizeFeatureChannels(maps[i], normalization, 0);
-    tensorToImageFilter->SetTensor(Impact::PcaReduce(map, m_Internals->principalComponents[i], m_PCA, sweepDimension));
-    tensorToImageFilter->Update();
-    this->ProcessObject::GetOutput(i)->Graft(tensorToImageFilter->GetOutput());
+    // the moving image) so both share the same basis. Each image is centred by its own features'
+    // mean: of the whole map, or of a swept model's slices that PcaSlices reads, summed a slab or a
+    // slice at a time.
+    const std::vector<torch::Tensor> slabs = Impact::Slabs(maps[i]);
+    const int64_t                    channels = maps[i].size(0);
+    Impact::PcaSums                  sums;
+    if (sweepDimension > 0)
+    {
+      const int64_t       depth = maps[i].size(sweepDimension);
+      const torch::Tensor slices = Impact::PcaSlices(torch::arange(depth).view({ 1, depth }), 1).flatten();
+      for (int64_t k = 0; k < slices.numel(); ++k)
+      {
+        sums.Add(maps[i].narrow(sweepDimension, slices[k].item<int64_t>(), 1).reshape({ channels, -1 }));
+      }
+    }
+    else
+    {
+      for (const torch::Tensor & slab : slabs)
+      {
+        sums.Add(slab.reshape({ channels, -1 }));
+      }
+    }
+    torch::Tensor & basis = m_Internals->principalComponents[i];
+    if (!basis.defined())
+    {
+      basis = sums.Basis(static_cast<int64_t>(m_PCA));
+    }
+    const torch::Tensor  mean = sums.Mean();
+    std::vector<int64_t> shape = maps[i].sizes().vec();
+    shape[0] = basis.size(1);
+    auto * const        output = static_cast<OutputImageType *>(this->ProcessObject::GetOutput(i));
+    const torch::Tensor projected = AllocateFeatureImage<ImageDimension>(this->GetInput(0), shape, output);
+    int64_t             start = 0;
+    for (const torch::Tensor & slab : slabs)
+    {
+      projected.narrow(1, start, slab.size(1)).copy_(Impact::PcaTransform(slab, basis, mean));
+      start += slab.size(1);
+    }
   }
 }
 

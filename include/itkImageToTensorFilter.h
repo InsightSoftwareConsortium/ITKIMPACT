@@ -19,6 +19,7 @@
 #ifndef itkImageToTensorFilter_h
 #define itkImageToTensorFilter_h
 
+#include <itkImage.h>
 #include <itkProcessObject.h>
 #include <torch/torch.h>
 #include <itkSimpleDataObjectDecorator.h>

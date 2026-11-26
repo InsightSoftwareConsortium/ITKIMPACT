@@ -500,6 +500,44 @@ MovingMaskThroughAField(const ImageType *   fixed,
   }
   return EXIT_SUCCESS;
 }
+
+// A moving image on a grid of its own, part of it past the fixed one, and its mask on a third: by regions the field
+// is the whole run's, which reads them through ITK's resampler (an edge sample within half a voxel past an image,
+// zero further).
+int
+MovingOnItsOwnGrid(const ImageType * fixed, FieldType * start)
+{
+  const ImageType::Pointer moving = Texture(fixed->GetLargestPossibleRegion().GetSize(), 1.5, -1.0, 0.5);
+  moving->SetSpacing(itk::MakeVector(1.1, 0.95, 1.05));
+  moving->SetOrigin(itk::MakePoint(-1.7, 2.3, 0.6));
+  const auto mask = CoarseCutMask(moving);
+  auto       run = [&](bool regions) {
+    auto fine = FineType::New();
+    fine->SetFixedImage(fixed);
+    fine->SetMovingImage(moving);
+    fine->SetMovingMask(mask);
+    fine->SetInitialDisplacementField(start);
+    Configure(fine, 6);
+    if (regions)
+    {
+      ByRegions(fine, 0, 0, false, "");
+    }
+    fine->Update();
+    return fine;
+  };
+  const auto   whole = run(false);
+  const auto   regions = run(true);
+  const double difference = MaxDifference(whole->GetOutput(), regions->GetOutput(), fixed->GetLargestPossibleRegion());
+  std::cout << "a moving image and its mask on grids of their own, whole vs by regions: max |difference| = "
+            << difference << " mm" << std::endl;
+  if (!(difference < 1e-5))
+  {
+    std::cerr << "By regions, a moving image on a grid of its own is read otherwise than the whole run reads it."
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}
 } // namespace
 
 int
@@ -1820,7 +1858,8 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   }
 
   // 22. Checks of their own, each printing what it compares.
-  if (MovingMaskThroughAField(fixed, moving, start, temporary) != EXIT_SUCCESS)
+  if (MovingMaskThroughAField(fixed, moving, start, temporary) != EXIT_SUCCESS ||
+      MovingOnItsOwnGrid(fixed, start) != EXIT_SUCCESS)
   {
     return EXIT_FAILURE;
   }

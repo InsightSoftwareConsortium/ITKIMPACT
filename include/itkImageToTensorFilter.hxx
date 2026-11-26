@@ -129,8 +129,14 @@ ImageToTensorFilter<TInputImage, TInterpolator>::GenerateData()
     newSpacing[d] = newSize[d] > 0 ? oldSize[d] * oldSpacing[d] / newSize[d] : m_OutputSpacing[d];
   }
 
-  // Interpolated intensities, filled with the first image axis varying fastest.
-  std::vector<float> buffer(static_cast<size_t>(numberOfVoxels), 0.0f);
+  // Interpolated intensities, filled with the first image axis varying fastest, in the buffer of an image the tensor
+  // below is a view of: one copy of the volume, which a process that keeps its images in files (elastix -out-of-core)
+  // keeps there.
+  using ResampledImageType = Image<float, ImageDimension>;
+  const auto resampled = ResampledImageType::New();
+  resampled->SetRegions(typename ResampledImageType::RegionType(newSize));
+  resampled->Allocate(true);
+  float * const buffer = resampled->GetBufferPointer();
 
   // Sampling points go through the image's own index-to-physical map, so the direction cosines
   // are applied. The resampled grid shares the input's origin and orientation and differs only
@@ -177,8 +183,9 @@ ImageToTensorFilter<TInputImage, TInterpolator>::GenerateData()
     tensorShape[d] = static_cast<int64_t>(newSize[ImageDimension - 1 - d]);
   }
 
-  // clone() so the tensor owns its memory after `buffer` goes out of scope.
-  torch::Tensor tensor = torch::from_blob(buffer.data(), tensorShape, torch::kFloat32).clone();
+  // The tensor's storage holds the image, which goes with it.
+  torch::Tensor tensor =
+    torch::from_blob(buffer, tensorShape, [image = resampled](void *) mutable { image = nullptr; }, torch::kFloat32);
 
   this->GetOutputTensorDataObject()->Set(std::make_shared<TensorType>(tensor));
 }
