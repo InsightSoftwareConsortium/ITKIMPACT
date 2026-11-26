@@ -713,12 +713,13 @@ MetadataByBlocks(const TDirection & direction, unsigned int dim, TReadBlocks && 
   return metadata;
 }
 
-/** An image region ({1, 1, span...}) as a model takes it: in its precision, its channels repeated. */
+/** An image region ({1, 1, span...}) as a model takes it: its channels repeated, in single precision, which Forward
+ * brings to the model's. */
 template <unsigned int Dim>
 torch::Tensor
 ModelInput(const ImpactModelConfiguration & config, const torch::Tensor & image)
 {
-  torch::Tensor input = image.to(GetModelDtype(config));
+  torch::Tensor input = image.to(torch::kFloat32);
   if (config.GetNumberOfChannels() > 1)
   {
     std::vector<int64_t> repeats(Dim + 2, 1);

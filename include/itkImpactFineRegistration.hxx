@@ -161,7 +161,7 @@ PatchCentreFeatures(const ImpactModelConfiguration & config,
 {
   std::vector<int64_t> repeat(patches.dim(), 1);
   repeat[1] = static_cast<int64_t>(config.GetNumberOfChannels());
-  std::vector<torch::jit::IValue> outputs = Forward(config, patches.repeat(repeat).to(GetModelDtype(config)), metadata);
+  std::vector<torch::jit::IValue> outputs = Forward(config, patches.repeat(repeat), metadata);
   const std::vector<bool> &       mask = config.GetLayersMask();
   std::vector<torch::Tensor>      layers;
   for (size_t it = 0; it < outputs.size() && it < mask.size(); ++it)
