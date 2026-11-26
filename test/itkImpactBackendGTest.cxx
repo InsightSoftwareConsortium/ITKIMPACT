@@ -364,9 +364,9 @@ MapTensor(const itk::VectorImage<float, 3> & map)
 {
   const auto & size = map.GetLargestPossibleRegion().GetSize();
   const auto   channels = static_cast<int64_t>(map.GetNumberOfComponentsPerPixel());
-  return torch::from_blob(const_cast<float *>(map.GetBufferPointer()),
-                          { static_cast<int64_t>(size[2]), static_cast<int64_t>(size[1]), static_cast<int64_t>(size[0]),
-                            channels })
+  return torch::from_blob(
+           const_cast<float *>(map.GetBufferPointer()),
+           { static_cast<int64_t>(size[2]), static_cast<int64_t>(size[1]), static_cast<int64_t>(size[0]), channels })
     .permute({ 3, 0, 1, 2 })
     .clone();
 }
@@ -406,9 +406,9 @@ TEST(ImpactBackend, ImageToFeaturesMapPcaIsTheMapsProjection)
 TEST(ImpactBackend, ImageToFeaturesMapKeepsItsVolumesInImageBuffers)
 {
   using FeatMapType = itk::ImageToFeaturesMap<ImageType, InterpolatorType>;
-  using MapInterpolatorType = itk::InterpolateVectorImageFunction<
-    itk::VectorImage<float, 3>,
-    itk::BSplineInterpolateImageFunction<itk::Image<float, 3>, double, float>>;
+  using MapInterpolatorType =
+    itk::InterpolateVectorImageFunction<itk::VectorImage<float, 3>,
+                                        itk::BSplineInterpolateImageFunction<itk::Image<float, 3>, double, float>>;
   auto image = MakeRampImage(8, 1);
   auto interpolator = InterpolatorType::New();
   interpolator->SetSplineOrder(3);

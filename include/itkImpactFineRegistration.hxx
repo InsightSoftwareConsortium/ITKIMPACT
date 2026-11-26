@@ -1714,8 +1714,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   auto * movingSource = const_cast<MovingImageType *>(m_MovingImage.GetPointer());
   fixedSource->UpdateOutputInformation();
   movingSource->UpdateOutputInformation();
-  const RegionType                           fixedRegion = m_FixedImage->GetLargestPossibleRegion();
-  std::vector<int64_t>                       spatial(Dim); // tensor order (z, y, x)
+  const RegionType     fixedRegion = m_FixedImage->GetLargestPossibleRegion();
+  std::vector<int64_t> spatial(Dim); // tensor order (z, y, x)
   for (unsigned int d = 0; d < Dim; ++d)
   {
     spatial[d] = static_cast<int64_t>(fixedRegion.GetSize()[Dim - 1 - d]);
@@ -2094,7 +2094,8 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
     m_MovingModelsConfiguration.empty() ? m_FixedModelsConfiguration : m_MovingModelsConfiguration;
   // A metadata-aware model (MIND reads the image's range) takes the image's statistics: one pass over each image, all
   // its voxels, in blocks of the box size, as the dense run's StatisticsImageFilter takes them: the moving ones on the
-  // fixed grid, as the dense run reads it resampled there (past the moving image, zeros), its direction the fixed one's.
+  // fixed grid, as the dense run reads it resampled there (past the moving image, zeros), its direction the fixed
+  // one's.
   ImpactImageMetadata fixedMetadata, movingMetadata;
   if (takesMetadata)
   {

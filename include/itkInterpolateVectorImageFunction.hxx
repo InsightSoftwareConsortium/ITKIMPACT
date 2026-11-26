@@ -33,7 +33,7 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::SetInputImage(ImagePointe
   using ChannelImageType = itk::Image<float, TImage::ImageDimension>;
   const unsigned int channels = vectorImage->GetVectorLength();
   const size_t       voxels = vectorImage->GetBufferedRegion().GetNumberOfPixels();
-  const auto coefficients = BufferType::New();
+  const auto         coefficients = BufferType::New();
   coefficients->Reserve(voxels * channels);
   for (unsigned int channel = 0; channel < channels; ++channel)
   {
@@ -70,7 +70,7 @@ InterpolateVectorImageFunction<TImage, TInterpolator>::SetActiveChannels(
   this->m_ActiveCoefficients = BufferType::New();
   this->m_ActiveCoefficients->Reserve(voxels * channels);
   // Written voxel after voxel, as it is laid out, each channel read in order: one pass over every buffer.
-  float * const                active = this->m_ActiveCoefficients->GetBufferPointer();
+  float * const              active = this->m_ActiveCoefficients->GetBufferPointer();
   std::vector<const float *> sources(channels);
   for (size_t c = 0; c < channels; ++c)
   {

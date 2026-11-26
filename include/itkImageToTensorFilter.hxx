@@ -184,8 +184,8 @@ ImageToTensorFilter<TInputImage, TInterpolator>::GenerateData()
   }
 
   // The tensor's storage holds the image, which goes with it.
-  torch::Tensor tensor = torch::from_blob(
-    buffer, tensorShape, [image = resampled](void *) mutable { image = nullptr; }, torch::kFloat32);
+  torch::Tensor tensor =
+    torch::from_blob(buffer, tensorShape, [image = resampled](void *) mutable { image = nullptr; }, torch::kFloat32);
 
   this->GetOutputTensorDataObject()->Set(std::make_shared<TensorType>(tensor));
 }
