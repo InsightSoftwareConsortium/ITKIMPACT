@@ -315,49 +315,78 @@ ImageLattice(size_t dim)
   return { std::vector<int64_t>(dim, 1), std::vector<bool>(dim, false) };
 }
 
-/** The lattices of the `layers` a model gave for a probe of `LatticeProbe` voxels along every axis, one more than a
- * power of two: a layer of 64 / s samples keeps whole samples every s voxels, one of 64 / s + 1 a partial last one. */
+/** The two probes a layer's lattice is told from, of `LatticeProbe` and of `SecondLatticeProbe` voxels along every
+ * axis, one more than a power of two each. A layer whose samples fit a power of two up to 64 lies on it, as the first
+ * probe alone told; the two tell every other stride up to 9 (each way its last sample may go) from any other. */
+// ponytail: a stride of 10 or more that is no power of two may fit none or several and be refused, or fit a power of
+// two and be taken on it; a probe of another size tells more of them.
 constexpr int64_t LatticeProbe = 65;
+constexpr int64_t SecondLatticeProbe = 129;
 
-/** The stride of the lattice of `samples` samples along an axis of the probe, and whether its last is `partial`; 0 for
- * none. */
-inline int64_t
-ProbeStride(int64_t samples, bool & partial)
+/** A probe of `voxels` voxels along every axis of a `Dim`-dimensional image: {1, 1, voxels...} zeros on `device`. */
+template <unsigned int Dim>
+torch::Tensor
+LatticeProbeImage(int64_t voxels, const torch::Device & device)
 {
-  auto          powerOfTwo = [](int64_t n) { return n > 0 && (n & (n - 1)) == 0; };
-  const int64_t whole = LatticeProbe - 1;
-  partial = false;
-  if (samples == LatticeProbe)
-  {
-    return 1;
-  }
-  if (samples > 0 && whole % samples == 0 && powerOfTwo(whole / samples))
-  {
-    return whole / samples;
-  }
-  partial = samples > 1 && whole % (samples - 1) == 0 && powerOfTwo(whole / (samples - 1));
-  return partial ? whole / (samples - 1) : 0;
+  std::vector<int64_t> shape(Dim + 2, voxels);
+  shape[0] = shape[1] = 1;
+  return torch::zeros(shape, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 }
 
+/** The stride of the lattice on which an axis has `samples` samples for the first probe and `second` for the second,
+ * and whether its last is `partial`: a power of two when one fits, else the one stride that fits; 0 for none, or for
+ * more than one. */
+inline int64_t
+ProbeStride(int64_t samples, int64_t second, bool & partial)
+{
+  int64_t found = 0, fits = 0;
+  bool    foundPartial = false;
+  for (int64_t stride = 1; stride < LatticeProbe; ++stride)
+  {
+    for (const bool last : { false, true })
+    {
+      const LayerLattice lattice{ { stride }, { last } };
+      if ((last && stride == 1) || lattice.Samples(0, LatticeProbe) != samples ||
+          lattice.Samples(0, SecondLatticeProbe) != second)
+      {
+        continue;
+      }
+      if ((stride & (stride - 1)) == 0)
+      {
+        partial = last;
+        return stride;
+      }
+      found = stride;
+      foundPartial = last;
+      ++fits;
+    }
+  }
+  partial = foundPartial;
+  return fits == 1 ? found : 0;
+}
+
+/** The lattices of the `layers` a model gave for the first probe, `second` being those it gave for the second. */
 template <unsigned int Dim>
 std::vector<LayerLattice>
-LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
+LayerLattices(const std::vector<torch::Tensor> & layers, const std::vector<torch::Tensor> & second, const char * who)
 {
   std::vector<LayerLattice> lattices;
-  for (const torch::Tensor & layer : layers)
+  for (size_t l = 0; l < layers.size(); ++l)
   {
     LayerLattice lattice = ImageLattice(Dim);
     for (unsigned int d = 0; d < Dim; ++d)
     {
-      bool partial = false;
-      lattice.stride[d] = ProbeStride(layer.size(2 + static_cast<int64_t>(d)), partial);
+      bool          partial = false;
+      const int64_t axis = 2 + static_cast<int64_t>(d);
+      lattice.stride[d] = ProbeStride(layers[l].size(axis), second[l].size(axis), partial);
       lattice.partial[d] = partial;
       if (lattice.stride[d] == 0)
       {
-        itkGenericExceptionMacro(<< who << ": a feature layer of " << layer.sizes() << " for an image of "
-                                 << LatticeProbe
-                                 << " voxels a side lies on no lattice of the image's (a power of "
-                                    "two of its voxels), which RegionSize needs to compute it by regions.");
+        itkGenericExceptionMacro(
+          << who << ": a feature layer of " << layers[l].sizes() << " and " << second[l].sizes() << " for images of "
+          << LatticeProbe << " and " << SecondLatticeProbe
+          << " voxels a side lies on no lattice of the image's voxels that they tell (a sample every so many "
+             "voxels), which RegionSize needs to compute it by regions.");
       }
     }
     lattices.push_back(lattice);
@@ -366,9 +395,9 @@ LayerLattices(const std::vector<torch::Tensor> & layers, const char * who)
 }
 
 /** The lattices of the kept layers of the fixed and of the moving models, and what the regions read for the features
- * take from them: a layer coarser than the image lies on the image's lattice every `align` voxels, so the regions
- * start on it, and they reach, past the models' halo, what pooling the whole layer to the cells reads beyond a cell's
- * own voxels. */
+ * take from them: every layer lies on the image's lattice every `align` voxels (the least common multiple of their
+ * strides), so the regions start on it, and they reach, past the models' halo, what pooling the whole layer to the
+ * cells reads beyond a cell's own voxels: less than a cell and two samples of the coarsest layer. */
 struct RegionLattices
 {
   std::vector<LayerLattice> fixed;
@@ -388,35 +417,40 @@ ProbeRegionLattices(const std::vector<int64_t> & halo,
                     TLayersOf &&                 layersOf,
                     const char *                 who)
 {
-  std::vector<int64_t> shape(Dim + 2, LatticeProbe);
-  shape[0] = shape[1] = 1;
-  const torch::Tensor probe = torch::zeros(shape, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  const torch::Tensor probe = LatticeProbeImage<Dim>(LatticeProbe, device);
+  const torch::Tensor second = LatticeProbeImage<Dim>(SecondLatticeProbe, device);
   RegionLattices      lattices;
-  lattices.fixed = LayerLattices<Dim>(layersOf(probe, false), who);
-  lattices.moving = ownMovingModels ? LayerLattices<Dim>(layersOf(probe, true), who) : lattices.fixed;
+  lattices.fixed = LayerLattices<Dim>(layersOf(probe, false), layersOf(second, false), who);
+  lattices.moving =
+    ownMovingModels ? LayerLattices<Dim>(layersOf(probe, true), layersOf(second, true), who) : lattices.fixed;
+  int64_t coarsest = 1;
   for (const auto * side : { &lattices.fixed, &lattices.moving })
   {
     for (const LayerLattice & lattice : *side)
     {
-      lattices.align = std::max(lattices.align, *std::max_element(lattice.stride.begin(), lattice.stride.end()));
+      for (const int64_t stride : lattice.stride)
+      {
+        lattices.align = std::lcm(lattices.align, stride);
+        coarsest = std::max(coarsest, stride);
+      }
     }
   }
   lattices.reach = halo;
-  for (unsigned int d = 0; d < Dim && lattices.align > 1; ++d)
+  for (unsigned int d = 0; d < Dim && coarsest > 1; ++d)
   {
-    lattices.reach[d] += cellVoxels[d] + 2 * lattices.align;
+    lattices.reach[d] += cellVoxels[d] + 2 * coarsest;
   }
   return lattices;
 }
 
 /** A layer ({1, C, samples...}) of a span of the image, pooled over the cells [c0, c1) as the whole-image run pools
- * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. One coarser along any axis:
- * the whole layer is adaptive-average pooled to the cells along every axis, so each cell takes the samples that
- * pooling gives it. `lowPad` is where the cells start in the span, `spatial` the image; the span starts on the
- * layer's lattice and holds those samples (CellSpan's `align` and `extra`). With `keep`, a tensor spatial axis along
- * which a swept model keeps the image's voxels, the layer is pooled as the whole-image run pools a swept one: its
- * samples along `keep` kept, those of the cells' voxels (and of the voxels past the last cell, with the last), and
- * adaptive-average pooled to the cells along the others. */
+ * the layer whole. A layer at the image's resolution: over the cells' voxels, `windows`. One coarser along any axis,
+ * however coarse: the whole layer is adaptive-average pooled to the cells along every axis, so each cell takes the
+ * samples that pooling gives it (one or two of a layer coarser than the cells). `lowPad` is where the cells start in
+ * the span, `spatial` the image; the span starts on the layer's lattice and holds those samples (CellSpan's `align` and
+ * `extra`). With `keep`, a tensor spatial axis along which a swept model keeps the image's voxels, the layer is pooled
+ * as the whole-image run pools a swept one: its samples along `keep` kept, those of the cells' voxels (and of the
+ * voxels past the last cell, with the last), and adaptive-average pooled to the cells along the others. */
 template <unsigned int Dim>
 torch::Tensor
 PoolLayerToCells(torch::Tensor                    layer,
@@ -439,11 +473,10 @@ PoolLayerToCells(torch::Tensor                    layer,
     const int64_t length = lattice.Samples(d, spatial[d]);    // the whole layer's samples
     const bool    kept = static_cast<int64_t>(d) == keep;
     const int64_t cells = kept ? length : static_cast<int64_t>(windows[d].starts.size());
-    if (low % stride != 0 || (stride > 1 && length < cells))
+    if (low % stride != 0)
     {
-      itkGenericExceptionMacro(<< who << ": a feature layer " << stride << " times coarser than the image, of "
-                               << length << " samples for " << cells
-                               << " cells, cannot be pooled to the cells by regions: it must be no coarser than they.");
+      itkGenericExceptionMacro(<< who << ": the region read around the cells starts off the lattice of a feature layer "
+                               << stride << " times coarser than the image.");
     }
     // Output i's samples on the whole layer: [start(i), end(i)); along `keep`, its samples are the voxels.
     auto start = [&](int64_t i) { return atImage ? windows[d].starts[i] : i * length / cells; };
@@ -1103,7 +1136,7 @@ struct FeatureGrid
 
 /** The grid of the models of `configSets` on an image of `spatial` voxels (tensor order) and `spacing` (ITK order)
  * whose cells pool `windows`: the one every model with a voxel size on each axis resamples the image to, which must be
- * one and no coarser than the cells; the image's without. */
+ * one; the image's without. */
 template <unsigned int Dim>
 FeatureGrid
 ModelFeatureGrid(const std::vector<const std::vector<ImpactModelConfiguration> *> & configSets,
@@ -1142,12 +1175,6 @@ ModelFeatureGrid(const std::vector<const std::vector<ImpactModelConfiguration> *
   for (unsigned int d = 0; grid.resamples && d < Dim; ++d)
   {
     const int64_t cells = static_cast<int64_t>(windows[d].starts.size());
-    if (grid.spatial[d] < cells)
-    {
-      itkGenericExceptionMacro(<< who << ": the voxel size gives the models a grid of " << grid.spatial[d]
-                               << " samples along an axis of " << cells
-                               << " cells; with RegionSize their layers must be no coarser than the cells.");
-    }
     grid.windows[d] = PoolWindows{};
     for (int64_t c = 0; c < cells; ++c)
     {
@@ -1249,22 +1276,20 @@ GatherNorms(const std::vector<ImpactModelConfiguration> & configs,
     const int64_t count = configs[c].GetDimension() == Dim ? NormCount(configs[c]) : 0;
     for (int64_t k = 0; k < count; ++k)
     {
-      // The stride of the normalisation's input along each axis, from a probe, as a layer's lattice: the sizes of a
-      // short box's input and of its own do not tell it. On no lattice (a valid convolution trims it), the probe's
-      // ratio, as a box's was taken.
-      std::vector<int64_t> probe(Dim + 2, LatticeProbe);
-      probe[0] = probe[1] = 1;
-      const torch::Tensor probed =
-        NormInput(configs[c],
-                  ModelInput<Dim>(configs[c], torch::zeros(probe, torch::TensorOptions().device(device))),
-                  metadata,
-                  norms[c]);
+      // The stride of the normalisation's input along each axis, from the probes, as a layer's lattice: the sizes of
+      // a short box's input and of its own do not tell it. On no lattice (a valid convolution trims it), the first
+      // probe's ratio, as a box's was taken.
+      auto probed = [&](int64_t voxels) {
+        return NormInput(
+          configs[c], ModelInput<Dim>(configs[c], LatticeProbeImage<Dim>(voxels, device)), metadata, norms[c]);
+      };
+      const torch::Tensor  onFirst = probed(LatticeProbe), onSecond = probed(SecondLatticeProbe);
       std::vector<int64_t> strides(Dim);
       for (unsigned int d = 0; d < Dim; ++d)
       {
         bool          partial = false;
-        const int64_t samples = probed.size(2 + static_cast<int64_t>(d));
-        strides[d] = ProbeStride(samples, partial);
+        const int64_t samples = onFirst.size(2 + static_cast<int64_t>(d));
+        strides[d] = ProbeStride(samples, onSecond.size(2 + static_cast<int64_t>(d)), partial);
         if (strides[d] == 0)
         {
           strides[d] = int64_t{ 1 } << std::max<int64_t>(

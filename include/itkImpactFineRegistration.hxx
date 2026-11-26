@@ -2170,6 +2170,27 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
       },
       "ImpactFineRegistration"));
   }
+  // The whole-image run compares a layer coarser than the cells at its own resolution, the field resized to it, where
+  // the cells are compared here.
+  for (const Impact::RegionLattices & on : latticeSets)
+  {
+    for (const auto * side : { &on.fixed, &on.moving })
+    {
+      for (const Impact::LayerLattice & lattice : *side)
+      {
+        for (unsigned int d = 0; d < Dim; ++d)
+        {
+          if (lattice.Samples(d, featureSpatial[d]) < cells[d])
+          {
+            itkExceptionMacro("ImpactFineRegistration: a feature layer of "
+                              << lattice.Samples(d, featureSpatial[d]) << " samples along an axis of " << cells[d]
+                              << " control cells is coarser than they, which RegionSize does not compare; give "
+                                 "GridShrinkFactor at least the layer's stride.");
+          }
+        }
+      }
+    }
+  }
   // A map's lattices; those of a swept model's along ITK axis `axis`.
   auto latticesAlong = [&](int axis) -> const Impact::RegionLattices & {
     return latticeSets[axis < 0 ? 0 : static_cast<size_t>(axis)];
@@ -2625,7 +2646,7 @@ ImpactFineRegistration<TFixedImage, TMovingImage>::SolveByRegions()
   {
     for (const Impact::RegionLattices & on : latticeSets)
     {
-      spanAlign = std::max(spanAlign, on.align);
+      spanAlign = std::lcm(spanAlign, on.align);
       for (unsigned int d = 0; d < Dim; ++d)
       {
         spanExtra[d] = std::max(spanExtra[d], on.reach[d]);

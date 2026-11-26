@@ -183,8 +183,8 @@ moving image ┼─▶ itk::ImpactCoarseRegistration ─▶ initial displacement
   produced for the region requested of it (stream it to a writer). With the maps in mapped files
   that control grid is a mapped file too, kept by the field it backs, and the initial field is read
   by regions: nothing held in memory grows with the image. Static mode, point-wise distances
-  and feature layers at the image's resolution (MIND) or a power of two coarser, no coarser than the
-  control cells; the caller keeps its readers alive.
+  and feature layers at the image's resolution (MIND) or a whole number of voxels coarser, no coarser
+  than the control cells; the caller keeps its readers alive.
 - **The coarse stage by regions.** `SetRegionSize(n)` on `ImpactCoarseRegistration` reads the pair the same
   way: one pass over the boxes (each with its halo, the moving image brought onto the fixed grid region by
   region) extracts the features and pools them to the coarse grid; the cost volume

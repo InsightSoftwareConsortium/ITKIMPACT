@@ -157,6 +157,21 @@ class ImpactToyModelNormQuarter(ImpactToyModelNorm):
         self.conv1 = torch.nn.Conv3d(3, 2, kernel_size=3, stride=4, padding=1, bias=True)
 
 
+class ImpactToyModelLattice(torch.nn.Module):
+    """Layers on lattices that are no power of two of the input's voxels, or coarser than a registration's cells: a
+    convolution of stride 3, its last sample partial (layer 0), an average pooling of 6 voxels (layer 1) and a
+    convolution of stride 16, its last sample partial, as a backbone's deepest layer (layer 2)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv3 = torch.nn.Conv3d(1, 3, kernel_size=3, stride=3, padding=1, bias=True)
+        self.pool6 = torch.nn.AvgPool3d(6)
+        self.conv16 = torch.nn.Conv3d(1, 2, kernel_size=3, stride=16, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        return [self.conv3(x), self.pool6(x), self.conv16(x)]
+
+
 def main() -> None:
     torch.manual_seed(20240601)
     model = ImpactToyModel().eval()
@@ -186,6 +201,11 @@ def main() -> None:
     quarter = ImpactToyModelNormQuarter().eval()
     torch.jit.script(quarter).save("ImpactToyModelNormQuarter.pt")
     print("wrote ImpactToyModelNormQuarter.pt")
+
+    torch.manual_seed(20240601)
+    lattice = ImpactToyModelLattice().eval()
+    torch.jit.script(lattice).save("ImpactToyModelLattice.pt")
+    print("wrote ImpactToyModelLattice.pt")
 
 
 

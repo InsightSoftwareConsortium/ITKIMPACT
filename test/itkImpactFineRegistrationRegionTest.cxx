@@ -547,7 +547,7 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
   {
     std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
               << " <temporary directory> [<model with half-resolution layers> <3x3x3 model> <its 2D counterpart> "
-                 "<a model with instance normalisations>]"
+                 "<a model with instance normalisations> <a model with layers of strides 3, 6 and 16>]"
               << std::endl;
     return EXIT_FAILURE;
   }
@@ -1857,7 +1857,56 @@ itkImpactFineRegistrationRegionTest(int argc, char * argv[])
     }
   }
 
-  // 22. Checks of their own, each printing what it compares.
+  // 22. A model whose layers lie on lattices of 3 and 6 voxels (a strided convolution, its last sample partial, and an
+  // average pooling), on a pair of odd sizes and cells of 8 voxels: each region starts on a multiple of 6 voxels, and
+  // its cells pool the whole layers' samples as the whole-image run pools them. Whole against by regions on the
+  // resident maps, by bricks of one box from mapped files and with every box drawn at every iteration: the fields,
+  // and the losses at every iteration. On cells of 2 voxels, coarser than the first layer, which the whole-image run
+  // then compares at its own resolution, the run by regions is refused.
+  if (argc >= 7)
+  {
+    const ImageType::SizeType odd = { { 49, 41, 33 } };
+    ImageType::Pointer        oddFixed = Texture(odd, 0.0, 0.0, 0.0);
+    ImageType::Pointer        oddMoving = Texture(odd, 1.5, -1.0, 0.5);
+    const FieldType::Pointer  oddStart = StartingField(oddFixed);
+    auto make = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration, unsigned int shrink) {
+      auto fine = FineType::New();
+      fine->SetFixedImage(oddFixed);
+      fine->SetMovingImage(oddMoving);
+      fine->SetInitialDisplacementField(oddStart);
+      fine->AddModelConfiguration(itk::ImpactModelConfiguration(
+        argv[6], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, true, false }, false));
+      fine->SetDistance({ "L2", "L2" });
+      fine->SetLayersWeight({ 1.f, 1.f });
+      Configure(fine, 6);
+      fine->SetGridShrinkFactor(shrink);
+      if (byRegions)
+      {
+        ByRegions(fine, 2, regionsPerIteration, mapped, scratch);
+      }
+      return fine;
+    };
+    auto run = [&](bool byRegions, bool mapped, unsigned int regionsPerIteration) {
+      auto fine = make(byRegions, mapped, regionsPerIteration, 8);
+      fine->Update();
+      return fine;
+    };
+    const auto      whole = run(false, false, 0);
+    const Distances distances = CompareRoutes(whole, run);
+    const double    moved = MaxDifference(whole->GetOutput(), oddStart, oddFixed->GetLargestPossibleRegion());
+    std::cout << "layers of strides 3 and 6, by regions against whole: fields within " << distances.field
+              << " mm, losses within " << distances.loss << " of theirs, for a field moved by " << moved << " mm"
+              << std::endl;
+    if (!(distances.field < 1e-5) || !(distances.loss < 1e-5) || !(moved > 1e-3))
+    {
+      std::cerr << "With layers of strides 3 and 6, the runs by regions differ from the whole-image run." << std::endl;
+      return EXIT_FAILURE;
+    }
+    const auto coarser = make(true, false, 0, 2);
+    ITK_TRY_EXPECT_EXCEPTION(coarser->Update());
+  }
+
+  // 23. Checks of their own, each printing what it compares.
   if (MovingMaskThroughAField(fixed, moving, start, temporary) != EXIT_SUCCESS ||
       MovingOnItsOwnGrid(fixed, start) != EXIT_SUCCESS)
   {
