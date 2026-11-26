@@ -303,7 +303,7 @@ ExtractFeatureLayers(const std::vector<ImpactModelConfiguration> & configs,
 
     const int64_t numberOfChannels = static_cast<int64_t>(config.GetNumberOfChannels());
 
-    torch::Tensor input = modelInput.to(GetModelDtype(config));
+    torch::Tensor input = modelInput; // Forward brings it to the model's precision
     if (numberOfChannels > 1)
     {
       std::vector<int64_t> repeats(Dim + 2, 1);

@@ -21,8 +21,8 @@
 // masks and with a moving image on another grid too; with the maps in mapped files, every step of the solve taken by
 // those boxes, it gives the field of the maps resident; a streaming reader gives the same field as the image in
 // memory, is read by regions, and the dense field is produced for the region asked. Toy models by regions as whole:
-// layers at half the image's resolution, PCA, a model of one dimension fewer, a voxel size of the model's own and
-// instance normalisations.
+// layers at half the image's resolution, PCA, a model of one dimension fewer, a voxel size of the model's own,
+// instance normalisations, and layers on lattices of 3, 6 and 16 voxels, coarser than the cells.
 
 #include "itkImpactCoarseRegistration.h"
 
@@ -32,6 +32,7 @@
 #include "itkTestingMacros.h"
 #include "itkTranslationTransform.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -186,7 +187,7 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
   {
     std::cerr << "Usage: " << itkNameOfTestExecutableMacro(argv)
               << " <temporary directory> [<model with half-resolution layers> <3D model> <2D model> <model with "
-                 "instance normalisations>]"
+                 "instance normalisations> <model with layers of strides 3, 6 and 16>]"
               << std::endl;
     return EXIT_FAILURE;
   }
@@ -601,6 +602,69 @@ itkImpactCoarseRegistrationRegionTest(int argc, char * argv[])
       {
         std::cerr << variant.label << ": the layers' spreads by regions differ from the whole-image run's."
                   << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
+  // A model whose layers lie on lattices of 3, 6 and 16 voxels (strided convolutions, their last samples partial, and
+  // an average pooling), by regions as whole: the layers of strides 3 and 6 on cells of 4 voxels, the second coarser
+  // than they, each region starting on a multiple of 6 voxels; and the layer of stride 16, a backbone's deepest, on
+  // cells of 2 voxels, each of which pools one or two of its samples, beside the 3x3x3 convolution's layer: alone, it
+  // gives eight cells a side the same features, whose candidates tie and fall to round-off (0.9 mm apart, its pooled
+  // maps 6e-8 apart). Without a mask and with both.
+  if (argc > 6)
+  {
+    struct Case
+    {
+      const char *        label;
+      unsigned int        gridSpacing;
+      bool                beside;
+      std::vector<bool>   layers;
+      ImageType::SizeType size;
+      bool                masked;
+    };
+    const ImageType::SizeType odd = { { 49, 41, 33 } }, large = { { 97, 81, 65 } };
+    for (const Case & lattice :
+         { Case{ "layers of strides 3 and 6", 4, false, { true, true, false }, odd, false },
+           Case{ "layers of strides 3 and 6, masked", 4, false, { true, true, false }, odd, true },
+           Case{ "a layer of stride 16", 2, true, { false, false, true }, large, false },
+           Case{ "a layer of stride 16, masked", 2, true, { false, false, true }, large, true } })
+    {
+      const ImageType::Pointer latticeFixed = Texture(lattice.size, 0.0, 0.0, 0.0);
+      const ImageType::Pointer latticeMoving = Texture(lattice.size, 1.5, -1.0, 0.5);
+      const auto               kept =
+        static_cast<size_t>(std::count(lattice.layers.begin(), lattice.layers.end(), true)) + (lattice.beside ? 1 : 0);
+      auto run = [&](bool byRegions) {
+        auto coarse = CoarseType::New();
+        coarse->SetFixedImage(latticeFixed);
+        coarse->SetMovingImage(latticeMoving);
+        if (lattice.beside)
+        {
+          coarse->AddModelConfiguration(itk::ImpactModelConfiguration(
+            argv[3], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, { true, false }, false));
+        }
+        coarse->AddModelConfiguration(itk::ImpactModelConfiguration(
+          argv[6], 3, 1, { 0, 0, 0 }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, lattice.layers, false));
+        coarse->SetDistance(std::vector<std::string>(kept, "L2"));
+        coarse->SetLayersWeight(std::vector<float>(kept, 1.f));
+        if (lattice.masked)
+        {
+          coarse->SetFixedMask(HalfMask(latticeFixed, 0, 30));
+          coarse->SetMovingMask(HalfMask(latticeMoving, 1, 25));
+        }
+        Configure(coarse);
+        coarse->SetGridSpacing(lattice.gridSpacing);
+        if (byRegions)
+        {
+          coarse->SetRegionSize(16);
+          coarse->SetRegionHalo(2);
+          coarse->SetCostBoxBytes(CostBoxBytes);
+        }
+        return coarse;
+      };
+      if (CompareRuns(run(false), run(true), lattice.label, 1e-3) != EXIT_SUCCESS)
+      {
         return EXIT_FAILURE;
       }
     }

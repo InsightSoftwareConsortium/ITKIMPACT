@@ -100,11 +100,64 @@ MetadataArguments(const ImpactImageMetadata & metadata, const torch::Tensor & in
            metadata.direction.defined() ? metadata.direction : empty };
 }
 
+namespace detail
+{
+/** The gradient through a half-precision network, scaled on its way in and back on its way out: a loss over many
+ * voxels has a derivative with respect to each feature below float16's range, which the network's backward pass would
+ * round to zero. The first output's gradient to come back, in single precision, sets the scale, a power of two that
+ * brings its largest magnitude near one, held in `scale` (a double on the host, 0 until set), which every output then
+ * takes and the input's gradient is divided by, in single precision. */
+struct HalfGradientOut : public torch::autograd::Function<HalfGradientOut>
+{
+  static torch::Tensor
+  forward(torch::autograd::AutogradContext * ctx, const torch::Tensor & output, const torch::Tensor & scale)
+  {
+    ctx->saved_data["scale"] = scale;
+    ctx->saved_data["dtype"] = static_cast<int64_t>(output.scalar_type());
+    return output.to(torch::kFloat32);
+  }
+
+  static torch::autograd::variable_list
+  backward(torch::autograd::AutogradContext * ctx, torch::autograd::variable_list gradients)
+  {
+    double & scale = ctx->saved_data["scale"].toTensor().data_ptr<double>()[0];
+    if (scale == 0.0)
+    {
+      const double peak = gradients[0].abs().max().item<double>();
+      scale = peak > 0.0 && std::isfinite(peak) ? std::exp2(-std::ceil(std::log2(peak))) : 0.0;
+    }
+    const auto dtype = static_cast<torch::ScalarType>(ctx->saved_data["dtype"].toInt());
+    return { (gradients[0] * (scale > 0.0 ? scale : 1.0)).to(dtype), torch::Tensor() };
+  }
+};
+
+struct HalfGradientIn : public torch::autograd::Function<HalfGradientIn>
+{
+  static torch::Tensor
+  forward(torch::autograd::AutogradContext * ctx,
+          const torch::Tensor &              input,
+          const torch::Tensor &              scale,
+          torch::ScalarType                  dtype)
+  {
+    ctx->saved_data["scale"] = scale;
+    return input.to(dtype);
+  }
+
+  static torch::autograd::variable_list
+  backward(torch::autograd::AutogradContext * ctx, torch::autograd::variable_list gradients)
+  {
+    const double scale = ctx->saved_data["scale"].toTensor().data_ptr<double>()[0];
+    return { gradients[0].to(torch::kFloat32) / (scale > 0.0 ? scale : 1.0), torch::Tensor(), torch::Tensor() };
+  }
+};
+} // namespace detail
+
 /** Run the model's forward, assembling positional arguments per the introspected schema:
  * always the patch; plus the requested layer count when forward takes >= 2 inputs; plus the
  * stats and direction of `metadata` when it takes >= 4; plus `norms` when given, the statistics of
  * its normalisations (NormCount) the model takes in place of its input's own. Returns the per-layer
- * output tensors. */
+ * output tensors. The input is brought to the model's precision; a half-precision model on the graph of a
+ * single-precision input returns single-precision layers whose gradient goes through it scaled (HalfGradientOut). */
 inline std::vector<torch::jit::IValue>
 Forward(const ImpactModelConfiguration &   configuration,
         torch::Tensor                      inputPatch,
@@ -112,7 +165,11 @@ Forward(const ImpactModelConfiguration &   configuration,
         const std::vector<torch::Tensor> & norms = {})
 {
   detail::ImpactModelConfigurationImpl * impl = configuration.GetImpl();
-  std::vector<torch::jit::IValue>        args;
+  const bool scaled = impl->dtype == torch::kFloat16 && torch::GradMode::is_enabled() && inputPatch.requires_grad() &&
+                      inputPatch.scalar_type() == torch::kFloat32;
+  const torch::Tensor scale = scaled ? torch::zeros({ 1 }, torch::kFloat64) : torch::Tensor();
+  inputPatch = scaled ? detail::HalfGradientIn::apply(inputPatch, scale, impl->dtype) : inputPatch.to(impl->dtype);
+  std::vector<torch::jit::IValue> args;
   args.reserve(impl->nArgs);
   args.emplace_back(inputPatch);
   if (impl->nArgs >= 2)
@@ -129,7 +186,12 @@ Forward(const ImpactModelConfiguration &   configuration,
   {
     args.emplace_back(c10::List<torch::Tensor>(norms));
   }
-  return impl->model->forward(std::move(args)).toList().vec();
+  std::vector<torch::jit::IValue> outputs = impl->model->forward(std::move(args)).toList().vec();
+  for (size_t i = 0; scaled && i < outputs.size(); ++i)
+  {
+    outputs[i] = detail::HalfGradientOut::apply(outputs[i].toTensor(), scale);
+  }
+  return outputs;
 }
 
 /** How many normalisations by its input's own statistics (TS's instance normalisation, MIND's bound on its
@@ -156,7 +218,7 @@ NormInput(const ImpactModelConfiguration &   configuration,
 {
   const auto [stats, direction] = MetadataArguments(metadata, input);
   return GetModel(configuration)
-    .run_method("norm_input", input, stats, direction, c10::List<torch::Tensor>(norms))
+    .run_method("norm_input", input.to(GetModelDtype(configuration)), stats, direction, c10::List<torch::Tensor>(norms))
     .toTensor();
 }
 

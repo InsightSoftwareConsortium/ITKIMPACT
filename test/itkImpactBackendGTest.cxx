@@ -4017,6 +4017,95 @@ TEST(ImpactTorchAdam, JacobianComparesAMovingLayerOfAnotherStride)
 // and trilinearly upsamples it each iteration; a known translation must still be recovered (a
 // constant field is representable at any control-grid resolution), validating the upsample +
 // units path and the control-grid smoothing.
+// The Jacobian mode differentiates the loss through the moving model. In half precision, its derivative with respect
+// to the features of a mean over many voxels lies below float16's range (the losses unnormalised), and the network's
+// backward pass rounded it to zero: on this pair, 42% of the steps of the sampled mode and 58% of the dense one's, a
+// cosine of 0.91 to single precision on patches. The first step, proportional to the gradient (an epsilon far above
+// it), in half precision against single precision, dense and on sampled patches.
+TEST(ImpactTorchAdam, HalfPrecisionJacobianGradientIsTheSinglePrecisionOne)
+{
+  if (!torch::cuda::is_available())
+  {
+    GTEST_SKIP() << "no CUDA device";
+  }
+  const std::string       model = std::string(IMPACT_TEST_DATA_DIR) + "/ImpactToyModel.pt";
+  const std::vector<bool> layers{ true, false };
+  ImageType::SpacingType  spacing;
+  spacing.Fill(1.0);
+  ImageType::DirectionType identity;
+  identity.SetIdentity();
+  const unsigned int n = 96;
+  const auto         fixed = MakeTorchAdamPattern(n, 0, 0, 0, spacing, identity);
+  const auto         moving = MakeTorchAdamPattern(n, 1.0, -0.5, 0.5, spacing, identity);
+  auto               start = TorchAdamFieldType::New();
+  start->SetRegions(fixed->GetLargestPossibleRegion());
+  start->Allocate();
+  itk::ImageRegionIteratorWithIndex<TorchAdamFieldType> it(start, start->GetLargestPossibleRegion());
+  for (it.GoToBegin(); !it.IsAtEnd(); ++it)
+  {
+    const auto                    i = it.GetIndex();
+    TorchAdamFieldType::PixelType u;
+    u[0] = static_cast<float>(0.3 + 0.2 * std::sin(i[1] / 7.0));
+    u[1] = static_cast<float>(-0.3 + 0.2 * std::cos(i[2] / 5.0));
+    u[2] = static_cast<float>(0.2 + 0.2 * std::sin(i[0] / 9.0));
+    it.Set(u);
+  }
+  auto step = [&](bool half, double sampling) {
+    auto               filter = TorchAdamFilterType::New();
+    const unsigned int patch = sampling < 1.0 ? 5u : 0u;
+    filter->AddModelConfiguration(itk::ImpactModelConfiguration(
+      model, 3, 1, { patch, patch, patch }, { 0.f, 0.f, 0.f }, { 0, 0, 0 }, layers, half));
+    filter->SetFixedImage(fixed);
+    filter->SetMovingImage(moving);
+    filter->SetInitialDisplacementField(start);
+    filter->SetDistance({ "L2" });
+    filter->SetLayersWeight({ 1.f });
+    filter->SetMode("Jacobian");
+    filter->SetSamplingPercentage(sampling);
+    filter->SetGridShrinkFactor(1);
+    filter->SetControlGridSmoothingIterations(0);
+    filter->SetRegularizationWeight(0.0);
+    filter->SetNumberOfIterations(1);
+    filter->SetEpsilon(1e3);
+    filter->SetLearningRate(1e5); // a step of a hundred times the gradient
+    filter->SetDevice("cuda");
+    filter->SetNormalizeLosses(false);
+    filter->SetSeed(1);
+    filter->Update();
+    std::vector<double>                                        moved;
+    itk::ImageRegionConstIteratorWithIndex<TorchAdamFieldType> field(filter->GetOutput(),
+                                                                     filter->GetOutput()->GetLargestPossibleRegion());
+    for (field.GoToBegin(); !field.IsAtEnd(); ++field)
+    {
+      for (unsigned int d = 0; d < 3; ++d)
+      {
+        moved.push_back(field.Get()[d] - start->GetPixel(field.GetIndex())[d]);
+      }
+    }
+    return moved;
+  };
+  for (const double sampling : { 1.0, 0.2 })
+  {
+    SCOPED_TRACE(sampling);
+    const std::vector<double> single = step(false, sampling), halved = step(true, sampling);
+    double                    product = 0.0, singleNorm = 0.0, halfNorm = 0.0, zeros = 0.0;
+    for (size_t i = 0; i < single.size(); ++i)
+    {
+      product += single[i] * halved[i];
+      singleNorm += single[i] * single[i];
+      halfNorm += halved[i] * halved[i];
+      zeros += halved[i] == 0.0 && single[i] != 0.0 ? 1.0 : 0.0;
+    }
+    const double cosine = product / std::sqrt(singleNorm * halfNorm + 1e-300);
+    std::cout << "sampling " << sampling << ": half against single precision, cosine " << cosine << ", norm ratio "
+              << std::sqrt(halfNorm / singleNorm) << ", " << zeros / static_cast<double>(single.size())
+              << " of the steps zero in half alone" << std::endl;
+    ASSERT_GT(singleNorm, 0.0);
+    EXPECT_GT(cosine, 0.999);
+    EXPECT_LT(zeros, 0.05 * static_cast<double>(single.size()));
+  }
+}
+
 TEST(ImpactTorchAdam, LowResControlGrid)
 {
   const double           tx = 1.5, ty = -2.0, tz = 1.0;

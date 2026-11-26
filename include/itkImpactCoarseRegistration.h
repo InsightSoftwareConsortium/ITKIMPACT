@@ -225,12 +225,12 @@ public:
    * own pipelines (SetRequestedRegion then Update: an itk::ImageFileReader with UseStreamingOn reads those regions
    * alone; an image in memory serves them from its buffer); the caller keeps its readers alive. Request a region of
    * GetOutput() (or stream it to a writer) rather than the whole field, and take the field on the coarse grid from
-   * GetCoarseGridTransform(). A feature layer a power of two coarser than the image, no coarser than the coarse
-   * cells, is computed by regions too, each region starting on its lattice. A model of one dimension fewer runs on a
+   * GetCoarseGridTransform(). A feature layer a whole number of voxels coarser than the image, however coarse, is
+   * computed by regions too, each region starting on its lattice. A model of one dimension fewer runs on a
    * box slice by slice along the axis closest to head-feet, as the whole-image run sweeps it. A model that resamples
    * the image to its voxel size runs on its own grid: a box's samples of it resampled from the image's region they lie
    * in as ResampleToVoxelSize resamples the whole image (the corners aligned), its layers pooled over that grid's
-   * windows as the whole-image run pools them; every model on one grid, no coarser than the cells. A model that
+   * windows as the whole-image run pools them; every model on one grid. A model that
    * normalises by its input's statistics (its norm_count and norm_input methods) takes those of the whole image,
    * gathered over the boxes by one pass a normalisation, so that a box is normalised as the image is. PCA fits each
    * layer's basis on the fixed features of the whole layer (a swept model's: of the slices PcaSlices reads) from their
@@ -238,7 +238,8 @@ public:
    * projected on it before they are pooled. */
   /** @{ */
   /** Side of a box, in voxels; 0 (the default) reads the images whole. A model runs on a box with RegionHalo voxels
-   * around it, whole, and once on a probe of 65 voxels a side, which tells where its layers' samples lie. */
+   * around it, whole, and once on each of two probes, of 65 and 129 voxels a side, which tell where its layers'
+   * samples lie. */
   itkSetMacro(RegionSize, unsigned int);
   itkGetConstMacro(RegionSize, unsigned int);
   /** Voxels read around a box, on every axis, so that its features equal those of the whole image: the receptive
